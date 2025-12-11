@@ -23,11 +23,15 @@ async def get_rag_for_request(request: Request, rag_instance=None):
 
     In single-instance mode, returns the passed rag_instance.
     In multi-tenant mode, resolves the workspace and gets the appropriate instance.
+
+    Note: Query operations use the configured engine (LightRAG or RAGAnything).
+    When RAGAnything is enabled, it provides enhanced query capabilities including
+    multimodal-aware retrieval via aquery() and aquery_with_multimodal() methods.
     """
     workspace_manager = getattr(request.app.state, "workspace_manager", None)
 
     if workspace_manager is not None:
-        # Multi-tenant mode - get workspace-specific instance
+        # Multi-tenant mode - get workspace-specific RAG instance (LightRAG or RAGAnything)
         workspace = await get_current_workspace(request)
         return await workspace_manager.get_instance(workspace)
     else:

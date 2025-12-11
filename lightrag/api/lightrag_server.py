@@ -931,7 +931,7 @@ def create_app(args):
     )
     app.include_router(create_query_routes(rag, api_key, args.top_k))
     app.include_router(create_graph_routes(rag, api_key))
-    app.include_router(create_email_routes(rag, api_key))
+    app.include_router(create_email_routes(rag, rag_anything, api_key))
     logger.info("Email ingestion routes enabled")
 
     # Add admin routes if multi-tenancy is enabled

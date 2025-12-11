@@ -16,17 +16,20 @@ router = APIRouter(tags=["graph"])
 
 async def get_rag_for_request(request: Request, rag_instance=None):
     """
-    Get the appropriate RAG instance for the request.
+    Get the appropriate LightRAG instance for the request.
 
     In single-instance mode, returns the passed rag_instance.
     In multi-tenant mode, resolves the workspace and gets the appropriate instance.
+
+    Note: Graph operations are performed on LightRAG instances, so we use
+    get_lightrag_instance() to ensure we always get a LightRAG instance.
     """
     workspace_manager = getattr(request.app.state, "workspace_manager", None)
 
     if workspace_manager is not None:
-        # Multi-tenant mode - get workspace-specific instance
+        # Multi-tenant mode - get workspace-specific LightRAG instance
         workspace = await get_current_workspace(request)
-        return await workspace_manager.get_instance(workspace)
+        return await workspace_manager.get_lightrag_instance(workspace)
     else:
         # Single-instance mode - use the provided rag instance
         return rag_instance

@@ -41,6 +41,10 @@ from pydantic import BaseModel, Field
 
 from lightrag.api.dependencies import get_current_workspace
 from lightrag.api.utils_api import get_combined_auth_dependency
+from lightrag.api.routers.document_routes import (
+    is_raganything_available,
+    get_default_framework,
+)
 
 logger = logging.getLogger("lightrag.api.email")
 
@@ -706,12 +710,18 @@ async def get_rag_for_request(request: Request, rag_instance=None):
     Get the appropriate RAG instance for the request.
 
     In single-instance mode, returns the passed rag_instance.
-    In multi-tenant mode, resolves the workspace and gets the appropriate instance.
+    In multi-tenant mode, resolves the workspace and gets the appropriate instance
+    based on the configured engine_type (LightRAG or RAGAnything).
+
+    Note: Email ingestion currently uses LightRAG's ainsert() method, but the
+    EmailIngestionService is designed to work with both LightRAG and RAGAnything.
+    When RAGAnything is configured, attachments could potentially benefit from
+    multimodal processing.
     """
     workspace_manager = getattr(request.app.state, "workspace_manager", None)
 
     if workspace_manager is not None:
-        # Multi-tenant mode - get workspace-specific instance
+        # Multi-tenant mode - get workspace-specific instance based on engine_type
         workspace = await get_current_workspace(request)
         return await workspace_manager.get_instance(workspace)
     else:
@@ -724,12 +734,13 @@ async def get_rag_for_request(request: Request, rag_instance=None):
 # ============================================================================
 
 
-def create_email_routes(rag, api_key: Optional[str] = None):
+def create_email_routes(rag, rag_anything=None, api_key: Optional[str] = None):
     """
     Create email ingestion routes.
 
     Args:
-        rag: The default RAG instance (for single-instance mode).
+        rag: The default LightRAG instance (for single-instance mode).
+        rag_anything: The default RAGAnything instance (for single-instance mode, optional).
         api_key: Optional API key for authentication.
 
     Returns:
@@ -737,6 +748,7 @@ def create_email_routes(rag, api_key: Optional[str] = None):
     """
     combined_auth = get_combined_auth_dependency(api_key)
     _default_rag = rag
+    _default_rag_anything = rag_anything
 
     @router.post(
         "/email",
@@ -803,6 +815,15 @@ relationships in the knowledge graph. This enables queries like:
 - "What charts were included in the marketing presentation email?"
 
 **File size limit:** 100MB for .eml files (streamed to avoid memory issues)
+
+---
+
+## Framework Selection
+
+The processing framework can be specified using the `framework` parameter:
+- `framework=lightrag`: Text-only processing (faster, basic image description)
+- `framework=raganything`: Multimodal processing (enhanced image/attachment handling)
+- If omitted: Uses server's default (raganything if configured, else lightrag)
         """,
     )
     async def ingest_email(
@@ -827,6 +848,11 @@ relationships in the knowledge graph. This enables queries like:
             default=[],
             description="Inline image files (for structured input mode)",
         ),
+        framework: Optional[str] = Form(
+            None,
+            description="Processing framework: 'lightrag' or 'raganything'. "
+            "If not specified, uses server default (raganything if available, else lightrag).",
+        ),
     ):
         """
         Ingest an email with attachments as a related document bundle.
@@ -835,7 +861,33 @@ relationships in the knowledge graph. This enables queries like:
         metadata that preserves their relationships in the knowledge graph.
         """
         try:
-            # Get RAG instance
+            # Determine framework to use
+            current_framework = framework
+
+            # If framework not specified, use server default
+            if current_framework is None:
+                current_framework = get_default_framework(
+                    http_request, _default_rag_anything
+                )
+                logger.info(f"Using server default framework: {current_framework}")
+
+            # Validate framework value
+            if current_framework not in ("lightrag", "raganything"):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid framework '{current_framework}'. Must be 'lightrag' or 'raganything'.",
+                )
+
+            # Validate RAGAnything availability if requested
+            if current_framework == "raganything":
+                if not is_raganything_available(http_request, _default_rag_anything):
+                    raise HTTPException(
+                        status_code=400,
+                        detail="RAGAnything is not available on this server. "
+                        "Please configure vision_model_func or use framework='lightrag'.",
+                    )
+
+            # Get RAG instance based on framework
             rag_instance = await get_rag_for_request(http_request, _default_rag)
 
             # Get vision model if available (for image description)
@@ -845,6 +897,11 @@ relationships in the knowledge graph. This enables queries like:
                 shared = getattr(workspace_manager, "_shared", None)
                 if shared:
                     vision_model_func = getattr(shared, "vision_model_func", None)
+            elif _default_rag_anything is not None:
+                # Single-instance mode - get vision_model_func from RAGAnything
+                vision_model_func = getattr(
+                    _default_rag_anything, "vision_model_func", None
+                )
 
             # Create ingestion service
             service = EmailIngestionService(rag_instance, vision_model_func)

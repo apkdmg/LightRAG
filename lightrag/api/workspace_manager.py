@@ -216,6 +216,13 @@ class WorkspaceManager:
         self._instances: OrderedDict[str, Tuple[Any, float, float, int]] = OrderedDict()
         self._lock = asyncio.Lock()
 
+        # Separate cache for RAGAnything instances when in hybrid mode
+        # This allows having both LightRAG and RAGAnything per workspace
+        self._raganything_instances: OrderedDict[str, Tuple[Any, float, float, int]] = (
+            OrderedDict()
+        )
+        self._raganything_lock = asyncio.Lock()
+
         # Track workspace metadata (persists even after eviction)
         self._workspace_metadata: Dict[str, Dict[str, Any]] = {}
 
@@ -291,6 +298,208 @@ class WorkspaceManager:
             self._workspace_metadata[workspace_id]["last_accessed_at"] = now
 
             return rag
+
+    async def get_lightrag_instance(self, workspace_id: str) -> "LightRAG":
+        """
+        Get or create a LightRAG instance for the specified workspace.
+
+        This always returns a LightRAG instance, regardless of engine_type.
+        Useful when both LightRAG and RAGAnything are needed per workspace.
+
+        Args:
+            workspace_id: The workspace identifier (typically sanitized username).
+
+        Returns:
+            The LightRAG instance for the workspace.
+        """
+        async with self._lock:
+            if workspace_id in self._instances:
+                instance_data = self._instances[workspace_id]
+                rag = instance_data[0]
+                # If engine_type is RAGANYTHING, the cached instance is RAGAnything
+                # which wraps a LightRAG - extract the underlying LightRAG
+                if self._config.engine_type == EngineType.RAGANYTHING:
+                    # RAGAnything has a .lightrag attribute
+                    rag = getattr(rag, "lightrag", rag)
+                # Move to end (most recently used) and update access time
+                created_at = instance_data[1]
+                count = instance_data[3]
+                self._instances.pop(workspace_id)
+                self._instances[workspace_id] = (
+                    instance_data[0],  # Keep original instance
+                    created_at,
+                    time.time(),
+                    count + 1,
+                )
+                logger.debug(f"LightRAG cache hit for workspace: {workspace_id}")
+                return rag
+
+            # Create new LightRAG instance
+            logger.info(f"Creating new LightRAG instance for workspace: {workspace_id}")
+            rag = await self._create_lightrag_instance(workspace_id)
+
+            # Evict LRU if over capacity
+            while len(self._instances) >= self._max_instances:
+                await self._evict_lru()
+
+            now = time.time()
+            self._instances[workspace_id] = (rag, now, now, 1)
+
+            # Update metadata
+            if workspace_id not in self._workspace_metadata:
+                self._workspace_metadata[workspace_id] = {
+                    "created_at": now,
+                    "owner_username": workspace_id,
+                }
+            self._workspace_metadata[workspace_id]["last_accessed_at"] = now
+
+            return rag
+
+    async def get_raganything_instance(self, workspace_id: str) -> Any:
+        """
+        Get or create a RAGAnything instance for the specified workspace.
+
+        This is separate from the main instance cache to allow having both
+        LightRAG and RAGAnything instances per workspace for hybrid mode.
+
+        Args:
+            workspace_id: The workspace identifier (typically sanitized username).
+
+        Returns:
+            The RAGAnything instance for the workspace.
+
+        Raises:
+            ImportError: If RAGAnything is not installed.
+            ValueError: If vision_model_func is not configured.
+        """
+        async with self._raganything_lock:
+            if workspace_id in self._raganything_instances:
+                # Move to end (most recently used) and update access time
+                rag_anything, created_at, _, count = self._raganything_instances.pop(
+                    workspace_id
+                )
+                self._raganything_instances[workspace_id] = (
+                    rag_anything,
+                    created_at,
+                    time.time(),
+                    count + 1,
+                )
+                logger.debug(f"RAGAnything cache hit for workspace: {workspace_id}")
+                return rag_anything
+
+            # Create new RAGAnything instance
+            logger.info(
+                f"Creating new RAGAnything instance for workspace: {workspace_id}"
+            )
+            rag_anything = await self._create_raganything_instance_standalone(
+                workspace_id
+            )
+
+            # Evict LRU if over capacity (same limit as main instances)
+            while len(self._raganything_instances) >= self._max_instances:
+                await self._evict_raganything_lru()
+
+            now = time.time()
+            self._raganything_instances[workspace_id] = (rag_anything, now, now, 1)
+
+            return rag_anything
+
+    async def _evict_raganything_lru(self) -> None:
+        """Evict the least recently used RAGAnything instance from the cache."""
+        if not self._raganything_instances:
+            return
+
+        # Get oldest (first item in OrderedDict)
+        workspace_id, (rag_anything, created_at, last_accessed, count) = next(
+            iter(self._raganything_instances.items())
+        )
+
+        logger.info(
+            f"Evicting LRU RAGAnything workspace: {workspace_id} "
+            f"(created: {created_at:.0f}, last_access: {last_accessed:.0f}, "
+            f"access_count: {count})"
+        )
+
+        # RAGAnything wraps LightRAG - finalize the underlying LightRAG
+        try:
+            lightrag = getattr(rag_anything, "lightrag", None)
+            if lightrag:
+                await lightrag.finalize_storages()
+        except Exception as e:
+            logger.error(
+                f"Error finalizing RAGAnything storage for workspace {workspace_id}: {e}"
+            )
+
+        del self._raganything_instances[workspace_id]
+
+    async def _create_raganything_instance_standalone(self, workspace_id: str) -> Any:
+        """
+        Create a new standalone RAGAnything instance for a workspace.
+
+        This creates both a LightRAG and RAGAnything instance for the workspace,
+        suitable for hybrid mode where both frameworks are available.
+
+        Args:
+            workspace_id: The workspace identifier.
+
+        Returns:
+            A newly initialized RAGAnything instance.
+        """
+        # Lazy import RAGAnything
+        if self._raganything_class is None:
+            try:
+                from raganything import RAGAnything, RAGAnythingConfig
+
+                self._raganything_class = RAGAnything
+                self._raganything_config_class = RAGAnythingConfig
+            except ImportError as e:
+                raise ImportError(
+                    "RAGAnything is not installed. Please run 'pip install raganything' "
+                    "to enable multimodal document processing."
+                ) from e
+
+        # Validate required components
+        if self._shared.vision_model_func is None:
+            raise ValueError(
+                "vision_model_func is required for RAGAnything. "
+                "Please configure SharedComponents with a vision model function."
+            )
+
+        config = self._config
+
+        # Get or create the underlying LightRAG instance (uses the main cache)
+        lightrag_instance = await self.get_lightrag_instance(workspace_id)
+
+        # Create RAGAnything config
+        raganything_config = self._raganything_config_class(
+            working_dir=config.working_dir,
+            parser=config.raganything_parser,
+            parse_method=config.raganything_parse_method,
+            enable_image_processing=config.raganything_enable_image_processing,
+            enable_table_processing=config.raganything_enable_table_processing,
+            enable_equation_processing=config.raganything_enable_equation_processing,
+        )
+
+        # Use RAGAnything-specific embedding func if provided
+        embedding_func = (
+            self._shared.raganything_embedding_func
+            if self._shared.raganything_embedding_func is not None
+            else self._shared.embedding_func
+        )
+
+        # Create RAGAnything instance wrapping LightRAG
+        rag_anything = self._raganything_class(
+            lightrag=lightrag_instance,
+            config=raganything_config,
+            llm_model_func=self._shared.llm_model_func,
+            vision_model_func=self._shared.vision_model_func,
+            embedding_func=embedding_func,
+        )
+
+        logger.info(
+            f"Standalone RAGAnything instance created for workspace: {workspace_id}"
+        )
+        return rag_anything
 
     async def _create_instance(self, workspace_id: str) -> Any:
         """

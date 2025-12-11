@@ -36,7 +36,7 @@ from raganything import RAGAnything
 
 async def get_rag_for_request(request: Request, rag_instance=None):
     """
-    Get the appropriate RAG instance for the request.
+    Get the appropriate LightRAG instance for the request.
 
     In single-instance mode, returns the passed rag_instance.
     In multi-tenant mode, resolves the workspace and gets the appropriate instance.
@@ -44,12 +44,131 @@ async def get_rag_for_request(request: Request, rag_instance=None):
     workspace_manager = getattr(request.app.state, "workspace_manager", None)
 
     if workspace_manager is not None:
-        # Multi-tenant mode - get workspace-specific instance
+        # Multi-tenant mode - get workspace-specific LightRAG instance
         workspace = await get_current_workspace(request)
-        return await workspace_manager.get_instance(workspace)
+        return await workspace_manager.get_lightrag_instance(workspace)
     else:
         # Single-instance mode - use the provided rag instance
         return rag_instance
+
+
+async def get_raganything_for_request(
+    request: Request, rag_anything_instance=None
+) -> RAGAnything:
+    """
+    Get the appropriate RAGAnything instance for the request.
+
+    In single-instance mode, returns the passed rag_anything_instance.
+    In multi-tenant mode, resolves the workspace and gets workspace-specific instance.
+    """
+    workspace_manager = getattr(request.app.state, "workspace_manager", None)
+
+    if workspace_manager is not None:
+        # Multi-tenant mode - get workspace-specific RAGAnything instance
+        workspace = await get_current_workspace(request)
+        return await workspace_manager.get_raganything_instance(workspace)
+    else:
+        # Single-instance mode - use the provided rag_anything instance
+        return rag_anything_instance
+
+
+def is_raganything_available(request: Request, rag_anything_instance=None) -> bool:
+    """
+    Check if RAGAnything is available on this server.
+
+    RAGAnything requires:
+    1. raganything package installed
+    2. vision_model_func configured in SharedComponents
+
+    Args:
+        request: FastAPI Request object
+        rag_anything_instance: Single-instance mode RAGAnything instance
+
+    Returns:
+        True if RAGAnything is available, False otherwise
+    """
+    workspace_manager = getattr(request.app.state, "workspace_manager", None)
+
+    if workspace_manager is not None:
+        # Multi-tenant mode - check if vision_model_func is configured
+        shared = getattr(workspace_manager, "_shared", None)
+        if shared and getattr(shared, "vision_model_func", None) is not None:
+            return True
+        return False
+    else:
+        # Single-instance mode - check if rag_anything_instance is provided
+        return rag_anything_instance is not None
+
+
+def get_default_framework(request: Request, rag_anything_instance=None) -> str:
+    """
+    Get the server's default processing framework.
+
+    Returns "raganything" if RAGAnything is available and configured,
+    otherwise returns "lightrag".
+
+    Args:
+        request: FastAPI Request object
+        rag_anything_instance: Single-instance mode RAGAnything instance
+
+    Returns:
+        "raganything" or "lightrag"
+    """
+    if is_raganything_available(request, rag_anything_instance):
+        return "raganything"
+    return "lightrag"
+
+
+def get_server_capabilities(request: Request, rag_anything_instance=None) -> dict:
+    """
+    Get server capabilities for document processing.
+
+    Returns information about available frameworks and configurations.
+
+    Args:
+        request: FastAPI Request object
+        rag_anything_instance: Single-instance mode RAGAnything instance
+
+    Returns:
+        Dictionary with server capabilities
+    """
+    raganything_available = is_raganything_available(request, rag_anything_instance)
+    default_framework = get_default_framework(request, rag_anything_instance)
+
+    workspace_manager = getattr(request.app.state, "workspace_manager", None)
+    config_info = {}
+
+    if workspace_manager is not None:
+        config = getattr(workspace_manager, "_config", None)
+        if config:
+            config_info = {
+                "raganything_parser": getattr(config, "raganything_parser", "mineru"),
+                "raganything_enable_image_processing": getattr(
+                    config, "raganything_enable_image_processing", True
+                ),
+                "raganything_enable_table_processing": getattr(
+                    config, "raganything_enable_table_processing", True
+                ),
+                "raganything_enable_equation_processing": getattr(
+                    config, "raganything_enable_equation_processing", True
+                ),
+            }
+
+    return {
+        "frameworks": {
+            "lightrag": {
+                "available": True,
+                "description": "Standard text-based document processing",
+            },
+            "raganything": {
+                "available": raganything_available,
+                "description": "Advanced multimodal processing with image/table/equation support",
+                "config": config_info if raganything_available else None,
+            },
+        },
+        "default_framework": default_framework,
+        "multi_tenant_enabled": workspace_manager is not None,
+    }
 
 
 # Function to format datetime to ISO format string with timezone information
@@ -137,9 +256,10 @@ class SchemeConfig(BaseModel):
     Defines the processing framework and optional extractor to use for document processing.
 
     Attributes:
-        framework (Literal['lightrag', 'raganything']): Processing framework to use.
+        framework (Optional[Literal['lightrag', 'raganything']]): Processing framework to use.
             - "lightrag": Standard LightRAG processing for text-based documents
             - "raganything": Advanced multimodal processing with image/table/equation support
+            - None: Use server default (raganything if available, else lightrag)
         extractor (Literal['mineru', 'docling', '']): Document extraction tool to use.
             - "mineru": MinerU parser for comprehensive document parsing
             - "docling": Docling parser for office document processing
@@ -151,7 +271,7 @@ class SchemeConfig(BaseModel):
             - "":Maintain the default model source configuration of the system (usually huggingface)
     """
 
-    framework: Literal["lightrag", "raganything"]
+    framework: Optional[Literal["lightrag", "raganything"]] = None
     extractor: Literal["mineru", "docling", ""] = ""  # 默认值
     modelSource: Literal["huggingface", "modelscope", "local", ""] = ""
 
@@ -776,6 +896,58 @@ class PipelineStatusResponse(BaseModel):
 
     class Config:
         extra = "allow"  # Allow additional fields from the pipeline status
+
+
+class FrameworkInfo(BaseModel):
+    """Information about a processing framework."""
+
+    available: bool = Field(description="Whether this framework is available")
+    description: str = Field(description="Description of the framework")
+    config: Optional[Dict[str, Any]] = Field(
+        default=None, description="Configuration details (if available)"
+    )
+
+
+class CapabilitiesResponse(BaseModel):
+    """Response model for server capabilities.
+
+    Provides information about available processing frameworks and server configuration.
+    """
+
+    frameworks: Dict[str, FrameworkInfo] = Field(
+        description="Available processing frameworks"
+    )
+    default_framework: str = Field(
+        description="The server's default processing framework"
+    )
+    multi_tenant_enabled: bool = Field(
+        description="Whether multi-tenant mode is enabled"
+    )
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "frameworks": {
+                    "lightrag": {
+                        "available": True,
+                        "description": "Standard text-based document processing",
+                        "config": None,
+                    },
+                    "raganything": {
+                        "available": True,
+                        "description": "Advanced multimodal processing with image/table/equation support",
+                        "config": {
+                            "raganything_parser": "mineru",
+                            "raganything_enable_image_processing": True,
+                            "raganything_enable_table_processing": True,
+                            "raganything_enable_equation_processing": True,
+                        },
+                    },
+                },
+                "default_framework": "raganything",
+                "multi_tenant_enabled": False,
+            }
+        }
 
 
 class DocumentManager:
@@ -1788,6 +1960,48 @@ def create_document_routes(
     _default_rag = rag
 
     @router.get(
+        "/capabilities",
+        response_model=CapabilitiesResponse,
+        dependencies=[Depends(combined_auth)],
+        summary="Get server processing capabilities",
+        description="""
+Get information about the server's document processing capabilities.
+
+This endpoint returns:
+- Available processing frameworks (lightrag, raganything)
+- The server's default framework
+- Whether multi-tenant mode is enabled
+- Configuration details for each framework
+
+Use this endpoint to discover server capabilities before uploading documents,
+especially to determine if RAGAnything multimodal processing is available.
+        """,
+    )
+    async def get_capabilities(http_request: Request):
+        """
+        Get server processing capabilities.
+
+        Returns information about available frameworks and server configuration
+        to help clients make informed decisions about document processing.
+        """
+        capabilities = get_server_capabilities(http_request, rag_anything)
+
+        # Convert to response model format
+        frameworks = {}
+        for name, info in capabilities["frameworks"].items():
+            frameworks[name] = FrameworkInfo(
+                available=info["available"],
+                description=info["description"],
+                config=info.get("config"),
+            )
+
+        return CapabilitiesResponse(
+            frameworks=frameworks,
+            default_framework=capabilities["default_framework"],
+            multi_tenant_enabled=capabilities["multi_tenant_enabled"],
+        )
+
+    @router.get(
         "/schemes",
         response_model=SchemesResponse,
         dependencies=[Depends(combined_auth)],
@@ -2021,7 +2235,9 @@ def create_document_routes(
         "/scan", response_model=ScanResponse, dependencies=[Depends(combined_auth)]
     )
     async def scan_for_new_documents(
-        request: ScanRequest, background_tasks: BackgroundTasks
+        http_request: Request,
+        scan_request: ScanRequest,
+        background_tasks: BackgroundTasks,
     ):
         """
         Trigger the scanning process for new documents.
@@ -2030,24 +2246,66 @@ def create_document_routes(
         and processes them. If a scanning process is already running, it returns a status indicating
         that fact.
 
+        ## Framework Selection
+
+        The processing framework can be specified in the schemeConfig:
+        - `framework: "lightrag"`: Text-only processing (faster, cheaper)
+        - `framework: "raganything"`: Multimodal processing (images, tables, equations)
+        - `framework: null` or omitted: Uses server's default (raganything if configured, else lightrag)
+
+        Args:
+            http_request: FastAPI Request object for workspace resolution
+            scan_request: The scan request with scheme configuration
+            background_tasks: FastAPI BackgroundTasks for async processing
+
         Returns:
             ScanResponse: A response object containing the scanning status and track_id
         """
+        # Determine framework to use
+        current_framework = scan_request.schemeConfig.framework
+
+        # If framework not specified, use server default
+        if current_framework is None:
+            current_framework = get_default_framework(http_request, rag_anything)
+            logger.info(f"Using server default framework for scan: {current_framework}")
+
+        # Validate RAGAnything availability if requested
+        if current_framework == "raganything":
+            if not is_raganything_available(http_request, rag_anything):
+                raise HTTPException(
+                    status_code=400,
+                    detail="RAGAnything is not available on this server. "
+                    "Please configure vision_model_func or use framework='lightrag'.",
+                )
+
+        # Get workspace-resolved instances for multi-tenant support
+        current_rag = await get_rag_for_request(http_request, rag)
+        current_rag_anything = await get_raganything_for_request(
+            http_request, rag_anything
+        )
+
         # Generate track_id with "scan" prefix for scanning operation
         track_id = generate_track_id("scan")
+
+        # Create a resolved scheme config with the determined framework
+        resolved_config = SchemeConfig(
+            framework=current_framework,
+            extractor=scan_request.schemeConfig.extractor,
+            modelSource=scan_request.schemeConfig.modelSource,
+        )
 
         # Start the scanning process in the background with track_id
         background_tasks.add_task(
             run_scanning_process,
-            rag,
-            rag_anything,
+            current_rag,
+            current_rag_anything,
             doc_manager,
             track_id,
-            schemeConfig=request.schemeConfig,
+            schemeConfig=resolved_config,
         )
         return ScanResponse(
             status="scanning_started",
-            message="Scanning process has been initiated in the background",
+            message=f"Scanning process has been initiated in the background using {current_framework}",
             track_id=track_id,
         )
 
@@ -2055,9 +2313,30 @@ def create_document_routes(
         "/upload", response_model=InsertResponse, dependencies=[Depends(combined_auth)]
     )
     async def upload_to_input_dir(
+        request: Request,
         background_tasks: BackgroundTasks,
         file: UploadFile = File(...),
-        schemeId: str = Form(...),
+        framework: Optional[str] = Form(
+            None,
+            description="Processing framework: 'lightrag' or 'raganything'. "
+            "If not specified, uses server default (raganything if available, else lightrag).",
+        ),
+        extractor: Optional[str] = Form(
+            None,
+            description="Document extractor for RAGAnything: 'mineru' or 'docling'. "
+            "Only used when framework is 'raganything'.",
+        ),
+        model_source: Optional[str] = Form(
+            None,
+            description="Model source for MinerU: 'huggingface', 'modelscope', or 'local'. "
+            "Only used when extractor is 'mineru'.",
+        ),
+        # Keep schemeId for backward compatibility with WebUI
+        schemeId: Optional[str] = Form(
+            None,
+            description="[Deprecated] Scheme ID for WebUI compatibility. "
+            "Use 'framework' parameter instead for API calls.",
+        ),
     ):
         """
         Upload a file to the input directory and index it.
@@ -2066,18 +2345,36 @@ def create_document_routes(
         uploaded file is of a supported type, saves it in the specified input directory,
         indexes it for retrieval, and returns a success status with relevant details.
 
+        ## Framework Selection
+
+        The processing framework can be specified in two ways:
+
+        1. **Explicit parameter** (recommended for API): Use the `framework` parameter
+           - `framework=lightrag`: Text-only processing (faster, cheaper)
+           - `framework=raganything`: Multimodal processing (images, tables, equations)
+           - If omitted: Uses server's default (raganything if configured, else lightrag)
+
+        2. **Scheme ID** (for WebUI compatibility): Use `schemeId` to reference a
+           pre-configured scheme from schemes.json
+
+        If both are provided, `framework` takes precedence over `schemeId`.
+
         Args:
+            request: FastAPI Request object for workspace resolution
             background_tasks: FastAPI BackgroundTasks for async processing
             file (UploadFile): The file to be uploaded. It must have an allowed extension
-            schemeId (str): ID of the processing scheme to use for this file. The scheme
-                determines whether to use LightRAG or RAGAnything framework for processing.
+            framework: Optional processing framework override ('lightrag' or 'raganything')
+            extractor: Optional document extractor for RAGAnything ('mineru' or 'docling')
+            model_source: Optional model source for MinerU
+            schemeId: [Deprecated] ID of the processing scheme (for WebUI backward compatibility)
 
         Returns:
             InsertResponse: A response object containing the upload status and a message.
                 status can be "success", "duplicated", or error is thrown.
 
         Raises:
-            HTTPException: If the file type is not supported (400) or other errors occur (500).
+            HTTPException: If the file type is not supported (400), framework unavailable (400),
+                or other errors occur (500).
         """
         try:
             # Sanitize filename to prevent Path Traversal attacks
@@ -2103,39 +2400,76 @@ def create_document_routes(
 
             track_id = generate_track_id("upload")
 
-            def load_config():
-                try:
-                    SCHEMES_FILE = Path("./examples/schemes.json")
-                    with open(SCHEMES_FILE, "r") as f:
-                        schemes = json.load(f)
-                    for scheme in schemes:
-                        if str(scheme.get("id")) == schemeId:
-                            return scheme.get("config", {})
-                    return {}
-                except Exception as e:
-                    logger.error(
-                        f"Failed to load config for scheme {schemeId}: {str(e)}"
-                    )
-                    return {}
+            # Determine framework to use
+            current_framework = framework
+            current_extractor = extractor
+            current_modelSource = model_source
 
-            config = load_config()
-            current_framework = config.get("framework")
-            current_extractor = config.get("extractor")
-            current_modelSource = config.get("modelSource")
+            # If framework not specified, check schemeId for backward compatibility
+            if current_framework is None and schemeId:
+
+                def load_config():
+                    try:
+                        SCHEMES_FILE = Path("./examples/schemes.json")
+                        with open(SCHEMES_FILE, "r") as f:
+                            schemes = json.load(f)
+                        for scheme in schemes:
+                            if str(scheme.get("id")) == schemeId:
+                                return scheme.get("config", {})
+                        return {}
+                    except Exception as e:
+                        logger.error(
+                            f"Failed to load config for scheme {schemeId}: {str(e)}"
+                        )
+                        return {}
+
+                config = load_config()
+                current_framework = config.get("framework")
+                current_extractor = current_extractor or config.get("extractor")
+                current_modelSource = current_modelSource or config.get("modelSource")
+
+            # If still no framework, use server default
+            if current_framework is None:
+                current_framework = get_default_framework(request, rag_anything)
+                logger.info(f"Using server default framework: {current_framework}")
+
+            # Validate framework value
+            if current_framework not in ("lightrag", "raganything"):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid framework '{current_framework}'. Must be 'lightrag' or 'raganything'.",
+                )
+
+            # Validate RAGAnything availability if requested
+            if current_framework == "raganything":
+                if not is_raganything_available(request, rag_anything):
+                    raise HTTPException(
+                        status_code=400,
+                        detail="RAGAnything is not available on this server. "
+                        "Please configure vision_model_func or use framework='lightrag'.",
+                    )
+
             doc_pre_id = f"doc-pre-{safe_filename}"
 
-            if current_framework and current_framework == "lightrag":
+            # Get workspace-resolved instances for multi-tenant support
+            current_rag = await get_rag_for_request(request, rag)
+
+            if current_framework == "lightrag":
                 # Add to background tasks and get track_id
                 background_tasks.add_task(
                     pipeline_index_file,
-                    rag,
+                    current_rag,
                     file_path,
                     track_id,
                     scheme_name=current_framework,
                 )
             else:
+                # Get RAGAnything instance for multimodal processing
+                current_rag_anything = await get_raganything_for_request(
+                    request, rag_anything
+                )
                 background_tasks.add_task(
-                    rag_anything.process_document_complete_lightrag_api,
+                    current_rag_anything.process_document_complete_lightrag_api,
                     file_path=str(file_path),
                     output_dir="./output",
                     parse_method="auto",
@@ -2144,7 +2478,7 @@ def create_document_routes(
                     source=current_modelSource,
                 )
 
-            await rag.doc_status.upsert(
+            await current_rag.doc_status.upsert(
                 {
                     doc_pre_id: {
                         "status": DocStatus.READY,
@@ -2175,7 +2509,9 @@ def create_document_routes(
         "/text", response_model=InsertResponse, dependencies=[Depends(combined_auth)]
     )
     async def insert_text(
-        request: InsertTextRequest, background_tasks: BackgroundTasks
+        http_request: Request,
+        text_request: InsertTextRequest,
+        background_tasks: BackgroundTasks,
     ):
         """
         Insert text into the RAG system.
@@ -2184,7 +2520,8 @@ def create_document_routes(
         and use in generating responses.
 
         Args:
-            request (InsertTextRequest): The request body containing the text to be inserted.
+            http_request: FastAPI Request object for workspace resolution
+            text_request (InsertTextRequest): The request body containing the text to be inserted.
             background_tasks: FastAPI BackgroundTasks for async processing
 
         Returns:
@@ -2194,14 +2531,17 @@ def create_document_routes(
             HTTPException: If an error occurs during text processing (500).
         """
         try:
+            # Get workspace-resolved instance for multi-tenant support
+            current_rag = await get_rag_for_request(http_request, rag)
+
             # Generate track_id for text insertion
             track_id = generate_track_id("insert")
 
             background_tasks.add_task(
                 pipeline_index_texts,
-                rag,
-                [request.text],
-                file_sources=[request.file_source],
+                current_rag,
+                [text_request.text],
+                file_sources=[text_request.file_source],
                 track_id=track_id,
             )
 
@@ -2221,7 +2561,9 @@ def create_document_routes(
         dependencies=[Depends(combined_auth)],
     )
     async def insert_texts(
-        request: InsertTextsRequest, background_tasks: BackgroundTasks
+        http_request: Request,
+        texts_request: InsertTextsRequest,
+        background_tasks: BackgroundTasks,
     ):
         """
         Insert multiple texts into the RAG system.
@@ -2230,7 +2572,8 @@ def create_document_routes(
         in a single request.
 
         Args:
-            request (InsertTextsRequest): The request body containing the list of texts.
+            http_request: FastAPI Request object for workspace resolution
+            texts_request (InsertTextsRequest): The request body containing the list of texts.
             background_tasks: FastAPI BackgroundTasks for async processing
 
         Returns:
@@ -2240,14 +2583,17 @@ def create_document_routes(
             HTTPException: If an error occurs during text processing (500).
         """
         try:
+            # Get workspace-resolved instance for multi-tenant support
+            current_rag = await get_rag_for_request(http_request, rag)
+
             # Generate track_id for texts insertion
             track_id = generate_track_id("insert")
 
             background_tasks.add_task(
                 pipeline_index_texts,
-                rag,
-                request.texts,
-                file_sources=request.file_sources,
+                current_rag,
+                texts_request.texts,
+                file_sources=texts_request.file_sources,
                 track_id=track_id,
             )
 
@@ -2264,13 +2610,16 @@ def create_document_routes(
     @router.delete(
         "", response_model=ClearDocumentsResponse, dependencies=[Depends(combined_auth)]
     )
-    async def clear_documents():
+    async def clear_documents(http_request: Request):
         """
         Clear all documents from the RAG system.
 
         This endpoint deletes all documents, entities, relationships, and files from the system.
         It uses the storage drop methods to properly clean up all data and removes all files
         from the input directory.
+
+        Args:
+            http_request: FastAPI Request object for workspace resolution
 
         Returns:
             ClearDocumentsResponse: A response object containing the status and message.
@@ -2289,6 +2638,9 @@ def create_document_routes(
             get_namespace_data,
             get_pipeline_status_lock,
         )
+
+        # Get workspace-resolved instance for multi-tenant support
+        current_rag = await get_rag_for_request(http_request, rag)
 
         # Get pipeline status and lock
         pipeline_status = await get_namespace_data("pipeline_status")
@@ -2324,15 +2676,15 @@ def create_document_routes(
             # Use drop method to clear all data
             drop_tasks = []
             storages = [
-                rag.text_chunks,
-                rag.full_docs,
-                rag.full_entities,
-                rag.full_relations,
-                rag.entities_vdb,
-                rag.relationships_vdb,
-                rag.chunks_vdb,
-                rag.chunk_entity_relation_graph,
-                rag.doc_status,
+                current_rag.text_chunks,
+                current_rag.full_docs,
+                current_rag.full_entities,
+                current_rag.full_relations,
+                current_rag.entities_vdb,
+                current_rag.relationships_vdb,
+                current_rag.chunks_vdb,
+                current_rag.chunk_entity_relation_graph,
+                current_rag.doc_status,
             ]
 
             # Log storage drop start
@@ -2387,7 +2739,7 @@ def create_document_routes(
                             "Cleaning parse_cache entries"
                         )
 
-                    parse_cache_result = await rag.aclean_all_parse_cache()
+                    parse_cache_result = await current_rag.aclean_all_parse_cache()
                     if parse_cache_result.get("error"):
                         cache_error_msg = f"Warning: Failed to clean parse_cache: {parse_cache_result['error']}"
                         logger.warning(cache_error_msg)
@@ -2581,12 +2933,15 @@ def create_document_routes(
     @router.get(
         "", response_model=DocsStatusesResponse, dependencies=[Depends(combined_auth)]
     )
-    async def documents() -> DocsStatusesResponse:
+    async def documents(http_request: Request) -> DocsStatusesResponse:
         """
         Get the status of all documents in the system.
 
         This endpoint retrieves the current status of all documents, grouped by their
         processing status (READY, HANDLING, PENDING, PROCESSING, PROCESSED, FAILED).
+
+        Args:
+            http_request: FastAPI Request object for workspace resolution
 
         Returns:
             DocsStatusesResponse: A response object containing a dictionary where keys are
@@ -2597,6 +2952,9 @@ def create_document_routes(
             HTTPException: If an error occurs while retrieving document statuses (500).
         """
         try:
+            # Get workspace-resolved instance for multi-tenant support
+            current_rag = await get_rag_for_request(http_request, rag)
+
             statuses = (
                 DocStatus.READY,
                 DocStatus.HANDLING,
@@ -2606,7 +2964,7 @@ def create_document_routes(
                 DocStatus.FAILED,
             )
 
-            tasks = [rag.get_docs_by_status(status) for status in statuses]
+            tasks = [current_rag.get_docs_by_status(status) for status in statuses]
             results: List[Dict[str, DocProcessingStatus]] = await asyncio.gather(*tasks)
 
             response = DocsStatusesResponse()
@@ -2655,6 +3013,7 @@ def create_document_routes(
         summary="Delete a document and all its associated data by its ID.",
     )
     async def delete_document(
+        http_request: Request,
         delete_request: DeleteDocRequest,
         background_tasks: BackgroundTasks,
     ) -> DeleteDocByIdResponse:
@@ -2669,6 +3028,7 @@ def create_document_routes(
         This operation is irreversible and will interact with the pipeline status.
 
         Args:
+            http_request: FastAPI Request object for workspace resolution
             delete_request (DeleteDocRequest): The request containing the document IDs and delete_file options.
             background_tasks: FastAPI BackgroundTasks for async processing
 
@@ -2682,11 +3042,14 @@ def create_document_routes(
             HTTPException:
               - 500: If an unexpected internal error occurs during initialization.
         """
+        # Get workspace-resolved instance for multi-tenant support
+        current_rag = await get_rag_for_request(http_request, rag)
+
         doc_ids = delete_request.doc_ids
 
         # The rag object is initialized from the server startup args,
         # so we can access its properties here.
-        if not rag.enable_llm_cache_for_entity_extract:
+        if not current_rag.enable_llm_cache_for_entity_extract:
             return DeleteDocByIdResponse(
                 status="not_allowed",
                 message="Operation not allowed when LLM cache for entity extraction is disabled.",
@@ -2709,7 +3072,7 @@ def create_document_routes(
             # Add deletion task to background tasks
             background_tasks.add_task(
                 background_delete_documents,
-                rag,
+                current_rag,
                 doc_manager,
                 doc_ids,
                 delete_request.delete_file,
@@ -2732,7 +3095,7 @@ def create_document_routes(
         response_model=ClearCacheResponse,
         dependencies=[Depends(combined_auth)],
     )
-    async def clear_cache(request: ClearCacheRequest):
+    async def clear_cache(http_request: Request, cache_request: ClearCacheRequest):
         """
         Clear all cache data from the LLM response cache storage.
 
@@ -2740,7 +3103,8 @@ def create_document_routes(
         The request body is accepted for API compatibility but is ignored.
 
         Args:
-            request (ClearCacheRequest): The request body (ignored for compatibility).
+            http_request: FastAPI Request object for workspace resolution
+            cache_request (ClearCacheRequest): The request body (ignored for compatibility).
 
         Returns:
             ClearCacheResponse: A response object containing the status and message.
@@ -2749,8 +3113,11 @@ def create_document_routes(
             HTTPException: If an error occurs during cache clearing (500).
         """
         try:
+            # Get workspace-resolved instance for multi-tenant support
+            current_rag = await get_rag_for_request(http_request, rag)
+
             # Call the aclear_cache method (no modes parameter)
-            await rag.aclear_cache()
+            await current_rag.aclear_cache()
 
             # Prepare success message
             message = "Successfully cleared all cache"
@@ -2766,12 +3133,13 @@ def create_document_routes(
         response_model=DeletionResult,
         dependencies=[Depends(combined_auth)],
     )
-    async def delete_entity(request: DeleteEntityRequest):
+    async def delete_entity(http_request: Request, entity_request: DeleteEntityRequest):
         """
         Delete an entity and all its relationships from the knowledge graph.
 
         Args:
-            request (DeleteEntityRequest): The request body containing the entity name.
+            http_request: FastAPI Request object for workspace resolution
+            entity_request (DeleteEntityRequest): The request body containing the entity name.
 
         Returns:
             DeletionResult: An object containing the outcome of the deletion process.
@@ -2780,7 +3148,10 @@ def create_document_routes(
             HTTPException: If the entity is not found (404) or an error occurs (500).
         """
         try:
-            result = await rag.adelete_by_entity(entity_name=request.entity_name)
+            # Get workspace-resolved instance for multi-tenant support
+            current_rag = await get_rag_for_request(http_request, rag)
+
+            result = await current_rag.adelete_by_entity(entity_name=entity_request.entity_name)
             if result.status == "not_found":
                 raise HTTPException(status_code=404, detail=result.message)
             if result.status == "fail":
@@ -2791,7 +3162,7 @@ def create_document_routes(
         except HTTPException:
             raise
         except Exception as e:
-            error_msg = f"Error deleting entity '{request.entity_name}': {str(e)}"
+            error_msg = f"Error deleting entity '{entity_request.entity_name}': {str(e)}"
             logger.error(error_msg)
             logger.error(traceback.format_exc())
             raise HTTPException(status_code=500, detail=error_msg)
@@ -2801,12 +3172,15 @@ def create_document_routes(
         response_model=DeletionResult,
         dependencies=[Depends(combined_auth)],
     )
-    async def delete_relation(request: DeleteRelationRequest):
+    async def delete_relation(
+        http_request: Request, relation_request: DeleteRelationRequest
+    ):
         """
         Delete a relationship between two entities from the knowledge graph.
 
         Args:
-            request (DeleteRelationRequest): The request body containing the source and target entity names.
+            http_request: FastAPI Request object for workspace resolution
+            relation_request (DeleteRelationRequest): The request body containing the source and target entity names.
 
         Returns:
             DeletionResult: An object containing the outcome of the deletion process.
@@ -2815,9 +3189,12 @@ def create_document_routes(
             HTTPException: If the relation is not found (404) or an error occurs (500).
         """
         try:
-            result = await rag.adelete_by_relation(
-                source_entity=request.source_entity,
-                target_entity=request.target_entity,
+            # Get workspace-resolved instance for multi-tenant support
+            current_rag = await get_rag_for_request(http_request, rag)
+
+            result = await current_rag.adelete_by_relation(
+                source_entity=relation_request.source_entity,
+                target_entity=relation_request.target_entity,
             )
             if result.status == "not_found":
                 raise HTTPException(status_code=404, detail=result.message)
@@ -2829,7 +3206,7 @@ def create_document_routes(
         except HTTPException:
             raise
         except Exception as e:
-            error_msg = f"Error deleting relation from '{request.source_entity}' to '{request.target_entity}': {str(e)}"
+            error_msg = f"Error deleting relation from '{relation_request.source_entity}' to '{relation_request.target_entity}': {str(e)}"
             logger.error(error_msg)
             logger.error(traceback.format_exc())
             raise HTTPException(status_code=500, detail=error_msg)
@@ -2839,7 +3216,9 @@ def create_document_routes(
         response_model=TrackStatusResponse,
         dependencies=[Depends(combined_auth)],
     )
-    async def get_track_status(track_id: str) -> TrackStatusResponse:
+    async def get_track_status(
+        http_request: Request, track_id: str
+    ) -> TrackStatusResponse:
         """
         Get the processing status of documents by tracking ID.
 
@@ -2847,6 +3226,7 @@ def create_document_routes(
         allowing users to monitor the processing progress of their uploaded files or inserted texts.
 
         Args:
+            http_request: FastAPI Request object for workspace resolution
             track_id (str): The tracking ID returned from upload, text, or texts endpoints
 
         Returns:
@@ -2859,6 +3239,9 @@ def create_document_routes(
             HTTPException: If track_id is invalid (400) or an error occurs (500).
         """
         try:
+            # Get workspace-resolved instance for multi-tenant support
+            current_rag = await get_rag_for_request(http_request, rag)
+
             # Validate track_id
             if not track_id or not track_id.strip():
                 raise HTTPException(status_code=400, detail="Track ID cannot be empty")
@@ -2866,7 +3249,7 @@ def create_document_routes(
             track_id = track_id.strip()
 
             # Get documents by track_id
-            docs_by_track_id = await rag.aget_docs_by_track_id(track_id)
+            docs_by_track_id = await current_rag.aget_docs_by_track_id(track_id)
 
             # Convert to response format
             documents = []
@@ -2914,7 +3297,8 @@ def create_document_routes(
         dependencies=[Depends(combined_auth)],
     )
     async def get_documents_paginated(
-        request: DocumentsRequest,
+        http_request: Request,
+        docs_request: DocumentsRequest,
     ) -> PaginatedDocsResponse:
         """
         Get documents with pagination support.
@@ -2924,7 +3308,8 @@ def create_document_routes(
         requested page of data.
 
         Args:
-            request (DocumentsRequest): The request body containing pagination parameters
+            http_request: FastAPI Request object for workspace resolution
+            docs_request (DocumentsRequest): The request body containing pagination parameters
 
         Returns:
             PaginatedDocsResponse: A response object containing:
@@ -2936,15 +3321,18 @@ def create_document_routes(
             HTTPException: If an error occurs while retrieving documents (500).
         """
         try:
+            # Get workspace-resolved instance for multi-tenant support
+            current_rag = await get_rag_for_request(http_request, rag)
+
             # Get paginated documents and status counts in parallel
-            docs_task = rag.doc_status.get_docs_paginated(
-                status_filter=request.status_filter,
-                page=request.page,
-                page_size=request.page_size,
-                sort_field=request.sort_field,
-                sort_direction=request.sort_direction,
+            docs_task = current_rag.doc_status.get_docs_paginated(
+                status_filter=docs_request.status_filter,
+                page=docs_request.page,
+                page_size=docs_request.page_size,
+                sort_field=docs_request.sort_field,
+                sort_direction=docs_request.sort_direction,
             )
-            status_counts_task = rag.doc_status.get_all_status_counts()
+            status_counts_task = current_rag.doc_status.get_all_status_counts()
 
             # Execute both queries in parallel
             (documents_with_ids, total_count), status_counts = await asyncio.gather(
@@ -2973,13 +3361,13 @@ def create_document_routes(
                 )
 
             # Calculate pagination info
-            total_pages = (total_count + request.page_size - 1) // request.page_size
-            has_next = request.page < total_pages
-            has_prev = request.page > 1
+            total_pages = (total_count + docs_request.page_size - 1) // docs_request.page_size
+            has_next = docs_request.page < total_pages
+            has_prev = docs_request.page > 1
 
             pagination = PaginationInfo(
-                page=request.page,
-                page_size=request.page_size,
+                page=docs_request.page,
+                page_size=docs_request.page_size,
                 total_count=total_count,
                 total_pages=total_pages,
                 has_next=has_next,
@@ -3002,12 +3390,15 @@ def create_document_routes(
         response_model=StatusCountsResponse,
         dependencies=[Depends(combined_auth)],
     )
-    async def get_document_status_counts() -> StatusCountsResponse:
+    async def get_document_status_counts(http_request: Request) -> StatusCountsResponse:
         """
         Get counts of documents by status.
 
         This endpoint retrieves the count of documents in each processing status
         (PENDING, PROCESSING, PROCESSED, FAILED) for all documents in the system.
+
+        Args:
+            http_request: FastAPI Request object for workspace resolution
 
         Returns:
             StatusCountsResponse: A response object containing status counts
@@ -3016,7 +3407,10 @@ def create_document_routes(
             HTTPException: If an error occurs while retrieving status counts (500).
         """
         try:
-            status_counts = await rag.doc_status.get_all_status_counts()
+            # Get workspace-resolved instance for multi-tenant support
+            current_rag = await get_rag_for_request(http_request, rag)
+
+            status_counts = await current_rag.doc_status.get_all_status_counts()
             return StatusCountsResponse(status_counts=status_counts)
 
         except Exception as e:
