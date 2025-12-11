@@ -393,6 +393,37 @@ def parse_args() -> argparse.Namespace:
         "RELATED_CHUNK_NUMBER", DEFAULT_RELATED_CHUNK_NUMBER, int
     )
 
+    # Multi-tenancy configuration
+    args.enable_multi_tenancy = get_env_value("ENABLE_MULTI_TENANCY", False, bool)
+    args.max_workspace_instances = get_env_value("MAX_WORKSPACE_INSTANCES", 100, int)
+    args.workspace_ttl_minutes = get_env_value("WORKSPACE_TTL_MINUTES", 60, int)
+    args.auto_create_workspace = get_env_value("AUTO_CREATE_WORKSPACE", True, bool)
+
+    # RAGAnything configuration (for multi-tenancy mode)
+    args.enable_raganything = get_env_value("ENABLE_RAGANYTHING", False, bool)
+    args.raganything_vision_model = get_env_value(
+        "RAGANYTHING_VISION_MODEL", "gpt-4o", str
+    )
+    args.raganything_embedding_model = get_env_value(
+        "RAGANYTHING_EMBEDDING_MODEL", "", str
+    )
+    args.raganything_embedding_dim = get_env_value(
+        "RAGANYTHING_EMBEDDING_DIM", 3072, int
+    )
+    args.raganything_parser = get_env_value("RAGANYTHING_PARSER", "mineru", str)
+    args.raganything_parse_method = get_env_value(
+        "RAGANYTHING_PARSE_METHOD", "auto", str
+    )
+    args.raganything_enable_image_processing = get_env_value(
+        "RAGANYTHING_ENABLE_IMAGE_PROCESSING", True, bool
+    )
+    args.raganything_enable_table_processing = get_env_value(
+        "RAGANYTHING_ENABLE_TABLE_PROCESSING", True, bool
+    )
+    args.raganything_enable_equation_processing = get_env_value(
+        "RAGANYTHING_ENABLE_EQUATION_PROCESSING", True, bool
+    )
+
     # Add missing environment variables for health endpoint
     args.force_llm_summary_on_merge = get_env_value(
         "FORCE_LLM_SUMMARY_ON_MERGE", DEFAULT_FORCE_LLM_SUMMARY_ON_MERGE, int

@@ -21,6 +21,7 @@ from fastapi import (
     HTTPException,
     UploadFile,
     Form,
+    Request,
 )
 from pydantic import BaseModel, Field, field_validator
 
@@ -28,8 +29,27 @@ from lightrag import LightRAG
 from lightrag.base import DeletionResult, DocProcessingStatus, DocStatus
 from lightrag.utils import generate_track_id
 from lightrag.api.utils_api import get_combined_auth_dependency
+from lightrag.api.dependencies import get_current_workspace
 from ..config import global_args
 from raganything import RAGAnything
+
+
+async def get_rag_for_request(request: Request, rag_instance=None):
+    """
+    Get the appropriate RAG instance for the request.
+
+    In single-instance mode, returns the passed rag_instance.
+    In multi-tenant mode, resolves the workspace and gets the appropriate instance.
+    """
+    workspace_manager = getattr(request.app.state, "workspace_manager", None)
+
+    if workspace_manager is not None:
+        # Multi-tenant mode - get workspace-specific instance
+        workspace = await get_current_workspace(request)
+        return await workspace_manager.get_instance(workspace)
+    else:
+        # Single-instance mode - use the provided rag instance
+        return rag_instance
 
 
 # Function to format datetime to ISO format string with timezone information
@@ -1763,6 +1783,9 @@ def create_document_routes(
 ):
     # Create combined auth dependency for document routes
     combined_auth = get_combined_auth_dependency(api_key)
+
+    # Store rag instance for closure access in multi-tenant helper
+    _default_rag = rag
 
     @router.get(
         "/schemes",

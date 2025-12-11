@@ -6,14 +6,33 @@ import json
 import logging
 from typing import Any, Dict, List, Literal, Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from lightrag.base import QueryParam
 from ..utils_api import get_combined_auth_dependency
+from ..dependencies import get_current_workspace, get_workspace_manager
 from pydantic import BaseModel, Field, field_validator
 
 from ascii_colors import trace_exception
 
 router = APIRouter(tags=["query"])
+
+
+async def get_rag_for_request(request: Request, rag_instance=None):
+    """
+    Get the appropriate RAG instance for the request.
+
+    In single-instance mode, returns the passed rag_instance.
+    In multi-tenant mode, resolves the workspace and gets the appropriate instance.
+    """
+    workspace_manager = getattr(request.app.state, "workspace_manager", None)
+
+    if workspace_manager is not None:
+        # Multi-tenant mode - get workspace-specific instance
+        workspace = await get_current_workspace(request)
+        return await workspace_manager.get_instance(workspace)
+    else:
+        # Single-instance mode - use the provided rag instance
+        return rag_instance
 
 
 class QueryRequest(BaseModel):
@@ -152,10 +171,13 @@ class QueryDataResponse(BaseModel):
 def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
     combined_auth = get_combined_auth_dependency(api_key)
 
+    # Store rag instance for closure access in multi-tenant helper
+    _default_rag = rag
+
     @router.post(
         "/query", response_model=QueryResponse, dependencies=[Depends(combined_auth)]
     )
-    async def query_text(request: QueryRequest):
+    async def query_text(request: QueryRequest, http_request: Request):
         """
         Handle a POST request at the /query endpoint to process user queries using RAG capabilities.
 
@@ -171,8 +193,11 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
                        with status code 500 and detail containing the exception message.
         """
         try:
+            # Get appropriate RAG instance (workspace-specific in multi-tenant mode)
+            rag_instance = await get_rag_for_request(http_request, _default_rag)
+
             param = request.to_query_params(False)
-            response = await rag.aquery(request.query, param=param)
+            response = await rag_instance.aquery(request.query, param=param)
 
             # If response is a string (e.g. cache hit), return directly
             if isinstance(response, str):
@@ -188,7 +213,7 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
             raise HTTPException(status_code=500, detail=str(e))
 
     @router.post("/query/stream", dependencies=[Depends(combined_auth)])
-    async def query_text_stream(request: QueryRequest):
+    async def query_text_stream(request: QueryRequest, http_request: Request):
         """
         This endpoint performs a retrieval-augmented generation (RAG) query and streams the response.
 
@@ -200,8 +225,11 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
             StreamingResponse: A streaming response containing the RAG query results.
         """
         try:
+            # Get appropriate RAG instance (workspace-specific in multi-tenant mode)
+            rag_instance = await get_rag_for_request(http_request, _default_rag)
+
             param = request.to_query_params(True)
-            response = await rag.aquery(request.query, param=param)
+            response = await rag_instance.aquery(request.query, param=param)
 
             from fastapi.responses import StreamingResponse
 
@@ -241,7 +269,7 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
         response_model=QueryDataResponse,
         dependencies=[Depends(combined_auth)],
     )
-    async def query_data(request: QueryRequest):
+    async def query_data(request: QueryRequest, http_request: Request):
         """
         Retrieve structured data without LLM generation.
 
@@ -261,8 +289,11 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
                          with status code 500 and detail containing the exception message.
         """
         try:
+            # Get appropriate RAG instance (workspace-specific in multi-tenant mode)
+            rag_instance = await get_rag_for_request(http_request, _default_rag)
+
             param = request.to_query_params(False)  # No streaming for data endpoint
-            response = await rag.aquery_data(request.query, param=param)
+            response = await rag_instance.aquery_data(request.query, param=param)
 
             # The aquery_data method returns a dict with entities, relationships, chunks, and metadata
             if isinstance(response, dict):

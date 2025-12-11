@@ -1,4 +1,6 @@
 from datetime import datetime, timedelta
+import re
+from typing import Optional
 
 import jwt
 from dotenv import load_dotenv
@@ -13,10 +15,36 @@ from .config import global_args
 load_dotenv(dotenv_path=".env", override=False)
 
 
+def sanitize_workspace_id(username: str) -> str:
+    """
+    Convert a username to a valid workspace ID.
+
+    Replaces invalid characters with underscores and ensures the ID
+    is safe for use in file paths and database identifiers.
+
+    Args:
+        username: The username to sanitize.
+
+    Returns:
+        A sanitized workspace ID string.
+    """
+    # Replace @ and . with underscores, remove other special chars
+    workspace_id = re.sub(r"[^a-zA-Z0-9_-]", "_", username.lower())
+    # Remove consecutive underscores
+    workspace_id = re.sub(r"_+", "_", workspace_id)
+    # Remove leading/trailing underscores
+    workspace_id = workspace_id.strip("_")
+    # Ensure non-empty
+    if not workspace_id:
+        workspace_id = "default"
+    return workspace_id
+
+
 class TokenPayload(BaseModel):
     sub: str  # Username
     exp: datetime  # Expiration time
     role: str = "user"  # User role, default is regular user
+    workspace_id: Optional[str] = None  # Workspace ID derived from username
     metadata: dict = {}  # Additional metadata
 
 
@@ -39,6 +67,7 @@ class AuthHandler:
         role: str = "user",
         custom_expire_hours: int = None,
         metadata: dict = None,
+        workspace_id: str = None,
     ) -> str:
         """
         Create JWT token
@@ -48,6 +77,7 @@ class AuthHandler:
             role: User role, default is "user", guest is "guest"
             custom_expire_hours: Custom expiration time (hours), if None use default value
             metadata: Additional metadata
+            workspace_id: Optional workspace ID, if None will be derived from username
 
         Returns:
             str: Encoded JWT token
@@ -63,9 +93,17 @@ class AuthHandler:
 
         expire = datetime.utcnow() + timedelta(hours=expire_hours)
 
+        # Derive workspace_id from username if not provided
+        if workspace_id is None:
+            workspace_id = sanitize_workspace_id(username)
+
         # Create payload
         payload = TokenPayload(
-            sub=username, exp=expire, role=role, metadata=metadata or {}
+            sub=username,
+            exp=expire,
+            role=role,
+            workspace_id=workspace_id,
+            metadata=metadata or {},
         )
 
         return jwt.encode(payload.dict(), self.secret, algorithm=self.algorithm)
@@ -78,7 +116,7 @@ class AuthHandler:
             token: JWT token
 
         Returns:
-            dict: Dictionary containing user information
+            dict: Dictionary containing user information including workspace_id
 
         Raises:
             HTTPException: If token is invalid or expired
@@ -93,10 +131,15 @@ class AuthHandler:
                     status_code=status.HTTP_401_UNAUTHORIZED, detail="Token expired"
                 )
 
-            # Return complete payload instead of just username
+            username = payload["sub"]
+            # Get workspace_id from token or derive from username for backwards compatibility
+            workspace_id = payload.get("workspace_id") or sanitize_workspace_id(username)
+
+            # Return complete payload including workspace_id
             return {
-                "username": payload["sub"],
+                "username": username,
                 "role": payload.get("role", "user"),
+                "workspace_id": workspace_id,
                 "metadata": payload.get("metadata", {}),
                 "exp": expire_time,
             }

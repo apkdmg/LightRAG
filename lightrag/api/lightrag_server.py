@@ -51,6 +51,8 @@ from lightrag.api.routers.document_routes import (
 from lightrag.api.routers.query_routes import create_query_routes
 from lightrag.api.routers.graph_routes import create_graph_routes
 from lightrag.api.routers.ollama_api import OllamaAPI
+from lightrag.api.routers.admin_routes import create_admin_routes
+from lightrag.api.routers.email_routes import create_email_routes
 
 from lightrag.utils import logger, set_verbose_debug
 from lightrag.kg.shared_storage import (
@@ -64,6 +66,12 @@ from fastapi.security import OAuth2PasswordRequestForm
 from lightrag.api.auth import auth_handler
 from lightrag.ragmanager import RAGManager
 from raganything import RAGAnything, RAGAnythingConfig
+from lightrag.api.workspace_manager import (
+    WorkspaceManager,
+    SharedComponents,
+    WorkspaceConfig,
+    EngineType,
+)
 
 # use the .env that is inside the current folder
 # allows to use different .env file for each lightrag instance
@@ -240,6 +248,10 @@ def create_app(args):
         finally:
             # Clean up database connections
             await rag.finalize_storages()
+
+            # Shutdown workspace manager if multi-tenancy is enabled
+            if hasattr(app.state, "workspace_manager") and app.state.workspace_manager:
+                await app.state.workspace_manager.shutdown()
 
             # Clean up shared data
             finalize_share_data()
@@ -758,7 +770,157 @@ def create_app(args):
             "The system has been downgraded to basic mode, but LightRAG core functions are still available"
         )
 
-    # Add routes
+    # Multi-tenancy setup
+    workspace_manager = None
+    if args.enable_multi_tenancy:
+        # Determine engine type based on --enable-raganything flag
+        engine_type = (
+            EngineType.RAGANYTHING if args.enable_raganything else EngineType.LIGHTRAG
+        )
+        logger.info(
+            f"Multi-tenancy mode enabled with engine={engine_type.value} - creating WorkspaceManager"
+        )
+
+        # Create shared components from the already-created functions
+        # For RAGAnything, we need vision_model_func and optionally a separate embedding func
+        vision_model_func = None
+        raganything_embedding_func = None
+
+        if engine_type == EngineType.RAGANYTHING:
+            # Get API credentials for RAGAnything vision model
+            api_key = get_env_value("LLM_BINDING_API_KEY", "", str)
+            base_url = get_env_value("LLM_BINDING_HOST", "", str)
+
+            if not api_key or not base_url:
+                raise ValueError(
+                    "LLM_BINDING_API_KEY and LLM_BINDING_HOST are required for "
+                    "RAGAnything multi-tenancy mode"
+                )
+
+            # Create vision model function for RAGAnything
+            def vision_model_func(
+                prompt, system_prompt=None, history_messages=[], image_data=None, **kwargs
+            ):
+                if image_data:
+                    return openai_complete_if_cache(
+                        args.raganything_vision_model,
+                        "",
+                        system_prompt=None,
+                        history_messages=[],
+                        messages=[
+                            {"role": "system", "content": system_prompt}
+                            if system_prompt
+                            else None,
+                            {
+                                "role": "user",
+                                "content": [
+                                    {"type": "text", "text": prompt},
+                                    {
+                                        "type": "image_url",
+                                        "image_url": {
+                                            "url": f"data:image/jpeg;base64,{image_data}"
+                                        },
+                                    },
+                                ],
+                            }
+                            if image_data
+                            else {"role": "user", "content": prompt},
+                        ],
+                        api_key=api_key,
+                        base_url=base_url,
+                        **kwargs,
+                    )
+                else:
+                    return openai_complete_if_cache(
+                        args.llm_model,
+                        prompt,
+                        system_prompt=system_prompt,
+                        history_messages=history_messages,
+                        api_key=api_key,
+                        base_url=base_url,
+                        **kwargs,
+                    )
+
+            # Create RAGAnything-specific embedding function if configured
+            if args.raganything_embedding_model:
+                raganything_embedding_func = EmbeddingFunc(
+                    embedding_dim=args.raganything_embedding_dim,
+                    max_token_size=8192,
+                    func=lambda texts: openai_embed(
+                        texts,
+                        model=args.raganything_embedding_model,
+                        api_key=api_key,
+                        base_url=base_url,
+                    ),
+                )
+
+            logger.info(
+                f"RAGAnything multi-tenancy configured with vision_model={args.raganything_vision_model}"
+            )
+
+        shared_components = SharedComponents(
+            embedding_func=embedding_func,
+            llm_model_func=create_llm_model_func(args.llm_binding),
+            rerank_model_func=rerank_model_func,
+            tokenizer=None,  # Will use default TiktokenTokenizer
+            vision_model_func=vision_model_func,
+            raganything_embedding_func=raganything_embedding_func,
+        )
+
+        # Create workspace configuration from args
+        workspace_config = WorkspaceConfig(
+            engine_type=engine_type,
+            working_dir=args.working_dir,
+            kv_storage=args.kv_storage,
+            vector_storage=args.vector_storage,
+            graph_storage=args.graph_storage,
+            doc_status_storage=args.doc_status_storage,
+            llm_model_name=args.llm_model,
+            llm_model_max_async=args.max_async,
+            llm_model_kwargs=create_llm_model_kwargs(args.llm_binding, args, llm_timeout),
+            default_llm_timeout=llm_timeout,
+            default_embedding_timeout=embedding_timeout,
+            chunk_token_size=int(args.chunk_size),
+            chunk_overlap_token_size=int(args.chunk_overlap_size),
+            summary_max_tokens=args.summary_max_tokens,
+            summary_context_size=args.summary_context_size,
+            summary_language=args.summary_language,
+            vector_db_storage_cls_kwargs={"cosine_better_than_threshold": args.cosine_threshold},
+            enable_llm_cache=args.enable_llm_cache,
+            enable_llm_cache_for_entity_extract=args.enable_llm_cache_for_extract,
+            max_parallel_insert=args.max_parallel_insert,
+            max_graph_nodes=args.max_graph_nodes,
+            addon_params={
+                "language": args.summary_language,
+                "entity_types": args.entity_types,
+            },
+            ollama_server_infos=ollama_server_infos,
+            # RAGAnything-specific settings
+            raganything_parser=args.raganything_parser,
+            raganything_parse_method=args.raganything_parse_method,
+            raganything_enable_image_processing=args.raganything_enable_image_processing,
+            raganything_enable_table_processing=args.raganything_enable_table_processing,
+            raganything_enable_equation_processing=args.raganything_enable_equation_processing,
+        )
+
+        workspace_manager = WorkspaceManager(
+            shared_components=shared_components,
+            workspace_config=workspace_config,
+            max_instances=args.max_workspace_instances,
+            ttl_minutes=args.workspace_ttl_minutes,
+        )
+
+        # Store in app state for dependencies
+        app.state.workspace_manager = workspace_manager
+        logger.info(
+            f"WorkspaceManager initialized with engine={engine_type.value}, "
+            f"max_instances={args.max_workspace_instances}"
+        )
+    else:
+        # Single-instance mode (legacy) - store None to indicate multi-tenancy is disabled
+        app.state.workspace_manager = None
+
+    # Add routes - pass rag for single-instance mode, routes will use dependencies for multi-tenant
     app.include_router(
         create_document_routes(
             rag,
@@ -769,6 +931,13 @@ def create_app(args):
     )
     app.include_router(create_query_routes(rag, api_key, args.top_k))
     app.include_router(create_graph_routes(rag, api_key))
+    app.include_router(create_email_routes(rag, api_key))
+    logger.info("Email ingestion routes enabled")
+
+    # Add admin routes if multi-tenancy is enabled
+    if args.enable_multi_tenancy:
+        app.include_router(create_admin_routes())
+        logger.info("Admin routes enabled for multi-tenancy management")
 
     # Add Ollama API routes
     ollama_api = OllamaAPI(rag, top_k=args.top_k, api_key=api_key)
