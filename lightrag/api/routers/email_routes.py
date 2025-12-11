@@ -44,6 +44,8 @@ from lightrag.api.utils_api import get_combined_auth_dependency
 from lightrag.api.routers.document_routes import (
     is_raganything_available,
     get_default_framework,
+    resolve_scheme,
+    validate_framework_availability,
 )
 
 logger = logging.getLogger("lightrag.api.email")
@@ -818,12 +820,23 @@ relationships in the knowledge graph. This enables queries like:
 
 ---
 
-## Framework Selection
+## Scheme Selection (Unified Parameter)
 
-The processing framework can be specified using the `framework` parameter:
-- `framework=lightrag`: Text-only processing (faster, basic image description)
-- `framework=raganything`: Multimodal processing (enhanced image/attachment handling)
-- If omitted: Uses server's default (raganything if configured, else lightrag)
+The `scheme` parameter accepts either:
+
+1. **Numeric scheme ID** (e.g., `scheme=1`): Loads configuration from schemes.json
+   - Used by WebUI for pre-configured processing schemes
+
+2. **Framework name** (e.g., `scheme=lightrag` or `scheme=raganything`):
+   - `lightrag`: Text-only processing (faster, basic image description)
+   - `raganything`: Multimodal processing (enhanced image/attachment handling)
+
+3. **Not specified**: Uses server's default (raganything if configured, else lightrag)
+
+## Backward Compatibility
+
+The `framework` parameter is deprecated but still supported.
+Priority order: `scheme` > `framework`
         """,
     )
     async def ingest_email(
@@ -848,10 +861,16 @@ The processing framework can be specified using the `framework` parameter:
             default=[],
             description="Inline image files (for structured input mode)",
         ),
+        scheme: Optional[str] = Form(
+            None,
+            description="Processing scheme: either a numeric scheme ID (e.g., '1') "
+            "or a framework name ('lightrag' or 'raganything'). "
+            "If not specified, uses server default (raganything if available, else lightrag).",
+        ),
+        # Backward compatibility alias (deprecated)
         framework: Optional[str] = Form(
             None,
-            description="Processing framework: 'lightrag' or 'raganything'. "
-            "If not specified, uses server default (raganything if available, else lightrag).",
+            description="[Deprecated] Alias for 'scheme'. Use 'scheme' parameter instead.",
         ),
     ):
         """
@@ -861,31 +880,27 @@ The processing framework can be specified using the `framework` parameter:
         metadata that preserves their relationships in the knowledge graph.
         """
         try:
-            # Determine framework to use
-            current_framework = framework
+            # Resolve scheme with backward compatibility
+            # Priority: scheme > framework
+            effective_scheme = scheme or framework
 
-            # If framework not specified, use server default
-            if current_framework is None:
-                current_framework = get_default_framework(
-                    http_request, _default_rag_anything
+            resolved = resolve_scheme(
+                scheme=effective_scheme,
+                request=http_request,
+                rag_anything_instance=_default_rag_anything,
+            )
+
+            # Validate framework availability
+            validate_framework_availability(
+                resolved.framework, http_request, _default_rag_anything
+            )
+
+            if resolved.scheme_name:
+                logger.info(
+                    f"Email ingestion using scheme '{resolved.scheme_name}' with framework: {resolved.framework}"
                 )
-                logger.info(f"Using server default framework: {current_framework}")
-
-            # Validate framework value
-            if current_framework not in ("lightrag", "raganything"):
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Invalid framework '{current_framework}'. Must be 'lightrag' or 'raganything'.",
-                )
-
-            # Validate RAGAnything availability if requested
-            if current_framework == "raganything":
-                if not is_raganything_available(http_request, _default_rag_anything):
-                    raise HTTPException(
-                        status_code=400,
-                        detail="RAGAnything is not available on this server. "
-                        "Please configure vision_model_func or use framework='lightrag'.",
-                    )
+            else:
+                logger.info(f"Email ingestion using framework: {resolved.framework}")
 
             # Get RAG instance based on framework
             rag_instance = await get_rag_for_request(http_request, _default_rag)

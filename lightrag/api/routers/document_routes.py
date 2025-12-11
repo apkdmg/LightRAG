@@ -5,6 +5,7 @@ This module contains all document-related routes for the LightRAG API.
 import asyncio
 import json
 import uuid
+from dataclasses import dataclass
 from lightrag.utils import logger, get_pinyin_sort_key
 import aiofiles
 import shutil
@@ -171,6 +172,148 @@ def get_server_capabilities(request: Request, rag_anything_instance=None) -> dic
     }
 
 
+@dataclass
+class ResolvedScheme:
+    """Resolved scheme configuration after parsing the unified scheme parameter."""
+
+    framework: str
+    extractor: Optional[str] = None
+    model_source: Optional[str] = None
+    scheme_name: Optional[str] = None  # Human-readable name if from schemes.json
+
+
+def resolve_scheme(
+    scheme: Optional[str],
+    request: Request,
+    rag_anything_instance=None,
+    fallback_extractor: Optional[str] = None,
+    fallback_model_source: Optional[str] = None,
+) -> ResolvedScheme:
+    """
+    Resolve a unified scheme parameter to framework configuration.
+
+    The scheme parameter accepts either:
+    - A numeric scheme ID (e.g., "1", "42") - looks up from schemes.json
+    - A framework name (e.g., "lightrag", "raganything") - uses directly
+
+    Args:
+        scheme: The unified scheme parameter (numeric ID or framework name)
+        request: FastAPI Request object for default framework resolution
+        rag_anything_instance: Single-instance mode RAGAnything instance
+        fallback_extractor: Extractor to use if not specified in scheme
+        fallback_model_source: Model source to use if not specified in scheme
+
+    Returns:
+        ResolvedScheme with framework, extractor, and model_source
+
+    Raises:
+        HTTPException: If scheme ID not found or invalid framework specified
+    """
+    SCHEMES_FILE = Path("./examples/schemes.json")
+
+    # No scheme specified - use server default
+    if scheme is None:
+        default_fw = get_default_framework(request, rag_anything_instance)
+        logger.info(f"No scheme specified, using server default: {default_fw}")
+        return ResolvedScheme(
+            framework=default_fw,
+            extractor=fallback_extractor,
+            model_source=fallback_model_source,
+        )
+
+    scheme = scheme.strip()
+
+    # Check if it's a numeric scheme ID
+    if scheme.isdigit():
+        try:
+            if not SCHEMES_FILE.exists():
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Scheme ID '{scheme}' specified but schemes.json not found. "
+                    "Use framework name ('lightrag' or 'raganything') instead.",
+                )
+
+            with open(SCHEMES_FILE, "r") as f:
+                schemes = json.load(f)
+
+            for s in schemes:
+                if str(s.get("id")) == scheme:
+                    config = s.get("config", {})
+                    framework = config.get("framework")
+
+                    # If scheme has no framework, use server default
+                    if framework is None:
+                        framework = get_default_framework(request, rag_anything_instance)
+
+                    return ResolvedScheme(
+                        framework=framework,
+                        extractor=fallback_extractor or config.get("extractor"),
+                        model_source=fallback_model_source or config.get("modelSource"),
+                        scheme_name=s.get("name"),
+                    )
+
+            raise HTTPException(
+                status_code=404,
+                detail=f"Scheme ID '{scheme}' not found in schemes.json",
+            )
+
+        except json.JSONDecodeError:
+            raise HTTPException(
+                status_code=500,
+                detail="Failed to parse schemes.json",
+            )
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"Error loading scheme {scheme}: {e}")
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to load scheme configuration: {str(e)}",
+            )
+
+    # It's a framework name - validate and use directly
+    valid_frameworks = ("lightrag", "raganything")
+    scheme_lower = scheme.lower()
+
+    if scheme_lower not in valid_frameworks:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid scheme '{scheme}'. Must be a numeric scheme ID or "
+            f"one of: {', '.join(valid_frameworks)}",
+        )
+
+    return ResolvedScheme(
+        framework=scheme_lower,
+        extractor=fallback_extractor,
+        model_source=fallback_model_source,
+    )
+
+
+def validate_framework_availability(
+    framework: str,
+    request: Request,
+    rag_anything_instance=None,
+) -> None:
+    """
+    Validate that the requested framework is available on this server.
+
+    Args:
+        framework: The framework name to validate
+        request: FastAPI Request object
+        rag_anything_instance: Single-instance mode RAGAnything instance
+
+    Raises:
+        HTTPException: If the framework is not available
+    """
+    if framework == "raganything":
+        if not is_raganything_available(request, rag_anything_instance):
+            raise HTTPException(
+                status_code=400,
+                detail="RAGAnything is not available on this server. "
+                "Please configure vision_model_func or use scheme='lightrag'.",
+            )
+
+
 # Function to format datetime to ISO format string with timezone information
 def format_datetime(dt: Any) -> Optional[str]:
     """Format datetime to ISO format string with timezone information
@@ -321,9 +464,27 @@ class SchemesResponse(BaseModel):
 
 
 class ScanRequest(BaseModel):
-    """Request model for document scanning operations."""
+    """Request model for document scanning operations.
 
-    schemeConfig: SchemeConfig = Field(..., description="Scanning scheme configuration")
+    Supports two modes for specifying processing configuration:
+
+    1. **Unified scheme parameter** (recommended):
+       - `scheme`: Either a numeric scheme ID (e.g., "1") or framework name ("lightrag"/"raganything")
+
+    2. **Legacy schemeConfig** (for backward compatibility):
+       - `schemeConfig`: Full configuration object with framework, extractor, modelSource
+
+    If both are provided, `scheme` takes precedence.
+    """
+
+    scheme: Optional[str] = Field(
+        None,
+        description="Processing scheme: numeric ID (e.g., '1') or framework name ('lightrag'/'raganything'). "
+        "Takes precedence over schemeConfig if provided.",
+    )
+    schemeConfig: Optional[SchemeConfig] = Field(
+        None, description="[Legacy] Scanning scheme configuration. Use 'scheme' parameter instead."
+    )
 
 
 class ScanResponse(BaseModel):
@@ -1975,6 +2136,20 @@ This endpoint returns:
 
 Use this endpoint to discover server capabilities before uploading documents,
 especially to determine if RAGAnything multimodal processing is available.
+
+## Unified Scheme Parameter
+
+All document processing endpoints (`/upload`, `/scan`, `/email`) support the unified
+`scheme` parameter that accepts either:
+
+1. **Numeric scheme ID** (e.g., `scheme=1`): Loads configuration from schemes.json
+   - Get available schemes via `GET /documents/schemes`
+
+2. **Framework name** (e.g., `scheme=lightrag` or `scheme=raganything`):
+   - `lightrag`: Text-only processing
+   - `raganything`: Multimodal processing (if available)
+
+3. **Not specified**: Uses the `default_framework` returned by this endpoint
         """,
     )
     async def get_capabilities(http_request: Request):
@@ -2246,37 +2421,65 @@ especially to determine if RAGAnything multimodal processing is available.
         and processes them. If a scanning process is already running, it returns a status indicating
         that fact.
 
-        ## Framework Selection
+        ## Scheme Selection (Unified Parameter)
 
-        The processing framework can be specified in the schemeConfig:
-        - `framework: "lightrag"`: Text-only processing (faster, cheaper)
-        - `framework: "raganything"`: Multimodal processing (images, tables, equations)
-        - `framework: null` or omitted: Uses server's default (raganything if configured, else lightrag)
+        The `scheme` parameter accepts either:
+
+        1. **Numeric scheme ID** (e.g., `"scheme": "1"`): Loads configuration from schemes.json
+           - Used by WebUI for pre-configured processing schemes
+           - Includes framework, extractor, and model_source settings
+
+        2. **Framework name** (e.g., `"scheme": "lightrag"` or `"scheme": "raganything"`):
+           - `lightrag`: Text-only processing (faster, cheaper)
+           - `raganything`: Multimodal processing (images, tables, equations)
+
+        3. **Not specified**: Uses server's default (raganything if configured, else lightrag)
+
+        ## Legacy Support
+
+        The `schemeConfig` object is still supported for backward compatibility.
+        Priority: `scheme` > `schemeConfig`
 
         Args:
             http_request: FastAPI Request object for workspace resolution
-            scan_request: The scan request with scheme configuration
+            scan_request: The scan request with scheme or schemeConfig
             background_tasks: FastAPI BackgroundTasks for async processing
 
         Returns:
             ScanResponse: A response object containing the scanning status and track_id
         """
-        # Determine framework to use
-        current_framework = scan_request.schemeConfig.framework
+        # Extract fallback extractor/modelSource from legacy schemeConfig if provided
+        fallback_extractor = None
+        fallback_model_source = None
+        if scan_request.schemeConfig:
+            fallback_extractor = scan_request.schemeConfig.extractor or None
+            fallback_model_source = scan_request.schemeConfig.modelSource or None
 
-        # If framework not specified, use server default
-        if current_framework is None:
-            current_framework = get_default_framework(http_request, rag_anything)
-            logger.info(f"Using server default framework for scan: {current_framework}")
+        # Resolve scheme with unified parameter
+        # Priority: scheme > schemeConfig.framework
+        effective_scheme = scan_request.scheme
+        if effective_scheme is None and scan_request.schemeConfig:
+            effective_scheme = scan_request.schemeConfig.framework
 
-        # Validate RAGAnything availability if requested
-        if current_framework == "raganything":
-            if not is_raganything_available(http_request, rag_anything):
-                raise HTTPException(
-                    status_code=400,
-                    detail="RAGAnything is not available on this server. "
-                    "Please configure vision_model_func or use framework='lightrag'.",
-                )
+        resolved = resolve_scheme(
+            scheme=effective_scheme,
+            request=http_request,
+            rag_anything_instance=rag_anything,
+            fallback_extractor=fallback_extractor,
+            fallback_model_source=fallback_model_source,
+        )
+
+        # Validate framework availability
+        validate_framework_availability(
+            resolved.framework, http_request, rag_anything
+        )
+
+        if resolved.scheme_name:
+            logger.info(
+                f"Scan using scheme '{resolved.scheme_name}' with framework: {resolved.framework}"
+            )
+        else:
+            logger.info(f"Scan using framework: {resolved.framework}")
 
         # Get workspace-resolved instances for multi-tenant support
         current_rag = await get_rag_for_request(http_request, rag)
@@ -2287,11 +2490,11 @@ especially to determine if RAGAnything multimodal processing is available.
         # Generate track_id with "scan" prefix for scanning operation
         track_id = generate_track_id("scan")
 
-        # Create a resolved scheme config with the determined framework
+        # Create a resolved scheme config for the scanning process
         resolved_config = SchemeConfig(
-            framework=current_framework,
-            extractor=scan_request.schemeConfig.extractor,
-            modelSource=scan_request.schemeConfig.modelSource,
+            framework=resolved.framework,
+            extractor=resolved.extractor or "",
+            modelSource=resolved.model_source or "",
         )
 
         # Start the scanning process in the background with track_id
@@ -2305,7 +2508,7 @@ especially to determine if RAGAnything multimodal processing is available.
         )
         return ScanResponse(
             status="scanning_started",
-            message=f"Scanning process has been initiated in the background using {current_framework}",
+            message=f"Scanning process has been initiated in the background using {resolved.framework}",
             track_id=track_id,
         )
 
@@ -2316,26 +2519,30 @@ especially to determine if RAGAnything multimodal processing is available.
         request: Request,
         background_tasks: BackgroundTasks,
         file: UploadFile = File(...),
-        framework: Optional[str] = Form(
+        scheme: Optional[str] = Form(
             None,
-            description="Processing framework: 'lightrag' or 'raganything'. "
+            description="Processing scheme: either a numeric scheme ID (e.g., '1') "
+            "or a framework name ('lightrag' or 'raganything'). "
             "If not specified, uses server default (raganything if available, else lightrag).",
         ),
         extractor: Optional[str] = Form(
             None,
             description="Document extractor for RAGAnything: 'mineru' or 'docling'. "
-            "Only used when framework is 'raganything'.",
+            "Only used when framework is 'raganything'. Overrides scheme config if provided.",
         ),
         model_source: Optional[str] = Form(
             None,
             description="Model source for MinerU: 'huggingface', 'modelscope', or 'local'. "
-            "Only used when extractor is 'mineru'.",
+            "Only used when extractor is 'mineru'. Overrides scheme config if provided.",
         ),
-        # Keep schemeId for backward compatibility with WebUI
+        # Backward compatibility aliases (deprecated)
         schemeId: Optional[str] = Form(
             None,
-            description="[Deprecated] Scheme ID for WebUI compatibility. "
-            "Use 'framework' parameter instead for API calls.",
+            description="[Deprecated] Alias for 'scheme'. Use 'scheme' parameter instead.",
+        ),
+        framework: Optional[str] = Form(
+            None,
+            description="[Deprecated] Alias for 'scheme'. Use 'scheme' parameter instead.",
         ),
     ):
         """
@@ -2345,28 +2552,40 @@ especially to determine if RAGAnything multimodal processing is available.
         uploaded file is of a supported type, saves it in the specified input directory,
         indexes it for retrieval, and returns a success status with relevant details.
 
-        ## Framework Selection
+        ## Scheme Selection (Unified Parameter)
 
-        The processing framework can be specified in two ways:
+        The `scheme` parameter accepts either:
 
-        1. **Explicit parameter** (recommended for API): Use the `framework` parameter
-           - `framework=lightrag`: Text-only processing (faster, cheaper)
-           - `framework=raganything`: Multimodal processing (images, tables, equations)
-           - If omitted: Uses server's default (raganything if configured, else lightrag)
+        1. **Numeric scheme ID** (e.g., `scheme=1`): Loads configuration from schemes.json
+           - Used by WebUI for pre-configured processing schemes
+           - Includes framework, extractor, and model_source settings
 
-        2. **Scheme ID** (for WebUI compatibility): Use `schemeId` to reference a
-           pre-configured scheme from schemes.json
+        2. **Framework name** (e.g., `scheme=lightrag` or `scheme=raganything`):
+           - `lightrag`: Text-only processing (faster, cheaper)
+           - `raganything`: Multimodal processing (images, tables, equations)
 
-        If both are provided, `framework` takes precedence over `schemeId`.
+        3. **Not specified**: Uses server's default (raganything if configured, else lightrag)
+
+        ## Override Parameters
+
+        When using a scheme ID, you can override specific settings:
+        - `extractor`: Override the document extractor ('mineru' or 'docling')
+        - `model_source`: Override the model source ('huggingface', 'modelscope', 'local')
+
+        ## Backward Compatibility
+
+        The `schemeId` and `framework` parameters are deprecated but still supported.
+        Priority order: `scheme` > `framework` > `schemeId`
 
         Args:
             request: FastAPI Request object for workspace resolution
             background_tasks: FastAPI BackgroundTasks for async processing
             file (UploadFile): The file to be uploaded. It must have an allowed extension
-            framework: Optional processing framework override ('lightrag' or 'raganything')
-            extractor: Optional document extractor for RAGAnything ('mineru' or 'docling')
-            model_source: Optional model source for MinerU
-            schemeId: [Deprecated] ID of the processing scheme (for WebUI backward compatibility)
+            scheme: Unified scheme parameter (numeric ID or framework name)
+            extractor: Optional document extractor override for RAGAnything
+            model_source: Optional model source override for MinerU
+            schemeId: [Deprecated] Use 'scheme' instead
+            framework: [Deprecated] Use 'scheme' instead
 
         Returns:
             InsertResponse: A response object containing the upload status and a message.
@@ -2374,7 +2593,7 @@ especially to determine if RAGAnything multimodal processing is available.
 
         Raises:
             HTTPException: If the file type is not supported (400), framework unavailable (400),
-                or other errors occur (500).
+                scheme not found (404), or other errors occur (500).
         """
         try:
             # Sanitize filename to prevent Path Traversal attacks
@@ -2400,68 +2619,41 @@ especially to determine if RAGAnything multimodal processing is available.
 
             track_id = generate_track_id("upload")
 
-            # Determine framework to use
-            current_framework = framework
-            current_extractor = extractor
-            current_modelSource = model_source
+            # Resolve scheme with backward compatibility
+            # Priority: scheme > framework > schemeId
+            effective_scheme = scheme or framework or schemeId
 
-            # If framework not specified, check schemeId for backward compatibility
-            if current_framework is None and schemeId:
+            resolved = resolve_scheme(
+                scheme=effective_scheme,
+                request=request,
+                rag_anything_instance=rag_anything,
+                fallback_extractor=extractor,
+                fallback_model_source=model_source,
+            )
 
-                def load_config():
-                    try:
-                        SCHEMES_FILE = Path("./examples/schemes.json")
-                        with open(SCHEMES_FILE, "r") as f:
-                            schemes = json.load(f)
-                        for scheme in schemes:
-                            if str(scheme.get("id")) == schemeId:
-                                return scheme.get("config", {})
-                        return {}
-                    except Exception as e:
-                        logger.error(
-                            f"Failed to load config for scheme {schemeId}: {str(e)}"
-                        )
-                        return {}
+            # Validate framework availability
+            validate_framework_availability(
+                resolved.framework, request, rag_anything
+            )
 
-                config = load_config()
-                current_framework = config.get("framework")
-                current_extractor = current_extractor or config.get("extractor")
-                current_modelSource = current_modelSource or config.get("modelSource")
-
-            # If still no framework, use server default
-            if current_framework is None:
-                current_framework = get_default_framework(request, rag_anything)
-                logger.info(f"Using server default framework: {current_framework}")
-
-            # Validate framework value
-            if current_framework not in ("lightrag", "raganything"):
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Invalid framework '{current_framework}'. Must be 'lightrag' or 'raganything'.",
+            if resolved.scheme_name:
+                logger.info(
+                    f"Using scheme '{resolved.scheme_name}' with framework: {resolved.framework}"
                 )
-
-            # Validate RAGAnything availability if requested
-            if current_framework == "raganything":
-                if not is_raganything_available(request, rag_anything):
-                    raise HTTPException(
-                        status_code=400,
-                        detail="RAGAnything is not available on this server. "
-                        "Please configure vision_model_func or use framework='lightrag'.",
-                    )
 
             doc_pre_id = f"doc-pre-{safe_filename}"
 
             # Get workspace-resolved instances for multi-tenant support
             current_rag = await get_rag_for_request(request, rag)
 
-            if current_framework == "lightrag":
+            if resolved.framework == "lightrag":
                 # Add to background tasks and get track_id
                 background_tasks.add_task(
                     pipeline_index_file,
                     current_rag,
                     file_path,
                     track_id,
-                    scheme_name=current_framework,
+                    scheme_name=resolved.scheme_name or resolved.framework,
                 )
             else:
                 # Get RAGAnything instance for multimodal processing
@@ -2473,9 +2665,9 @@ especially to determine if RAGAnything multimodal processing is available.
                     file_path=str(file_path),
                     output_dir="./output",
                     parse_method="auto",
-                    scheme_name=current_framework,
-                    parser=current_extractor,
-                    source=current_modelSource,
+                    scheme_name=resolved.scheme_name or resolved.framework,
+                    parser=resolved.extractor,
+                    source=resolved.model_source,
                 )
 
             await current_rag.doc_status.upsert(
@@ -2485,7 +2677,7 @@ especially to determine if RAGAnything multimodal processing is available.
                         "content": "",
                         "content_summary": "",
                         "multimodal_content": [],
-                        "scheme_name": current_framework,
+                        "scheme_name": resolved.scheme_name or resolved.framework,
                         "content_length": 0,
                         "created_at": "",
                         "updated_at": "",
@@ -2500,6 +2692,8 @@ especially to determine if RAGAnything multimodal processing is available.
                 track_id=track_id,
             )
 
+        except HTTPException:
+            raise
         except Exception as e:
             logger.error(f"Error /documents/upload: {file.filename}: {str(e)}")
             logger.error(traceback.format_exc())
