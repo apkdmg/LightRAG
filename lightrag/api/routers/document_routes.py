@@ -1758,7 +1758,6 @@ async def pipeline_index_files_raganything(
     rag_anything: RAGAnything,
     file_paths: List[Path],
     scheme_name: str = None,
-    parser: str = None,
     source: str = None,
 ):
     """Index multiple files using RAGAnything framework for multimodal processing.
@@ -1766,10 +1765,7 @@ async def pipeline_index_files_raganything(
     Args:
         rag_anything (RAGAnything): RAGAnything instance for multimodal document processing
         file_paths (List[Path]): List of file paths to be processed
-        track_id (str, optional): Tracking ID for batch monitoring. Defaults to None.
         scheme_name (str, optional): Processing scheme name for categorization.
-            Defaults to None.
-        parser (str, optional): Document extraction tool to use.
             Defaults to None.
         source (str, optional): The model source used by Mineru.
             Defaults to None.
@@ -1777,7 +1773,8 @@ async def pipeline_index_files_raganything(
     Note:
         - Uses RAGAnything's process_document_complete_lightrag_api method for each file
         - Supports multimodal content processing (images, tables, equations)
-        - Files are processed with "auto" parse method and "modelscope" source
+        - Parser is configured at RAGAnything instance level via config.parser
+        - Files are processed with "auto" parse method
         - Output is saved to "./output" directory
         - Errors are logged but don't stop processing of remaining files
     """
@@ -1797,7 +1794,6 @@ async def pipeline_index_files_raganything(
                 output_dir="./output",
                 parse_method="auto",
                 scheme_name=scheme_name,
-                parser=parser,
                 source=source,
             )
             if success:
@@ -1893,7 +1889,6 @@ async def run_scanning_process(
                     rag_anything,
                     new_files,
                     scheme_name=scheme_name,
-                    parser=extractor,
                     source=modelSource,
                 )
                 logger.info(
@@ -2666,7 +2661,6 @@ All document processing endpoints (`/upload`, `/scan`, `/email`) support the uni
                     output_dir="./output",
                     parse_method="auto",
                     scheme_name=resolved.scheme_name or resolved.framework,
-                    parser=resolved.extractor,
                     source=resolved.model_source,
                 )
 
