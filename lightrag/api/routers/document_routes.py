@@ -752,7 +752,7 @@ class DocStatusResponse(BaseModel):
         default=None, description="Additional metadata about the document"
     )
     file_path: str = Field(description="Path to the document file")
-    scheme_name: str = Field(
+    scheme_name: Optional[str] = Field(
         default=None, description="Name of the processing scheme used for this document"
     )
     multimodal_content: Optional[list[dict[str, Any]]] = Field(
