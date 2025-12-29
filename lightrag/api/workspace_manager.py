@@ -258,12 +258,22 @@ class WorkspaceManager:
         If an instance exists in the cache, it's moved to the end (most recently used).
         If not, a new instance is created, and LRU eviction occurs if needed.
 
+        Note: When engine_type is RAGANYTHING, this method ensures a RAGAnything instance
+        is returned. If only a LightRAG exists in the cache (e.g., created by
+        get_lightrag_instance()), it will delegate to get_raganything_instance().
+
         Args:
             workspace_id: The workspace identifier (typically sanitized username).
 
         Returns:
             The RAG instance (LightRAG or RAGAnything) for the workspace.
         """
+        # For RAGANYTHING engine type, always use get_raganything_instance
+        # This ensures consistency when both email ingestion and queries need RAGAnything
+        if self._config.engine_type == EngineType.RAGANYTHING:
+            return await self.get_raganything_instance(workspace_id)
+
+        # For LIGHTRAG engine type, use the main cache
         async with self._lock:
             if workspace_id in self._instances:
                 # Move to end (most recently used) and update access time
