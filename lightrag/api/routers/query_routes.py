@@ -9,7 +9,7 @@ from typing import Any, Dict, List, Literal, Optional
 from fastapi import APIRouter, Depends, HTTPException, Request
 from lightrag.base import QueryParam
 from ..utils_api import get_combined_auth_dependency
-from ..dependencies import get_current_workspace, get_workspace_manager
+from ..dependencies import resolve_workspace_from_request, get_workspace_manager
 from pydantic import BaseModel, Field, field_validator
 
 from ascii_colors import trace_exception
@@ -32,7 +32,8 @@ async def get_rag_for_request(request: Request, rag_instance=None):
 
     if workspace_manager is not None:
         # Multi-tenant mode - get workspace-specific RAG instance (LightRAG or RAGAnything)
-        workspace = await get_current_workspace(request)
+        # Use resolve_workspace_from_request to handle on-behalf operations
+        workspace = await resolve_workspace_from_request(request)
         return await workspace_manager.get_instance(workspace)
     else:
         # Single-instance mode - use the provided rag instance

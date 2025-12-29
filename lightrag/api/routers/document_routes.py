@@ -30,7 +30,7 @@ from lightrag import LightRAG
 from lightrag.base import DeletionResult, DocProcessingStatus, DocStatus
 from lightrag.utils import generate_track_id
 from lightrag.api.utils_api import get_combined_auth_dependency
-from lightrag.api.dependencies import get_current_workspace
+from lightrag.api.dependencies import resolve_workspace_from_request
 from ..config import global_args
 from raganything import RAGAnything
 
@@ -46,7 +46,8 @@ async def get_rag_for_request(request: Request, rag_instance=None):
 
     if workspace_manager is not None:
         # Multi-tenant mode - get workspace-specific LightRAG instance
-        workspace = await get_current_workspace(request)
+        # Use resolve_workspace_from_request to handle on-behalf operations
+        workspace = await resolve_workspace_from_request(request)
         return await workspace_manager.get_lightrag_instance(workspace)
     else:
         # Single-instance mode - use the provided rag instance
@@ -66,7 +67,8 @@ async def get_raganything_for_request(
 
     if workspace_manager is not None:
         # Multi-tenant mode - get workspace-specific RAGAnything instance
-        workspace = await get_current_workspace(request)
+        # Use resolve_workspace_from_request to handle on-behalf operations
+        workspace = await resolve_workspace_from_request(request)
         return await workspace_manager.get_raganything_instance(workspace)
     else:
         # Single-instance mode - use the provided rag_anything instance

@@ -62,16 +62,94 @@ def get_workspace_manager(request: Request) -> WorkspaceManager:
     return workspace_manager
 
 
-async def get_current_user(
-    request: Request,
-    token: Optional[str] = Depends(oauth2_scheme),
-) -> UserInfo:
+def _extract_token_from_request(request: Request) -> Optional[str]:
     """
-    Extract and validate the current user from the JWT token.
+    Extract the Bearer token from the Authorization header.
 
     Args:
         request: The FastAPI request object.
-        token: The JWT token from the Authorization header.
+
+    Returns:
+        The token string if present, None otherwise.
+    """
+    auth_header = request.headers.get("Authorization")
+    if auth_header and auth_header.startswith("Bearer "):
+        return auth_header[7:]  # Remove "Bearer " prefix
+    return None
+
+
+async def resolve_user_from_request(request: Request) -> UserInfo:
+    """
+    Resolve the current user from a request without using FastAPI's DI.
+
+    This function manually extracts the token from the Authorization header
+    and validates it. Use this when calling from helper functions that are
+    not part of FastAPI's dependency injection chain.
+
+    Args:
+        request: The FastAPI request object.
+
+    Returns:
+        UserInfo containing the authenticated user's details.
+
+    Raises:
+        HTTPException: If authentication fails or token is invalid.
+    """
+    token = _extract_token_from_request(request)
+    return await _resolve_user(token)
+
+
+async def resolve_workspace_from_request(request: Request) -> str:
+    """
+    Resolve the workspace ID from a request without using FastAPI's DI.
+
+    This function handles both normal operations (user's own workspace) and
+    admin on-behalf operations via the X-Target-Workspace header.
+
+    Use this when calling from helper functions that are not part of
+    FastAPI's dependency injection chain.
+
+    Args:
+        request: The FastAPI request object.
+
+    Returns:
+        The workspace ID to use for this request.
+
+    Raises:
+        HTTPException: If authentication fails, token is invalid, or
+            a non-admin tries to use on-behalf operations.
+    """
+    user = await resolve_user_from_request(request)
+    target_workspace = request.headers.get(TARGET_WORKSPACE_HEADER)
+
+    if target_workspace:
+        # On-behalf operation - admin only
+        if user.role != "admin":
+            logger.warning(
+                f"Non-admin user '{user.username}' attempted on-behalf operation "
+                f"for workspace '{target_workspace}'"
+            )
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Only admins can perform operations on behalf of other users",
+            )
+
+        sanitized_target = sanitize_workspace_id(target_workspace)
+        logger.info(
+            f"Admin '{user.username}' operating on behalf of workspace: {sanitized_target}"
+        )
+        return sanitized_target
+
+    # Normal operation - use own workspace
+    return user.workspace_id
+
+
+async def _resolve_user(token: Optional[str]) -> UserInfo:
+    """
+    Core user resolution logic shared by DI and non-DI paths.
+
+    Args:
+        token: The JWT token (or None).
 
     Returns:
         UserInfo containing the authenticated user's details.
@@ -122,6 +200,29 @@ async def get_current_user(
         workspace_id=workspace_id,
         metadata=metadata,
     )
+
+
+async def get_current_user(
+    request: Request,
+    token: Optional[str] = Depends(oauth2_scheme),
+) -> UserInfo:
+    """
+    Extract and validate the current user from the JWT token.
+
+    This is a FastAPI dependency - use resolve_user_from_request() when
+    calling from non-DI contexts.
+
+    Args:
+        request: The FastAPI request object.
+        token: The JWT token from the Authorization header (injected by FastAPI).
+
+    Returns:
+        UserInfo containing the authenticated user's details.
+
+    Raises:
+        HTTPException: If authentication fails or token is invalid.
+    """
+    return await _resolve_user(token)
 
 
 async def get_current_workspace(

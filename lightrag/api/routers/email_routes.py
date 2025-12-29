@@ -39,7 +39,7 @@ from fastapi import (
 )
 from pydantic import BaseModel, Field
 
-from lightrag.api.dependencies import get_current_workspace
+from lightrag.api.dependencies import resolve_workspace_from_request
 from lightrag.api.utils_api import get_combined_auth_dependency
 from lightrag.api.routers.document_routes import (
     is_raganything_available,
@@ -724,7 +724,8 @@ async def get_rag_for_request(request: Request, rag_instance=None):
 
     if workspace_manager is not None:
         # Multi-tenant mode - get workspace-specific instance based on engine_type
-        workspace = await get_current_workspace(request)
+        # Use resolve_workspace_from_request to handle on-behalf operations
+        workspace = await resolve_workspace_from_request(request)
         return await workspace_manager.get_instance(workspace)
     else:
         # Single-instance mode - use the provided rag instance

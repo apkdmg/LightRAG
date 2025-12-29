@@ -999,14 +999,25 @@ def create_app(args):
         if auth_handler.accounts.get(username) != form_data.password:
             raise HTTPException(status_code=401, detail="Incorrect credentials")
 
-        # Regular user login
+        # Determine user role based on ADMIN_ACCOUNTS configuration
+        admin_usernames = set()
+        if global_args.admin_accounts:
+            admin_usernames = {
+                name.strip()
+                for name in global_args.admin_accounts.split(",")
+                if name.strip()
+            }
+        role = "admin" if username in admin_usernames else "user"
+
+        # Create token with appropriate role
         user_token = auth_handler.create_token(
-            username=username, role="user", metadata={"auth_mode": "enabled"}
+            username=username, role=role, metadata={"auth_mode": "enabled"}
         )
         return {
             "access_token": user_token,
             "token_type": "bearer",
             "auth_mode": "enabled",
+            "role": role,
             "core_version": core_version,
             "api_version": __api_version__,
             "webui_title": webui_title,

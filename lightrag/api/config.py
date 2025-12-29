@@ -357,6 +357,7 @@ def parse_args() -> argparse.Namespace:
 
     # For JWT Auth
     args.auth_accounts = get_env_value("AUTH_ACCOUNTS", "")
+    args.admin_accounts = get_env_value("ADMIN_ACCOUNTS", "")
     args.token_secret = get_env_value("TOKEN_SECRET", "lightrag-jwt-default-secret")
     args.token_expire_hours = get_env_value("TOKEN_EXPIRE_HOURS", 48, int)
     args.guest_token_expire_hours = get_env_value("GUEST_TOKEN_EXPIRE_HOURS", 24, int)
@@ -395,7 +396,7 @@ def parse_args() -> argparse.Namespace:
 
     # Multi-tenancy configuration
     args.enable_multi_tenancy = get_env_value("ENABLE_MULTI_TENANCY", False, bool)
-    args.max_workspace_instances = get_env_value("MAX_WORKSPACE_INSTANCES", 100, int)
+    args.max_workspace_instances = get_env_value("MAX_WORKSPACE_INSTANCES", 10000, int)
     args.workspace_ttl_minutes = get_env_value("WORKSPACE_TTL_MINUTES", 60, int)
     args.auto_create_workspace = get_env_value("AUTO_CREATE_WORKSPACE", True, bool)
 

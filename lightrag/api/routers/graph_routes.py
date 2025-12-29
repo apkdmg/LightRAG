@@ -9,7 +9,7 @@ from pydantic import BaseModel
 
 from lightrag.utils import logger
 from ..utils_api import get_combined_auth_dependency
-from ..dependencies import get_current_workspace
+from ..dependencies import resolve_workspace_from_request
 
 router = APIRouter(tags=["graph"])
 
@@ -28,7 +28,8 @@ async def get_rag_for_request(request: Request, rag_instance=None):
 
     if workspace_manager is not None:
         # Multi-tenant mode - get workspace-specific LightRAG instance
-        workspace = await get_current_workspace(request)
+        # Use resolve_workspace_from_request to handle on-behalf operations
+        workspace = await resolve_workspace_from_request(request)
         return await workspace_manager.get_lightrag_instance(workspace)
     else:
         # Single-instance mode - use the provided rag instance
