@@ -1760,6 +1760,7 @@ async def pipeline_index_files_raganything(
     rag_anything: RAGAnything,
     file_paths: List[Path],
     scheme_name: str = None,
+    parser: str = "mineru",
     source: str = None,
 ):
     """Index multiple files using RAGAnything framework for multimodal processing.
@@ -1769,13 +1770,15 @@ async def pipeline_index_files_raganything(
         file_paths (List[Path]): List of file paths to be processed
         scheme_name (str, optional): Processing scheme name for categorization.
             Defaults to None.
+        parser (str, optional): Document extraction tool ('mineru' or 'docling').
+            Comes from schemeConfig.extractor in scan requests. Defaults to 'mineru'.
         source (str, optional): The model source used by Mineru.
             Defaults to None.
 
     Note:
         - Uses RAGAnything's process_document_complete_lightrag_api method for each file
         - Supports multimodal content processing (images, tables, equations)
-        - Parser is configured at RAGAnything instance level via config.parser
+        - Parser is passed per-call from schemeConfig.extractor
         - Files are processed with "auto" parse method
         - Output is saved to "./output" directory
         - Errors are logged but don't stop processing of remaining files
@@ -1796,6 +1799,7 @@ async def pipeline_index_files_raganything(
                 output_dir="./output",
                 parse_method="auto",
                 scheme_name=scheme_name,
+                parser=parser,
                 source=source,
             )
             if success:
@@ -1891,6 +1895,7 @@ async def run_scanning_process(
                     rag_anything,
                     new_files,
                     scheme_name=scheme_name,
+                    parser=extractor or "mineru",
                     source=modelSource,
                 )
                 logger.info(
@@ -2663,6 +2668,7 @@ All document processing endpoints (`/upload`, `/scan`, `/email`) support the uni
                     output_dir="./output",
                     parse_method="auto",
                     scheme_name=resolved.scheme_name or resolved.framework,
+                    parser=resolved.extractor or "mineru",
                     source=resolved.model_source,
                 )
 
