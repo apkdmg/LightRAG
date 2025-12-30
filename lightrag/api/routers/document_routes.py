@@ -31,6 +31,7 @@ from lightrag.base import DeletionResult, DocProcessingStatus, DocStatus
 from lightrag.utils import generate_track_id
 from lightrag.api.utils_api import get_combined_auth_dependency
 from lightrag.api.dependencies import resolve_workspace_from_request
+from lightrag.ragmanager import RAGManager
 from ..config import global_args
 from raganything import RAGAnything
 
@@ -1787,6 +1788,10 @@ async def pipeline_index_files_raganything(
         return
 
     try:
+        # Set RAGManager instance for multimodal processing in LightRAG.process_document
+        # This is needed because LightRAG internally calls RAGManager.get_rag() for multimodal content
+        RAGManager.set_rag(rag_anything)
+
         # Use get_pinyin_sort_key for Chinese pinyin sorting
         sorted_file_paths = sorted(
             file_paths, key=lambda p: get_pinyin_sort_key(str(p))
@@ -2662,8 +2667,31 @@ All document processing endpoints (`/upload`, `/scan`, `/email`) support the uni
                 current_rag_anything = await get_raganything_for_request(
                     request, rag_anything
                 )
+
+                # Wrapper to set RAGManager before processing
+                async def process_with_ragmanager(
+                    rag_anything_inst: RAGAnything,
+                    file_path: str,
+                    output_dir: str,
+                    parse_method: str,
+                    scheme_name: str,
+                    parser: str,
+                    source: str,
+                ):
+                    # Set RAGManager instance for multimodal processing in LightRAG.process_document
+                    RAGManager.set_rag(rag_anything_inst)
+                    await rag_anything_inst.process_document_complete_lightrag_api(
+                        file_path=file_path,
+                        output_dir=output_dir,
+                        parse_method=parse_method,
+                        scheme_name=scheme_name,
+                        parser=parser,
+                        source=source,
+                    )
+
                 background_tasks.add_task(
-                    current_rag_anything.process_document_complete_lightrag_api,
+                    process_with_ragmanager,
+                    rag_anything_inst=current_rag_anything,
                     file_path=str(file_path),
                     output_dir="./output",
                     parse_method="auto",
