@@ -202,7 +202,11 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
             rag_instance = await get_rag_for_request(http_request, _default_rag)
 
             param = request.to_query_params(False)
-            response = await rag_instance.aquery(request.query, param=param)
+            # Handle RAGAnything vs LightRAG instance
+            if hasattr(rag_instance, "lightrag"):  # RAGAnything instance
+                response = await rag_instance.aquery(request.query, mode=param.mode)
+            else:
+                response = await rag_instance.aquery(request.query, param=param)
 
             # If response is a string (e.g. cache hit), return directly
             if isinstance(response, str):
@@ -234,7 +238,11 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
             rag_instance = await get_rag_for_request(http_request, _default_rag)
 
             param = request.to_query_params(True)
-            response = await rag_instance.aquery(request.query, param=param)
+            # Handle RAGAnything vs LightRAG instance
+            if hasattr(rag_instance, "lightrag"):  # RAGAnything instance
+                response = await rag_instance.aquery(request.query, mode=param.mode)
+            else:
+                response = await rag_instance.aquery(request.query, param=param)
 
             from fastapi.responses import StreamingResponse
 
