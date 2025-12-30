@@ -665,7 +665,7 @@ def create_app(args):
         # Define LLM model function
         def llm_model_func(prompt, system_prompt=None, history_messages=[], **kwargs):
             return openai_complete_if_cache(
-                "gpt-4o-mini",
+                args.llm_model,
                 prompt,
                 system_prompt=system_prompt,
                 history_messages=history_messages,
@@ -680,7 +680,7 @@ def create_app(args):
         ):
             if image_data:
                 return openai_complete_if_cache(
-                    "gpt-4o",
+                    args.raganything_vision_model or args.llm_model,
                     "",
                     system_prompt=None,
                     history_messages=[],
@@ -712,11 +712,11 @@ def create_app(args):
 
         # Define embedding function
         raganything_embedding_func = EmbeddingFunc(
-            embedding_dim=3072,
-            max_token_size=8192,
+            embedding_dim=args.embedding_dim,
+            max_token_size=args.max_embed_tokens,
             func=lambda texts: openai_embed(
                 texts,
-                model="text-embedding-3-large",
+                model=args.raganything_embedding_model or args.embedding_model,
                 api_key=api_key,
                 base_url=base_url,
             ),
