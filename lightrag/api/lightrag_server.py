@@ -703,8 +703,8 @@ def create_app(args):
                         if image_data
                         else {"role": "user", "content": prompt},
                     ],
-                    api_key=api_key,
-                    base_url=base_url,
+                    api_key=args.raganything_vision_api_key or api_key,
+                    base_url=args.raganything_vision_host or base_url,
                     **kwargs,
                 )
             else:
@@ -716,9 +716,9 @@ def create_app(args):
             max_token_size=args.max_embed_tokens,
             func=lambda texts: openai_embed(
                 texts,
-                model=args.raganything_embedding_model or args.embedding_model,
-                api_key=api_key,
-                base_url=base_url,
+                model=args.embedding_model,
+                api_key=args.embedding_binding_api_key or api_key,
+                base_url=args.embedding_binding_host or base_url,
             ),
         )
 
@@ -826,8 +826,8 @@ def create_app(args):
                             if image_data
                             else {"role": "user", "content": prompt},
                         ],
-                        api_key=api_key,
-                        base_url=base_url,
+                        api_key=args.raganything_vision_api_key or api_key,
+                        base_url=args.raganything_vision_host or base_url,
                         **kwargs,
                     )
                 else:
@@ -836,8 +836,8 @@ def create_app(args):
                         prompt,
                         system_prompt=system_prompt,
                         history_messages=history_messages,
-                        api_key=api_key,
-                        base_url=base_url,
+                        api_key=args.llm_binding_api_key or api_key,
+                        base_url=args.llm_binding_host or base_url,
                         **kwargs,
                     )
 
@@ -848,9 +848,9 @@ def create_app(args):
                     max_token_size=8192,
                     func=lambda texts: openai_embed(
                         texts,
-                        model=args.raganything_embedding_model,
-                        api_key=api_key,
-                        base_url=base_url,
+                        model=args.embedding_model,
+                        api_key=args.embedding_binding_api_key or api_key,
+                        base_url=args.embedding_binding_host or base_url,
                     ),
                 )
 
