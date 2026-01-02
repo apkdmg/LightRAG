@@ -78,6 +78,17 @@ api = [
     "pytz",
     "uvicorn",
 ]
+test = [
+    "pytest>=7.0.0",
+    "pytest-asyncio>=0.21.0",
+    "pytest-cov>=4.0.0",
+    "httpx>=0.24.0",
+]
+dev = [
+    "lightrag-hku[api,test]",
+    "pre-commit",
+    "ruff",
+]
 
 [project.scripts]
 lightrag-server = "lightrag.api.lightrag_server:main"
@@ -103,3 +114,44 @@ lightrag = ["api/webui/**/*"]
 
 [tool.ruff]
 target-version = "py310"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+markers = [
+    "unit: Unit tests (fast, no external dependencies)",
+    "integration: Integration tests (may require storage setup)",
+    "api: API endpoint tests (requires FastAPI test client)",
+    "slow: Slow running tests",
+    "requires_llm: Tests requiring real LLM API calls",
+    "requires_db: Tests requiring database connections",
+]
+addopts = "-v --tb=short --strict-markers -ra"
+filterwarnings = [
+    "ignore::DeprecationWarning",
+    "ignore::PendingDeprecationWarning",
+]
+
+[tool.coverage.run]
+source = ["lightrag"]
+branch = true
+omit = [
+    "lightrag/api/webui/*",
+    "lightrag/tools/*",
+    "*/tests/*",
+]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "raise AssertionError",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+    "if TYPE_CHECKING:",
+]
+show_missing = true

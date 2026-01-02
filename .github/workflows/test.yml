@@ -1,0 +1,234 @@
+name: Tests
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+      - 'feature/**'
+      - 'fix/**'
+  pull_request:
+    branches:
+      - main
+      - develop
+
+jobs:
+  # Unit tests - fast, no external dependencies
+  unit-tests:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ['3.10', '3.11', '3.12']
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Cache pip dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ matrix.python-version }}-${{ hashFiles('**/pyproject.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-${{ matrix.python-version }}-
+            ${{ runner.os }}-pip-
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[api]"
+          pip install pytest pytest-asyncio pytest-cov httpx
+
+      - name: Run unit tests
+        run: |
+          pytest tests/unit/ -v --tb=short -m "unit or not integration and not api" --cov=lightrag --cov-report=xml --cov-report=term-missing
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v4
+        if: matrix.python-version == '3.11'
+        with:
+          file: ./coverage.xml
+          flags: unit
+          name: unit-tests
+          fail_ci_if_error: false
+
+  # Integration tests - test storage backends
+  integration-tests:
+    runs-on: ubuntu-latest
+    needs: unit-tests
+    strategy:
+      matrix:
+        python-version: ['3.11']
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Cache pip dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ matrix.python-version }}-${{ hashFiles('**/pyproject.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-${{ matrix.python-version }}-
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[api]"
+          pip install pytest pytest-asyncio pytest-cov httpx
+
+      - name: Run integration tests
+        run: |
+          pytest tests/integration/ -v --tb=short -m "integration" --cov=lightrag --cov-report=xml --cov-report=term-missing
+        env:
+          # Use default in-memory/file-based storages for CI
+          LIGHTRAG_KV_STORAGE: JsonKVStorage
+          LIGHTRAG_VECTOR_STORAGE: NanoVectorDBStorage
+          LIGHTRAG_GRAPH_STORAGE: NetworkXStorage
+          LIGHTRAG_DOC_STATUS_STORAGE: JsonDocStatusStorage
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          file: ./coverage.xml
+          flags: integration
+          name: integration-tests
+          fail_ci_if_error: false
+
+  # API tests - test FastAPI endpoints
+  api-tests:
+    runs-on: ubuntu-latest
+    needs: unit-tests
+    strategy:
+      matrix:
+        python-version: ['3.11']
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Cache pip dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ matrix.python-version }}-${{ hashFiles('**/pyproject.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-${{ matrix.python-version }}-
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[api]"
+          pip install pytest pytest-asyncio pytest-cov httpx
+
+      - name: Run API tests
+        run: |
+          pytest tests/api/ -v --tb=short -m "api" --cov=lightrag --cov-report=xml --cov-report=term-missing
+        env:
+          LIGHTRAG_API_KEY: test-api-key
+          TOKEN_SECRET: test-secret-for-ci
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          file: ./coverage.xml
+          flags: api
+          name: api-tests
+          fail_ci_if_error: false
+
+  # Full test suite for main branch
+  full-test-suite:
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' || github.event_name == 'pull_request'
+    needs: [unit-tests, integration-tests, api-tests]
+    strategy:
+      matrix:
+        python-version: ['3.11']
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Cache pip dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ matrix.python-version }}-${{ hashFiles('**/pyproject.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-${{ matrix.python-version }}-
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[api]"
+          pip install pytest pytest-asyncio pytest-cov httpx
+
+      - name: Run full test suite
+        run: |
+          pytest tests/ -v --tb=short --cov=lightrag --cov-report=xml --cov-report=html --cov-report=term-missing
+        env:
+          LIGHTRAG_KV_STORAGE: JsonKVStorage
+          LIGHTRAG_VECTOR_STORAGE: NanoVectorDBStorage
+          LIGHTRAG_GRAPH_STORAGE: NetworkXStorage
+          LIGHTRAG_DOC_STATUS_STORAGE: JsonDocStatusStorage
+          LIGHTRAG_API_KEY: test-api-key
+          TOKEN_SECRET: test-secret-for-ci
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          file: ./coverage.xml
+          flags: full
+          name: full-test-suite
+          fail_ci_if_error: false
+
+      - name: Upload HTML coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: htmlcov/
+          retention-days: 7
+
+  # Test summary job
+  test-summary:
+    runs-on: ubuntu-latest
+    needs: [unit-tests, integration-tests, api-tests]
+    if: always()
+
+    steps:
+      - name: Check test results
+        run: |
+          if [ "${{ needs.unit-tests.result }}" == "failure" ]; then
+            echo "Unit tests failed!"
+            exit 1
+          fi
+          if [ "${{ needs.integration-tests.result }}" == "failure" ]; then
+            echo "Integration tests failed!"
+            exit 1
+          fi
+          if [ "${{ needs.api-tests.result }}" == "failure" ]; then
+            echo "API tests failed!"
+            exit 1
+          fi
+          echo "All tests passed!"
