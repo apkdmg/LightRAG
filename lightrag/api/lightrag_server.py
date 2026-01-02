@@ -655,8 +655,8 @@ def create_app(args):
 
         config = RAGAnythingConfig(
             working_dir=args.working_dir or "./rag_storage",
-            parser="mineru",  # Parser selection: mineru or docling
-            parse_method="auto",  # Parse method: auto, ocr, or txt
+            parser=args.raganything_parser or "mineru",  # Parser selection: mineru or docling
+            parse_method=args.raganything_parse_method or "auto",  # Parse method: auto, ocr, or txt
             enable_image_processing=True,
             enable_table_processing=True,
             enable_equation_processing=True,
@@ -669,8 +669,8 @@ def create_app(args):
                 prompt,
                 system_prompt=system_prompt,
                 history_messages=history_messages,
-                api_key=api_key,
-                base_url=base_url,
+                api_key=args.llm_binding_api_key or api_key,
+                base_url=args.llm_binding_host or base_url,
                 **kwargs,
             )
 
