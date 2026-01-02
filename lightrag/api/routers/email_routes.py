@@ -30,6 +30,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import aiofiles
 from fastapi import (
     APIRouter,
+    BackgroundTasks,
     Depends,
     File,
     Form,
@@ -46,6 +47,7 @@ from lightrag.api.routers.document_routes import (
     get_default_framework,
     resolve_scheme,
     validate_framework_availability,
+    generate_track_id,
 )
 
 logger = logging.getLogger("lightrag.api.email")
@@ -92,10 +94,24 @@ class EmailIngestionResponse(BaseModel):
     status: str
     bundle_id: str
     message: str
-    documents_created: int
+    track_id: str = Field(
+        default="",
+        description="Track ID for monitoring background processing status. "
+        "Use GET /documents/status/{track_id} to check progress.",
+    )
+    documents_created: int = Field(
+        default=0,
+        description="Number of documents created (0 when processing in background).",
+    )
     email_subject: str
-    attachments_processed: int
-    inline_images_processed: int
+    attachments_processed: int = Field(
+        default=0,
+        description="Number of attachments processed (0 when processing in background).",
+    )
+    inline_images_processed: int = Field(
+        default=0,
+        description="Number of inline images processed (0 when processing in background).",
+    )
 
 
 class EmailAttachmentInfo(BaseModel):
@@ -1224,6 +1240,7 @@ Priority order: `scheme` > `framework`
     )
     async def ingest_email(
         http_request: Request,
+        background_tasks: BackgroundTasks,
         email_file: Optional[UploadFile] = File(
             None,
             description="Complete .eml file containing email with all attachments",
@@ -1394,17 +1411,47 @@ Priority order: `scheme` > `framework`
                     detail="Must provide either 'email_file' (.eml) or 'metadata' (structured input)",
                 )
 
-            # Ingest the email
-            result = await service.ingest_email(parsed_email)
+            # Generate bundle_id and track_id for background processing
+            bundle_id = hashlib.sha256(parsed_email.message_id.encode()).hexdigest()[:12]
+            bundle_id = f"email_{bundle_id}"
+            track_id = generate_track_id("email")
+
+            # Define background task for email ingestion
+            async def process_email_background(
+                svc: Any,
+                email: ParsedEmail,
+                t_id: str,
+            ):
+                """Background task to ingest email."""
+                try:
+                    logger.info(f"[{t_id}] Starting background email ingestion for: {email.subject}")
+                    result = await svc.ingest_email(email)
+                    logger.info(
+                        f"[{t_id}] Email ingestion completed: {result['documents_created']} documents, "
+                        f"{result['attachments_processed']} attachments, "
+                        f"{result['inline_images_processed']} inline images"
+                    )
+                except Exception as e:
+                    logger.error(f"[{t_id}] Email ingestion failed: {str(e)}")
+                    logger.error(traceback.format_exc())
+
+            # Add to background tasks
+            background_tasks.add_task(
+                process_email_background,
+                svc=service,
+                email=parsed_email,
+                t_id=track_id,
+            )
 
             return EmailIngestionResponse(
                 status="success",
-                bundle_id=result["bundle_id"],
-                message=f"Email '{parsed_email.subject}' ingested successfully",
-                documents_created=result["documents_created"],
-                email_subject=result["email_subject"],
-                attachments_processed=result["attachments_processed"],
-                inline_images_processed=result["inline_images_processed"],
+                bundle_id=bundle_id,
+                message=f"Email '{parsed_email.subject}' accepted. Processing will continue in background.",
+                track_id=track_id,
+                email_subject=parsed_email.subject,
+                documents_created=0,
+                attachments_processed=0,
+                inline_images_processed=0,
             )
 
         except HTTPException:
