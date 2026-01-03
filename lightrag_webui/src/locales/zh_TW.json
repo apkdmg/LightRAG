@@ -30,7 +30,15 @@
     "errorEmptyFields": "請輸入您的帳號和密碼",
     "errorInvalidCredentials": "登入失敗，請檢查帳號和密碼",
     "authDisabled": "認證已停用，使用免登入模式",
-    "guestMode": "免登入"
+    "guestMode": "免登入",
+    "ssoButton": "使用 UNIMAS SSO 登入",
+    "ssoLoggingIn": "正在連接 SSO...",
+    "ssoError": "SSO 登入失敗",
+    "ssoSuccess": "SSO 登入成功",
+    "ssoProcessing": "正在處理 SSO 登入...",
+    "ssoVerifying": "正在驗證您的憑證...",
+    "redirectingToLogin": "正在跳轉至登入頁面...",
+    "orDivider": "或使用"
   },
   "common": {
     "cancel": "取消",

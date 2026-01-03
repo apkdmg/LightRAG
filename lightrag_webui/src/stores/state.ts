@@ -27,14 +27,15 @@ interface BackendState {
 
 interface AuthState {
   isAuthenticated: boolean;
-  isGuestMode: boolean;  // Add guest mode flag
+  isGuestMode: boolean;  // Guest mode flag
+  isSSOMode: boolean;    // SSO/OAuth2 mode flag
   coreVersion: string | null;
   apiVersion: string | null;
   username: string | null; // login username
   webuiTitle: string | null; // Custom title
   webuiDescription: string | null; // Title description
 
-  login: (token: string, isGuest?: boolean, coreVersion?: string | null, apiVersion?: string | null, webuiTitle?: string | null, webuiDescription?: string | null) => void;
+  login: (token: string, isGuest?: boolean, isSSO?: boolean, coreVersion?: string | null, apiVersion?: string | null, webuiTitle?: string | null, webuiDescription?: string | null) => void;
   logout: () => void;
   setVersion: (coreVersion: string | null, apiVersion: string | null) => void;
   setCustomTitle: (webuiTitle: string | null, webuiDescription: string | null) => void;
@@ -179,18 +180,20 @@ const isGuestToken = (token: string): boolean => {
   return payload.role === 'guest';
 };
 
-const initAuthState = (): { isAuthenticated: boolean; isGuestMode: boolean; coreVersion: string | null; apiVersion: string | null; username: string | null; webuiTitle: string | null; webuiDescription: string | null } => {
+const initAuthState = (): { isAuthenticated: boolean; isGuestMode: boolean; isSSOMode: boolean; coreVersion: string | null; apiVersion: string | null; username: string | null; webuiTitle: string | null; webuiDescription: string | null } => {
   const token = localStorage.getItem('LIGHTRAG-API-TOKEN');
   const coreVersion = localStorage.getItem('LIGHTRAG-CORE-VERSION');
   const apiVersion = localStorage.getItem('LIGHTRAG-API-VERSION');
   const webuiTitle = localStorage.getItem('LIGHTRAG-WEBUI-TITLE');
   const webuiDescription = localStorage.getItem('LIGHTRAG-WEBUI-DESCRIPTION');
+  const isSSOMode = localStorage.getItem('LIGHTRAG-SSO-MODE') === 'true';
   const username = token ? getUsernameFromToken(token) : null;
 
   if (!token) {
     return {
       isAuthenticated: false,
       isGuestMode: false,
+      isSSOMode: false,
       coreVersion: coreVersion,
       apiVersion: apiVersion,
       username: null,
@@ -202,6 +205,7 @@ const initAuthState = (): { isAuthenticated: boolean; isGuestMode: boolean; core
   return {
     isAuthenticated: true,
     isGuestMode: isGuestToken(token),
+    isSSOMode: isSSOMode,
     coreVersion: coreVersion,
     apiVersion: apiVersion,
     username: username,
@@ -217,14 +221,22 @@ export const useAuthStore = create<AuthState>(set => {
   return {
     isAuthenticated: initialState.isAuthenticated,
     isGuestMode: initialState.isGuestMode,
+    isSSOMode: initialState.isSSOMode,
     coreVersion: initialState.coreVersion,
     apiVersion: initialState.apiVersion,
     username: initialState.username,
     webuiTitle: initialState.webuiTitle,
     webuiDescription: initialState.webuiDescription,
 
-    login: (token, isGuest = false, coreVersion = null, apiVersion = null, webuiTitle = null, webuiDescription = null) => {
+    login: (token, isGuest = false, isSSO = false, coreVersion = null, apiVersion = null, webuiTitle = null, webuiDescription = null) => {
       localStorage.setItem('LIGHTRAG-API-TOKEN', token);
+
+      // Store SSO mode flag
+      if (isSSO) {
+        localStorage.setItem('LIGHTRAG-SSO-MODE', 'true');
+      } else {
+        localStorage.removeItem('LIGHTRAG-SSO-MODE');
+      }
 
       if (coreVersion) {
         localStorage.setItem('LIGHTRAG-CORE-VERSION', coreVersion);
@@ -249,6 +261,7 @@ export const useAuthStore = create<AuthState>(set => {
       set({
         isAuthenticated: true,
         isGuestMode: isGuest,
+        isSSOMode: isSSO,
         username: username,
         coreVersion: coreVersion,
         apiVersion: apiVersion,
@@ -259,6 +272,7 @@ export const useAuthStore = create<AuthState>(set => {
 
     logout: () => {
       localStorage.removeItem('LIGHTRAG-API-TOKEN');
+      localStorage.removeItem('LIGHTRAG-SSO-MODE');
 
       const coreVersion = localStorage.getItem('LIGHTRAG-CORE-VERSION');
       const apiVersion = localStorage.getItem('LIGHTRAG-API-VERSION');
@@ -268,6 +282,7 @@ export const useAuthStore = create<AuthState>(set => {
       set({
         isAuthenticated: false,
         isGuestMode: false,
+        isSSOMode: false,
         username: null,
         coreVersion: coreVersion,
         apiVersion: apiVersion,

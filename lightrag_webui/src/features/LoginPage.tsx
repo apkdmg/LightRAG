@@ -2,13 +2,13 @@ import { useState, useEffect, useRef } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useAuthStore } from '@/stores/state'
 import { useSettingsStore } from '@/stores/settings'
-import { loginToServer, getAuthStatus } from '@/api/lightrag'
+import { loginToServer, getAuthStatus, initiateOAuth2Login } from '@/api/lightrag'
 import { toast } from 'sonner'
 import { useTranslation } from 'react-i18next'
 import { Card, CardContent, CardHeader } from '@/components/ui/Card'
 import Input from '@/components/ui/Input'
 import Button from '@/components/ui/Button'
-import { ZapIcon } from 'lucide-react'
+import { ZapIcon, KeyRound } from 'lucide-react'
 import AppSettings from '@/components/AppSettings'
 
 const LoginPage = () => {
@@ -16,9 +16,11 @@ const LoginPage = () => {
   const { login, isAuthenticated } = useAuthStore()
   const { t } = useTranslation()
   const [loading, setLoading] = useState(false)
+  const [ssoLoading, setSSOLoading] = useState(false)
   const [username, setUsername] = useState('')
   const [password, setPassword] = useState('')
   const [checkingAuth, setCheckingAuth] = useState(true)
+  const [oauth2Enabled, setOAuth2Enabled] = useState(false)
   const authCheckRef = useRef(false); // Prevent duplicate calls in Vite dev mode
 
   useEffect(() => {
@@ -45,6 +47,11 @@ const LoginPage = () => {
         // Check auth status
         const status = await getAuthStatus()
 
+        // Set OAuth2 enabled status from auth-status response
+        if (status.oauth2_enabled) {
+          setOAuth2Enabled(true)
+        }
+
         // Set session flag for version check to avoid duplicate checks in App component
         if (status.core_version || status.api_version) {
           sessionStorage.setItem('VERSION_CHECKED_FROM_LOGIN', 'true');
@@ -52,7 +59,7 @@ const LoginPage = () => {
 
         if (!status.auth_configured && status.access_token) {
           // If auth is not configured, use the guest token and redirect
-          login(status.access_token, true, status.core_version, status.api_version, status.webui_title || null, status.webui_description || null)
+          login(status.access_token, true, false, status.core_version, status.api_version, status.webui_title || null, status.webui_description || null)
           if (status.message) {
             toast.info(status.message)
           }
@@ -82,6 +89,22 @@ const LoginPage = () => {
   // Don't render anything while checking auth
   if (checkingAuth) {
     return null
+  }
+
+  const handleSSOLogin = async () => {
+    try {
+      setSSOLoading(true)
+      const { authorization_url } = await initiateOAuth2Login()
+
+      // Redirect to Keycloak login page
+      // The callback will be handled by the OAuth2Callback component
+      window.location.href = authorization_url
+    } catch (error) {
+      console.error('SSO login failed:', error)
+      toast.error(t('login.ssoError', 'SSO login failed. Please try again.'))
+      setSSOLoading(false)
+    }
+    // Note: Don't set setSSOLoading(false) on success since we're redirecting
   }
 
   const handleSubmit = async (e: React.FormEvent<HTMLFormElement>) => {
@@ -115,7 +138,7 @@ const LoginPage = () => {
 
       // Check authentication mode
       const isGuestMode = response.auth_mode === 'disabled'
-      login(response.access_token, isGuestMode, response.core_version, response.api_version, response.webui_title || null, response.webui_description || null)
+      login(response.access_token, isGuestMode, false, response.core_version, response.api_version, response.webui_title || null, response.webui_description || null)
 
       // Set session flag for version check
       if (response.core_version || response.api_version) {
@@ -165,6 +188,34 @@ const LoginPage = () => {
           </div>
         </CardHeader>
         <CardContent className="px-8 pb-8">
+          {/* SSO Button - Show above the form when OAuth2 is enabled */}
+          {oauth2Enabled && (
+            <>
+              <Button
+                type="button"
+                variant="outline"
+                className="w-full h-11 text-base font-medium mb-4 border-emerald-500 text-emerald-600 hover:bg-emerald-50 dark:border-emerald-400 dark:text-emerald-400 dark:hover:bg-emerald-900/20"
+                onClick={handleSSOLogin}
+                disabled={ssoLoading}
+              >
+                <KeyRound className="mr-2 h-5 w-5" />
+                {ssoLoading ? t('login.ssoLoggingIn', 'Connecting to SSO...') : t('login.ssoButton', 'Sign in with UNIMAS SSO')}
+              </Button>
+
+              <div className="relative my-6">
+                <div className="absolute inset-0 flex items-center">
+                  <span className="w-full border-t" />
+                </div>
+                <div className="relative flex justify-center text-xs uppercase">
+                  <span className="bg-white dark:bg-gray-800 px-2 text-muted-foreground">
+                    {t('login.orDivider', 'Or continue with')}
+                  </span>
+                </div>
+              </div>
+            </>
+          )}
+
+          {/* Existing username/password form */}
           <form onSubmit={handleSubmit} className="space-y-6">
             <div className="flex items-center gap-4">
               <label htmlFor="username-input" className="text-sm font-medium w-16 shrink-0">

@@ -226,6 +226,8 @@ export type AuthStatusResponse = {
   api_version?: string
   webui_title?: string
   webui_description?: string
+  oauth2_enabled?: boolean
+  oauth2_provider?: string | null
 }
 
 export type PipelineStatusResponse = {
@@ -245,8 +247,33 @@ export type PipelineStatusResponse = {
 export type LoginResponse = {
   access_token: string
   token_type: string
-  auth_mode?: 'enabled' | 'disabled'  // Authentication mode identifier
+  auth_mode?: 'enabled' | 'disabled' | 'sso'  // Authentication mode identifier
   message?: string                    // Optional message
+  role?: string
+  username?: string
+  core_version?: string
+  api_version?: string
+  webui_title?: string
+  webui_description?: string
+}
+
+// OAuth2/SSO Types
+export type OAuth2ConfigResponse = {
+  oauth2_enabled: boolean
+  oauth2_provider: string | null
+}
+
+export type OAuth2AuthorizeResponse = {
+  authorization_url: string
+  state: string
+}
+
+export type OAuth2CallbackResponse = {
+  access_token: string
+  token_type: string
+  auth_mode: 'sso'
+  role: string
+  username: string
   core_version?: string
   api_version?: string
   webui_title?: string
@@ -811,5 +838,46 @@ export const getDocumentsPaginated = async (request: DocumentsRequest): Promise<
  */
 export const getDocumentStatusCounts = async (): Promise<StatusCountsResponse> => {
   const response = await axiosInstance.get('/documents/status_counts')
+  return response.data
+}
+
+// ==================== OAuth2/SSO API Functions ====================
+
+/**
+ * Get OAuth2 configuration status
+ * @returns Promise with OAuth2 configuration (enabled status and provider)
+ */
+export const getOAuth2Config = async (): Promise<OAuth2ConfigResponse> => {
+  try {
+    const response = await axiosInstance.get('/oauth2/config')
+    return response.data
+  } catch (error) {
+    console.error('Failed to get OAuth2 config:', error)
+    return { oauth2_enabled: false, oauth2_provider: null }
+  }
+}
+
+/**
+ * Initiate OAuth2 login flow
+ * @returns Promise with authorization URL and state for redirect
+ */
+export const initiateOAuth2Login = async (): Promise<OAuth2AuthorizeResponse> => {
+  const response = await axiosInstance.get('/oauth2/authorize')
+  return response.data
+}
+
+/**
+ * Handle OAuth2 callback - exchange authorization code for tokens
+ * @param code The authorization code from the OAuth2 provider
+ * @param state The state parameter for CSRF validation
+ * @returns Promise with access token and user info
+ */
+export const handleOAuth2Callback = async (
+  code: string,
+  state: string
+): Promise<OAuth2CallbackResponse> => {
+  const response = await axiosInstance.get('/oauth2/callback', {
+    params: { code, state }
+  })
   return response.data
 }

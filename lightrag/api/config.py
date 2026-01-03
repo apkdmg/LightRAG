@@ -363,6 +363,34 @@ def parse_args() -> argparse.Namespace:
     args.guest_token_expire_hours = get_env_value("GUEST_TOKEN_EXPIRE_HOURS", 24, int)
     args.jwt_algorithm = get_env_value("JWT_ALGORITHM", "HS256")
 
+    # OAuth2/Keycloak SSO Configuration
+    args.oauth2_enabled = get_env_value("OAUTH2_ENABLED", False, bool)
+    args.oauth2_client_id = get_env_value("OAUTH2_CLIENT_ID", "")
+    args.oauth2_client_secret = get_env_value("OAUTH2_CLIENT_SECRET", None)
+    args.oauth2_issuer = get_env_value(
+        "OAUTH2_ISSUER", "https://id.unimas.my/realms/UNIMAS"
+    )
+    args.oauth2_authorization_endpoint = get_env_value(
+        "OAUTH2_AUTHORIZATION_ENDPOINT",
+        "https://id.unimas.my/realms/UNIMAS/protocol/openid-connect/auth",
+    )
+    args.oauth2_token_endpoint = get_env_value(
+        "OAUTH2_TOKEN_ENDPOINT",
+        "https://id.unimas.my/realms/UNIMAS/protocol/openid-connect/token",
+    )
+    args.oauth2_userinfo_endpoint = get_env_value(
+        "OAUTH2_USERINFO_ENDPOINT",
+        "https://id.unimas.my/realms/UNIMAS/protocol/openid-connect/userinfo",
+    )
+    args.oauth2_jwks_uri = get_env_value(
+        "OAUTH2_JWKS_URI",
+        "https://id.unimas.my/realms/UNIMAS/protocol/openid-connect/certs",
+    )
+    args.oauth2_redirect_uri = get_env_value(
+        "OAUTH2_REDIRECT_URI", "http://localhost:8020/oauth2/callback"
+    )
+    args.oauth2_scopes = get_env_value("OAUTH2_SCOPES", "openid profile email")
+
     # Rerank model configuration
     args.rerank_model = get_env_value("RERANK_MODEL", None)
     args.rerank_binding_host = get_env_value("RERANK_BINDING_HOST", None)

@@ -952,6 +952,12 @@ def create_app(args):
     async def get_auth_status():
         """Get authentication status and guest token if auth is not configured"""
 
+        # OAuth2/SSO configuration status
+        oauth2_info = {
+            "oauth2_enabled": global_args.oauth2_enabled,
+            "oauth2_provider": "keycloak" if global_args.oauth2_enabled else None,
+        }
+
         if not auth_handler.accounts:
             # Authentication not configured, return guest token
             guest_token = auth_handler.create_token(
@@ -967,6 +973,7 @@ def create_app(args):
                 "api_version": __api_version__,
                 "webui_title": webui_title,
                 "webui_description": webui_description,
+                **oauth2_info,
             }
 
         return {
@@ -976,6 +983,7 @@ def create_app(args):
             "api_version": __api_version__,
             "webui_title": webui_title,
             "webui_description": webui_description,
+            **oauth2_info,
         }
 
     @app.post("/login")
@@ -1018,6 +1026,113 @@ def create_app(args):
             "token_type": "bearer",
             "auth_mode": "enabled",
             "role": role,
+            "core_version": core_version,
+            "api_version": __api_version__,
+            "webui_title": webui_title,
+            "webui_description": webui_description,
+        }
+
+    # ==================== OAuth2/SSO Endpoints ====================
+
+    @app.get("/oauth2/config")
+    async def oauth2_config():
+        """
+        Return OAuth2 configuration status for frontend.
+        Does not expose sensitive information like client_secret.
+        """
+        return {
+            "oauth2_enabled": global_args.oauth2_enabled,
+            "oauth2_provider": "keycloak" if global_args.oauth2_enabled else None,
+        }
+
+    @app.get("/oauth2/authorize")
+    async def oauth2_authorize():
+        """
+        Initiate OAuth2 authorization flow.
+        Returns the Keycloak authorization URL for frontend redirect.
+        """
+        from .oauth2 import get_keycloak_client
+
+        keycloak = get_keycloak_client()
+        if not keycloak:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="OAuth2/SSO is not configured. Set OAUTH2_ENABLED=true in environment.",
+            )
+
+        auth_url, state = keycloak.get_authorization_url()
+        return {"authorization_url": auth_url, "state": state}
+
+    @app.get("/oauth2/callback")
+    async def oauth2_callback(code: str, state: str):
+        """
+        Handle OAuth2 callback from Keycloak.
+        Exchanges authorization code for tokens and returns a local JWT.
+        """
+        from .oauth2 import get_keycloak_client
+
+        keycloak = get_keycloak_client()
+        if not keycloak:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="OAuth2/SSO is not configured",
+            )
+
+        # Exchange authorization code for tokens
+        tokens = await keycloak.exchange_code(code, state)
+        id_token = tokens.get("id_token")
+
+        if not id_token:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="No ID token received from identity provider",
+            )
+
+        # Validate ID token using JWKS
+        token_payload = keycloak.validate_id_token(id_token)
+        user_info = keycloak.extract_user_info(token_payload)
+
+        # Get username (prefer email, fallback to preferred_username or sub)
+        username = (
+            user_info.get("email")
+            or user_info.get("preferred_username")
+            or user_info.get("sub")
+        )
+
+        if not username:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Could not determine username from identity provider token",
+            )
+
+        # Determine role: only ADMIN_ACCOUNTS get admin, all SSO users get "user"
+        admin_usernames = set()
+        if global_args.admin_accounts:
+            admin_usernames = {
+                name.strip()
+                for name in global_args.admin_accounts.split(",")
+                if name.strip()
+            }
+        role = "admin" if username in admin_usernames else "user"
+
+        # Create local JWT token
+        user_token = auth_handler.create_token(
+            username=username,
+            role=role,
+            metadata={
+                "auth_mode": "sso",
+                "sso_provider": "keycloak",
+                "keycloak_sub": user_info.get("sub"),
+                "name": user_info.get("name"),
+            },
+        )
+
+        return {
+            "access_token": user_token,
+            "token_type": "bearer",
+            "auth_mode": "sso",
+            "role": role,
+            "username": username,
             "core_version": core_version,
             "api_version": __api_version__,
             "webui_title": webui_title,

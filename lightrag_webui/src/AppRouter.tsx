@@ -5,6 +5,7 @@ import { navigationService } from '@/services/navigation'
 import { Toaster } from 'sonner'
 import App from './App'
 import LoginPage from '@/features/LoginPage'
+import OAuth2Callback from '@/features/OAuth2Callback'
 import ThemeProvider from '@/components/ThemeProvider'
 
 const AppContent = () => {
@@ -52,7 +53,8 @@ const AppContent = () => {
   useEffect(() => {
     if (!initializing && !isAuthenticated) {
       const currentPath = window.location.hash.slice(1);
-      if (currentPath !== '/login') {
+      // Don't redirect if on login page or OAuth2 callback page
+      if (currentPath !== '/login' && !currentPath.startsWith('/oauth2/callback')) {
         console.log('Not authenticated, redirecting to login');
         navigate('/login');
       }
@@ -67,6 +69,7 @@ const AppContent = () => {
   return (
     <Routes>
       <Route path="/login" element={<LoginPage />} />
+      <Route path="/oauth2/callback" element={<OAuth2Callback />} />
       <Route
         path="/*"
         element={isAuthenticated ? <App /> : null}
