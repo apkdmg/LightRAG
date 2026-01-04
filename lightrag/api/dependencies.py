@@ -64,7 +64,12 @@ def get_workspace_manager(request: Request) -> WorkspaceManager:
 
 def _extract_token_from_request(request: Request) -> Optional[str]:
     """
-    Extract the Bearer token from the Authorization header.
+    Extract the Bearer token from the Authorization header or HTTP-only cookie.
+
+    Security: This function supports both header-based auth (for REST clients)
+    and cookie-based auth (for browser-based WebUI after OAuth2 SSO login).
+    The cookie-based approach is more secure for SPAs as it prevents XSS attacks
+    from accessing the token.
 
     Args:
         request: The FastAPI request object.
@@ -72,9 +77,17 @@ def _extract_token_from_request(request: Request) -> Optional[str]:
     Returns:
         The token string if present, None otherwise.
     """
+    # First, check Authorization header (for REST API clients)
     auth_header = request.headers.get("Authorization")
     if auth_header and auth_header.startswith("Bearer "):
         return auth_header[7:]  # Remove "Bearer " prefix
+
+    # Second, check HTTP-only cookie (for browser-based WebUI with SSO)
+    # This is the secure way to store tokens for SPAs
+    token_cookie = request.cookies.get("lightrag_token")
+    if token_cookie:
+        return token_cookie
+
     return None
 
 
@@ -95,8 +108,18 @@ async def resolve_user_from_request(request: Request) -> UserInfo:
     Raises:
         HTTPException: If authentication fails or token is invalid.
     """
+    # Check if request was authenticated via API key
+    api_key_user = getattr(request.state, "api_key_user", None)
+    if api_key_user:
+        return UserInfo(
+            username=api_key_user["username"],
+            role=api_key_user["role"],
+            workspace_id=api_key_user["workspace_id"],
+            metadata=api_key_user["metadata"],
+        )
+
     token = _extract_token_from_request(request)
-    return await _resolve_user(token)
+    return await _resolve_user(token, request)
 
 
 async def resolve_workspace_from_request(request: Request) -> str:
@@ -109,6 +132,9 @@ async def resolve_workspace_from_request(request: Request) -> str:
     Use this when calling from helper functions that are not part of
     FastAPI's dependency injection chain.
 
+    IMPORTANT: Service accounts (X-API-Key and Client Credentials) MUST provide
+    the X-Target-Workspace header.
+
     Args:
         request: The FastAPI request object.
 
@@ -116,11 +142,16 @@ async def resolve_workspace_from_request(request: Request) -> str:
         The workspace ID to use for this request.
 
     Raises:
-        HTTPException: If authentication fails, token is invalid, or
-            a non-admin tries to use on-behalf operations.
+        HTTPException: If authentication fails, token is invalid,
+            a non-admin tries to use on-behalf operations, or
+            a service account doesn't provide X-Target-Workspace.
     """
     user = await resolve_user_from_request(request)
     target_workspace = request.headers.get(TARGET_WORKSPACE_HEADER)
+
+    # Check if this is a service account (API key or Client Credentials)
+    auth_mode = user.metadata.get("auth_mode", "")
+    is_service_account = auth_mode in ("api_key", "client_credentials")
 
     if target_workspace:
         # On-behalf operation - admin only
@@ -140,16 +171,30 @@ async def resolve_workspace_from_request(request: Request) -> str:
         )
         return sanitized_target
 
+    # Service accounts MUST provide X-Target-Workspace
+    if is_service_account:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="X-Target-Workspace header is required when using API key or Client Credentials authentication",
+        )
+
     # Normal operation - use own workspace
     return user.workspace_id
 
 
-async def _resolve_user(token: Optional[str]) -> UserInfo:
+async def _resolve_user(
+    token: Optional[str], request: Optional[Request] = None
+) -> UserInfo:
     """
     Core user resolution logic shared by DI and non-DI paths.
 
+    Supports hybrid token validation:
+    - LightRAG JWT tokens (from /login endpoint)
+    - Keycloak access tokens (if OAuth2 is enabled)
+
     Args:
         token: The JWT token (or None).
+        request: Optional request object (for future extensions).
 
     Returns:
         UserInfo containing the authenticated user's details.
@@ -157,7 +202,7 @@ async def _resolve_user(token: Optional[str]) -> UserInfo:
     Raises:
         HTTPException: If authentication fails or token is invalid.
     """
-    from .auth import auth_handler
+    from .auth import auth_handler, validate_any_token
 
     # Check if auth is configured
     if not auth_handler.accounts:
@@ -176,9 +221,9 @@ async def _resolve_user(token: Optional[str]) -> UserInfo:
             headers={"WWW-Authenticate": "Bearer"},
         )
 
-    # Validate token
+    # Use hybrid token validation (LightRAG JWT or Keycloak access token)
     try:
-        payload = auth_handler.validate_token(token)
+        payload = validate_any_token(token)
     except HTTPException:
         raise
     except Exception as e:
@@ -212,6 +257,11 @@ async def get_current_user(
     This is a FastAPI dependency - use resolve_user_from_request() when
     calling from non-DI contexts.
 
+    Supports:
+    - API key authentication (via request.state.api_key_user)
+    - Authorization header (for REST API clients)
+    - HTTP-only cookie (for browser-based WebUI with SSO)
+
     Args:
         request: The FastAPI request object.
         token: The JWT token from the Authorization header (injected by FastAPI).
@@ -222,7 +272,21 @@ async def get_current_user(
     Raises:
         HTTPException: If authentication fails or token is invalid.
     """
-    return await _resolve_user(token)
+    # Check if request was authenticated via API key (set by combined_dependency)
+    api_key_user = getattr(request.state, "api_key_user", None)
+    if api_key_user:
+        return UserInfo(
+            username=api_key_user["username"],
+            role=api_key_user["role"],
+            workspace_id=api_key_user["workspace_id"],
+            metadata=api_key_user["metadata"],
+        )
+
+    # If no token from header, check cookie (for SSO cookie-based auth)
+    if not token:
+        token = request.cookies.get("lightrag_token")
+
+    return await _resolve_user(token, request)
 
 
 async def get_current_workspace(
@@ -236,6 +300,10 @@ async def get_current_workspace(
     For regular users, returns their own workspace.
     For admins with the header, returns the target workspace.
 
+    IMPORTANT: Service accounts (X-API-Key and Client Credentials) MUST provide
+    the X-Target-Workspace header for any workspace endpoint, as they don't have
+    a personal workspace.
+
     Args:
         request: The FastAPI request object.
         user: The authenticated user info.
@@ -244,9 +312,14 @@ async def get_current_workspace(
         The workspace ID to use for this request.
 
     Raises:
-        HTTPException: If a non-admin tries to use on-behalf operations.
+        HTTPException: If a non-admin tries to use on-behalf operations,
+            or if a service account doesn't provide X-Target-Workspace.
     """
     target_workspace = request.headers.get(TARGET_WORKSPACE_HEADER)
+
+    # Check if this is a service account (API key or Client Credentials)
+    auth_mode = user.metadata.get("auth_mode", "")
+    is_service_account = auth_mode in ("api_key", "client_credentials")
 
     if target_workspace:
         # On-behalf operation - admin only
@@ -265,6 +338,13 @@ async def get_current_workspace(
             f"Admin '{user.username}' operating on behalf of workspace: {sanitized_target}"
         )
         return sanitized_target
+
+    # Service accounts MUST provide X-Target-Workspace for workspace endpoints
+    if is_service_account:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="X-Target-Workspace header is required when using API key or Client Credentials authentication",
+        )
 
     # Normal operation - use own workspace
     return user.workspace_id

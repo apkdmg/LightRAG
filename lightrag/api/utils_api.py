@@ -132,6 +132,14 @@ def get_combined_auth_dependency(api_key: Optional[str] = None):
             and api_key_header_value
             and api_key_header_value == api_key
         ):
+            # Store service account user info in request state for downstream dependencies
+            # This allows get_current_user() to return a valid UserInfo for API key auth
+            request.state.api_key_user = {
+                "username": "api_key_service_account",
+                "role": "admin",  # API key holder has admin privileges for on-behalf operations
+                "workspace_id": "service_account",
+                "metadata": {"auth_mode": "api_key"},
+            }
             return  # API key validation successful
 
         ### Authentication failed ####

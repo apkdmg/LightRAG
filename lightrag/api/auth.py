@@ -150,3 +150,97 @@ class AuthHandler:
 
 
 auth_handler = AuthHandler()
+
+
+def _is_admin_user(username: str) -> bool:
+    """
+    Check if username is in ADMIN_ACCOUNTS.
+
+    Args:
+        username: The username to check
+
+    Returns:
+        bool: True if user is an admin
+    """
+    admin_accounts = global_args.admin_accounts
+    if not admin_accounts:
+        return False
+    admins = [a.strip().lower() for a in admin_accounts.split(",")]
+    return username.lower() in admins
+
+
+def validate_any_token(token: str) -> dict:
+    """
+    Validate token as LightRAG JWT or Keycloak access token.
+
+    This is a hybrid validator that supports:
+    - LightRAG JWT (from /login endpoint)
+    - Keycloak user access token (from Authorization Code flow)
+    - Keycloak service account token (from Client Credentials flow)
+
+    Returns standardized user info dict with keys:
+    - username: The user's username
+    - role: User role (admin, user, guest)
+    - workspace_id: The user's workspace ID
+    - metadata: Additional metadata including auth_mode
+
+    Args:
+        token: The JWT token to validate
+
+    Returns:
+        dict: Standardized user info
+
+    Raises:
+        HTTPException: If all validation methods fail
+    """
+    from .oauth2 import get_keycloak_client
+
+    # 1. Try LightRAG JWT first (fast, local validation)
+    try:
+        return auth_handler.validate_token(token)
+    except HTTPException:
+        pass
+
+    # 2. Try Keycloak access token if OAuth2 is enabled
+    keycloak_client = get_keycloak_client()
+    if keycloak_client:
+        try:
+            payload = keycloak_client.validate_access_token(token)
+
+            # Check if this is a service account (Client Credentials)
+            if keycloak_client.is_service_account_token(payload):
+                # Service accounts get admin role for on-behalf operations
+                client_id = payload.get("clientId") or payload.get("azp")
+                return {
+                    "username": f"service-account-{client_id}",
+                    "role": "admin",  # Service accounts have admin privileges
+                    "workspace_id": "service_account",
+                    "metadata": {
+                        "auth_mode": "client_credentials",
+                        "client_id": client_id,
+                        "scope": payload.get("scope", ""),
+                    },
+                }
+
+            # Regular user access token
+            username = payload.get("preferred_username") or payload.get("sub")
+            role = "admin" if _is_admin_user(username) else "user"
+
+            return {
+                "username": username,
+                "role": role,
+                "workspace_id": sanitize_workspace_id(username),
+                "metadata": {
+                    "auth_mode": "keycloak_direct",
+                    "email": payload.get("email"),
+                },
+            }
+        except HTTPException:
+            pass
+
+    # All validation failed
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Invalid token",
+        headers={"WWW-Authenticate": "Bearer"},
+    )

@@ -338,6 +338,101 @@ class KeycloakClient:
             "family_name": token_payload.get("family_name"),
         }
 
+    def validate_access_token(self, access_token: str) -> Dict[str, Any]:
+        """
+        Validate Keycloak access token using JWKS.
+
+        Supports both:
+        - User access tokens (from Authorization Code flow)
+        - Service account tokens (from Client Credentials flow)
+
+        Unlike ID tokens, access tokens may not have audience claim for the client.
+        We validate: signature, issuer, expiration.
+
+        Args:
+            access_token: The JWT access token from Keycloak
+
+        Returns:
+            dict: Decoded token payload
+
+        Raises:
+            HTTPException: If token validation fails
+        """
+        try:
+            # Get the signing key from JWKS
+            signing_key = self.jwks_client.get_signing_key_from_jwt(access_token)
+
+            # Decode and validate the token
+            # Note: Access tokens may not have audience claim for the client,
+            # so we disable audience verification
+            payload = jwt.decode(
+                access_token,
+                signing_key.key,
+                algorithms=["RS256"],
+                issuer=self.config.issuer,
+                options={
+                    "verify_exp": True,
+                    "verify_iat": True,
+                    "verify_aud": False,  # Access tokens may not have client as audience
+                    "verify_iss": True,
+                },
+            )
+
+            logger.info(
+                f"Access token validated for: {payload.get('preferred_username', payload.get('sub', 'service-account'))}"
+            )
+            return payload
+
+        except jwt.ExpiredSignatureError:
+            logger.error("Access token has expired")
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Access token has expired",
+            )
+        except jwt.InvalidIssuerError:
+            logger.error("Access token issuer mismatch")
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Access token issuer mismatch",
+            )
+        except jwt.PyJWTError as e:
+            logger.error(f"Access token validation failed: {e}")
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail=f"Invalid access token: {str(e)}",
+            )
+
+    def is_service_account_token(self, payload: Dict[str, Any]) -> bool:
+        """
+        Check if the token is from Client Credentials grant (service account).
+
+        Client Credentials tokens have:
+        - No 'preferred_username' (or it's the client_id)
+        - 'clientId' claim present
+        - 'azp' (authorized party) equals the client_id
+
+        Service account usernames typically follow pattern: service-account-<client_id>
+
+        Args:
+            payload: Decoded JWT payload
+
+        Returns:
+            bool: True if this is a service account token
+        """
+        # Check for service account indicators
+        client_id = payload.get("clientId") or payload.get("azp")
+        preferred_username = payload.get("preferred_username", "")
+
+        # Service account usernames typically follow pattern: service-account-<client_id>
+        if preferred_username.startswith("service-account-"):
+            return True
+
+        # Or no preferred_username but has clientId
+        if not preferred_username and client_id:
+            return True
+
+        return False
+
 
 # Module-level singleton
 _keycloak_client: Optional[KeycloakClient] = None
