@@ -100,10 +100,17 @@ def get_combined_auth_dependency(api_key: Optional[str] = None):
             ):
                 return  # Whitelist path, allow access
 
-        # 2. Validate token first if provided in the request (Ensure 401 error if token is invalid)
+        # 2. Check for token in cookie if not in Authorization header
+        # This supports SSO cookie-based authentication
+        if not token:
+            token = request.cookies.get("lightrag_token")
+
+        # 3. Validate token first if provided in the request (Ensure 401 error if token is invalid)
         if token:
             try:
-                token_info = auth_handler.validate_token(token)
+                # Use hybrid validation that supports both LightRAG JWT and Keycloak tokens
+                from .auth import validate_any_token
+                token_info = validate_any_token(token)
                 # Accept guest token if no auth is configured
                 if not auth_configured and token_info.get("role") == "guest":
                     return
