@@ -1183,6 +1183,8 @@ def create_app(args):
 
             # Store non-sensitive metadata in a separate readable cookie for UI
             # This allows the frontend to display user info without exposing the token
+            # URL-encode the JSON to safely store it in a cookie
+            from urllib.parse import quote
             metadata = json.dumps({
                 "username": token_data["username"],
                 "role": token_data["role"],
@@ -1194,7 +1196,7 @@ def create_app(args):
             })
             redirect_response.set_cookie(
                 key="lightrag_user",
-                value=metadata,
+                value=quote(metadata),  # URL-encode to handle special characters
                 httponly=False,  # Frontend needs to read this
                 secure=is_secure,
                 samesite="lax",

@@ -9,8 +9,20 @@ import { Loader2, AlertCircle } from 'lucide-react'
 
 // Helper function to get cookie value by name
 const getCookie = (name: string): string | null => {
-  const match = document.cookie.match(new RegExp('(^| )' + name + '=([^;]+)'))
-  return match ? decodeURIComponent(match[2]) : null
+  const cookies = document.cookie.split(';')
+  for (const cookie of cookies) {
+    const [cookieName, ...cookieValueParts] = cookie.trim().split('=')
+    if (cookieName === name) {
+      // Join with '=' in case the value contains '=' characters
+      const cookieValue = cookieValueParts.join('=')
+      try {
+        return decodeURIComponent(cookieValue)
+      } catch {
+        return cookieValue
+      }
+    }
+  }
+  return null
 }
 
 // Helper function to delete a cookie
