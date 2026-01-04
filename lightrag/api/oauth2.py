@@ -43,6 +43,7 @@ class OAuth2Config:
     issuer: str
     redirect_uri: str
     scopes: str = "openid profile email"
+    end_session_endpoint: Optional[str] = None  # Keycloak logout URL
 
 
 class KeycloakClient:
@@ -432,6 +433,35 @@ class KeycloakClient:
             return True
 
         return False
+
+    def get_logout_url(self, post_logout_redirect_uri: str) -> str:
+        """
+        Build the Keycloak logout URL (end_session_endpoint).
+
+        For Keycloak, the logout URL follows the OIDC standard:
+        {issuer}/protocol/openid-connect/logout
+
+        Args:
+            post_logout_redirect_uri: Where to redirect after logout
+
+        Returns:
+            str: The complete logout URL with redirect parameter
+        """
+        # Use configured end_session_endpoint or derive from issuer
+        if self.config.end_session_endpoint:
+            logout_endpoint = self.config.end_session_endpoint
+        else:
+            # Standard Keycloak pattern: {issuer}/protocol/openid-connect/logout
+            logout_endpoint = f"{self.config.issuer}/protocol/openid-connect/logout"
+
+        params = {
+            "client_id": self.config.client_id,
+            "post_logout_redirect_uri": post_logout_redirect_uri,
+        }
+
+        logout_url = f"{logout_endpoint}?{urlencode(params)}"
+        logger.info(f"Generated logout URL: {logout_url}")
+        return logout_url
 
 
 # Module-level singleton

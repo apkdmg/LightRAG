@@ -1234,6 +1234,55 @@ def create_app(args):
             error_params = urlencode({"error": "auth_failed", "error_description": e.detail})
             return RedirectResponse(url=f"/webui/#/oauth2/callback?{error_params}")
 
+    @app.get("/oauth2/logout")
+    async def oauth2_logout(request: Request):
+        """
+        Logout from Keycloak SSO and clear local session.
+
+        This endpoint:
+        1. Clears the HTTP-only lightrag_token cookie
+        2. Redirects to Keycloak's logout endpoint
+        3. Keycloak will then redirect back to the login page
+
+        For SSO users, this ensures they are logged out from both
+        LightRAG and Keycloak, allowing them to login with different credentials.
+        """
+        from .oauth2 import get_keycloak_client
+
+        keycloak_client = get_keycloak_client()
+
+        if not keycloak_client:
+            # OAuth2 not enabled, just clear cookie and redirect to login
+            response = RedirectResponse(
+                url="/webui/#/login",
+                status_code=status.HTTP_302_FOUND
+            )
+            response.delete_cookie(key="lightrag_token", path="/")
+            response.delete_cookie(key="lightrag_user", path="/")
+            return response
+
+        # Determine the post-logout redirect URI
+        # Use the same host as the current request
+        host = request.headers.get("host", "localhost:8020")
+        forwarded_proto = request.headers.get("x-forwarded-proto", request.url.scheme)
+        post_logout_uri = f"{forwarded_proto}://{host}/webui/#/login"
+
+        # Get Keycloak logout URL
+        logout_url = keycloak_client.get_logout_url(post_logout_uri)
+
+        # Create redirect response and clear cookies
+        response = RedirectResponse(
+            url=logout_url,
+            status_code=status.HTTP_302_FOUND
+        )
+
+        # Clear both authentication cookies
+        response.delete_cookie(key="lightrag_token", path="/")
+        response.delete_cookie(key="lightrag_user", path="/")
+
+        logger.info("SSO logout initiated, redirecting to Keycloak logout")
+        return response
+
     @app.get("/debug/auth")
     async def debug_auth(request: Request):
         """

@@ -271,6 +271,9 @@ export const useAuthStore = create<AuthState>(set => {
     },
 
     logout: () => {
+      // Check if in SSO mode before clearing
+      const wasSSOMode = localStorage.getItem('LIGHTRAG-SSO-MODE') === 'true';
+
       localStorage.removeItem('LIGHTRAG-API-TOKEN');
       localStorage.removeItem('LIGHTRAG-SSO-MODE');
 
@@ -289,6 +292,14 @@ export const useAuthStore = create<AuthState>(set => {
         webuiTitle: webuiTitle,
         webuiDescription: webuiDescription,
       });
+
+      // For SSO users, redirect to backend logout endpoint
+      // This will clear the HTTP-only cookie and logout from Keycloak
+      if (wasSSOMode) {
+        // Use window.location to navigate to the backend logout endpoint
+        // This allows the server to clear cookies and redirect to Keycloak logout
+        window.location.href = '/oauth2/logout';
+      }
     },
 
     setVersion: (coreVersion, apiVersion) => {
