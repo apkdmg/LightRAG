@@ -314,9 +314,12 @@ const axiosInstance = axios.create({
 axiosInstance.interceptors.request.use((config) => {
   const apiKey = useSettingsStore.getState().apiKey
   const token = localStorage.getItem('LIGHTRAG-API-TOKEN');
+  const isSSOMode = localStorage.getItem('LIGHTRAG-SSO-MODE') === 'true';
 
-  // Always include token if it exists, regardless of path
-  if (token) {
+  // For SSO mode, don't send Authorization header - rely on HTTP-only cookie
+  // The 'cookie-based-auth' placeholder token is not a valid JWT
+  // withCredentials: true ensures the HTTP-only cookie is sent automatically
+  if (token && !isSSOMode) {
     config.headers['Authorization'] = `Bearer ${token}`
   }
   if (apiKey) {
@@ -435,11 +438,13 @@ export const queryTextStream = async (
 ) => {
   const apiKey = useSettingsStore.getState().apiKey;
   const token = localStorage.getItem('LIGHTRAG-API-TOKEN');
+  const isSSOMode = localStorage.getItem('LIGHTRAG-SSO-MODE') === 'true';
   const headers: HeadersInit = {
     'Content-Type': 'application/json',
     'Accept': 'application/x-ndjson',
   };
-  if (token) {
+  // For SSO mode, don't send Authorization header - rely on HTTP-only cookie
+  if (token && !isSSOMode) {
     headers['Authorization'] = `Bearer ${token}`;
   }
   if (apiKey) {
@@ -451,6 +456,7 @@ export const queryTextStream = async (
       method: 'POST',
       headers: headers,
       body: JSON.stringify(request),
+      credentials: 'include',  // Send cookies with request (for SSO HTTP-only cookie)
     });
 
     if (!response.ok) {
