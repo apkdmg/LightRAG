@@ -368,13 +368,144 @@ response = httpx.post(
 
 ### Keycloak Setup for Client Credentials
 
-In Keycloak admin console:
+This section provides a detailed step-by-step guide for setting up a Keycloak client that uses the Client Credentials grant type for REST API access (e.g., n8n, backend services).
 
-1. Create a new client (e.g., `lightrag-n8n-service`)
-2. Set **Client authentication**: ON (confidential client)
-3. Enable **Service accounts roles**: ON
-4. Set **Valid redirect URIs**: (not needed for client credentials)
-5. Copy the **Client secret** from Credentials tab
+#### Prerequisites
+
+- Access to Keycloak Admin Console
+- An existing realm configured for your organization
+- LightRAG server with OAuth2 enabled
+
+#### Step-by-Step Configuration
+
+**Step 1: Access Keycloak Admin Console**
+
+1. Navigate to your Keycloak server (e.g., `https://your-keycloak-server/admin`)
+2. Log in with your admin credentials
+3. Select your realm from the dropdown in the top-left corner
+
+**Step 2: Create a New Client**
+
+1. In the left sidebar, click **Clients**
+2. Click **Create client** button
+3. Fill in the **General Settings**:
+   - **Client type**: OpenID Connect
+   - **Client ID**: `lightrag-service` (or a descriptive name like `lightrag-n8n-service`)
+   - **Name**: (Optional) A human-readable name like "LightRAG Service Account"
+   - **Description**: (Optional) "Service account for automated LightRAG API access"
+4. Click **Next**
+
+**Step 3: Configure Capability Config**
+
+1. On the **Capability config** screen:
+   - **Client authentication**: **ON** (this makes it a confidential client)
+   - **Authorization**: OFF (not needed for basic API access)
+   - **Authentication flow**:
+     - ☐ Standard flow (uncheck - not needed for service accounts)
+     - ☐ Direct access grants (uncheck - not needed)
+     - ☑ **Service accounts roles**: **ON** (required for Client Credentials grant)
+2. Click **Next**
+
+**Step 4: Configure Login Settings**
+
+1. On the **Login settings** screen:
+   - **Root URL**: Leave empty
+   - **Home URL**: Leave empty
+   - **Valid redirect URIs**: Leave empty (not needed for Client Credentials flow)
+   - **Valid post logout redirect URIs**: Leave empty
+   - **Web origins**: Leave empty
+2. Click **Save**
+
+**Step 5: Get the Client Secret**
+
+1. After saving, you'll be on the client details page
+2. Click the **Credentials** tab
+3. You'll see the **Client secret** - click the copy icon to copy it
+4. **Important**: Store this secret securely (e.g., in a password manager or secrets vault)
+
+**Step 6: (Optional) Assign Roles to Service Account**
+
+If you need the service account to have specific roles:
+
+1. Click the **Service accounts roles** tab
+2. Click **Assign role**
+3. Search for and select roles you want to assign
+4. Click **Assign**
+
+Note: For basic LightRAG API access, no additional roles are typically needed.
+
+#### Testing the Client Credentials Flow
+
+**Get an access token:**
+
+```bash
+curl -X POST "https://your-keycloak-server/realms/YOUR_REALM/protocol/openid-connect/token" \
+  -H "Content-Type: application/x-www-form-urlencoded" \
+  -d "grant_type=client_credentials" \
+  -d "client_id=lightrag-service" \
+  -d "client_secret=YOUR_CLIENT_SECRET"
+```
+
+**Expected response:**
+
+```json
+{
+  "access_token": "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9...",
+  "expires_in": 300,
+  "refresh_expires_in": 0,
+  "token_type": "Bearer",
+  "not-before-policy": 0,
+  "scope": "profile email"
+}
+```
+
+**Use the token with LightRAG:**
+
+```bash
+# Query on behalf of a user
+curl -X POST "http://your-lightrag-server/query" \
+  -H "Authorization: Bearer <access_token_from_above>" \
+  -H "X-Target-Workspace: user@example.com" \
+  -H "Content-Type: application/json" \
+  -d '{"query": "What is RAG?"}'
+```
+
+#### Configuration Summary
+
+| Setting | Value | Notes |
+|---------|-------|-------|
+| Client type | OpenID Connect | Standard OAuth2/OIDC |
+| Client authentication | ON | Makes it a confidential client |
+| Standard flow | OFF | Not needed for service accounts |
+| Direct access grants | OFF | Not needed |
+| Service accounts roles | ON | Required for Client Credentials |
+| Valid redirect URIs | (empty) | Not used in Client Credentials flow |
+
+#### Token Lifetime Configuration
+
+By default, Keycloak access tokens have a short lifetime (5 minutes). For automation, you may want to adjust this:
+
+1. Go to **Realm Settings** → **Tokens** tab
+2. Adjust **Access Token Lifespan** (e.g., 1 hour for automation)
+3. Or configure per-client in **Clients** → your client → **Advanced** tab → **Advanced Settings**
+
+**Note**: For long-running automation workflows, consider implementing token refresh logic rather than extending token lifetime.
+
+#### Troubleshooting
+
+**"Client not enabled to retrieve service account"**
+- Ensure **Service accounts roles** is enabled in Capability Config
+
+**"Invalid client credentials"**
+- Double-check the client ID and secret
+- Ensure there are no trailing spaces when copying
+
+**"Client is public"**
+- Enable **Client authentication** in the client settings
+
+**Token validation fails in LightRAG**
+- Ensure `OAUTH2_ISSUER` matches Keycloak's issuer URL exactly
+- Verify `OAUTH2_JWKS_URI` is accessible from the LightRAG server
 
 ## Security Considerations
 
