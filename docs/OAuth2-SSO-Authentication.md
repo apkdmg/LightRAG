@@ -42,7 +42,10 @@ OAUTH2_TOKEN_ENDPOINT=https://your-keycloak-server/realms/YOUR_REALM/protocol/op
 OAUTH2_USERINFO_ENDPOINT=https://your-keycloak-server/realms/YOUR_REALM/protocol/openid-connect/userinfo
 OAUTH2_JWKS_URI=https://your-keycloak-server/realms/YOUR_REALM/protocol/openid-connect/certs
 
-# OAuth2 callback URL (must match Keycloak client configuration)
+# OAuth2 callback URL - MUST be the FULL URL (not just the path!)
+# This URL must match exactly what you configure in Keycloak's "Valid redirect URIs"
+# For local development: http://localhost:8020/oauth2/callback
+# For production: https://your-domain.com/oauth2/callback
 OAUTH2_REDIRECT_URI=http://localhost:8020/oauth2/callback
 
 # OAuth2 scopes to request (space-separated)

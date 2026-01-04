@@ -306,7 +306,8 @@ const axiosInstance = axios.create({
   baseURL: backendBaseUrl,
   headers: {
     'Content-Type': 'application/json'
-  }
+  },
+  withCredentials: true  // Send cookies with requests (for HTTP-only token cookie)
 })
 
 // Interceptor: add api key and check authentication

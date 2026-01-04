@@ -2,11 +2,21 @@ import { useEffect, useState, useRef } from 'react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
 import { useAuthStore } from '@/stores/state'
 import { useSettingsStore } from '@/stores/settings'
-import { handleOAuth2Callback } from '@/api/lightrag'
 import { toast } from 'sonner'
 import { useTranslation } from 'react-i18next'
 import { Card, CardContent, CardHeader } from '@/components/ui/Card'
 import { Loader2, AlertCircle } from 'lucide-react'
+
+// Helper function to get cookie value by name
+const getCookie = (name: string): string | null => {
+  const match = document.cookie.match(new RegExp('(^| )' + name + '=([^;]+)'))
+  return match ? decodeURIComponent(match[2]) : null
+}
+
+// Helper function to delete a cookie
+const deleteCookie = (name: string): void => {
+  document.cookie = `${name}=; expires=Thu, 01 Jan 1970 00:00:00 UTC; path=/;`
+}
 
 const OAuth2Callback = () => {
   const navigate = useNavigate()
@@ -22,12 +32,10 @@ const OAuth2Callback = () => {
       if (callbackProcessed.current) return
       callbackProcessed.current = true
 
-      const code = searchParams.get('code')
-      const state = searchParams.get('state')
       const errorParam = searchParams.get('error')
       const errorDescription = searchParams.get('error_description')
 
-      // Handle Keycloak error response
+      // Handle error response (from Keycloak or backend)
       if (errorParam) {
         const errorMsg = errorDescription || errorParam
         setError(errorMsg)
@@ -36,19 +44,30 @@ const OAuth2Callback = () => {
         return
       }
 
-      if (!code || !state) {
-        setError('Missing authorization code or state parameter')
+      // Check for success indicator and read user metadata from cookie
+      const success = searchParams.get('success')
+      const userCookie = getCookie('lightrag_user')
+
+      if (success !== 'true' || !userCookie) {
+        setError('Missing authentication data')
         toast.error(t('login.ssoError', 'Invalid SSO callback'))
         setTimeout(() => navigate('/login'), 3000)
         return
       }
 
       try {
-        const response = await handleOAuth2Callback(code, state)
+        // Parse user metadata from cookie (non-sensitive data)
+        // The actual token is in HTTP-only cookie and will be sent automatically
+        const userData = JSON.parse(userCookie)
+        const username = userData.username
+
+        if (!username) {
+          throw new Error('Missing username in authentication data')
+        }
 
         // Get previous username for comparison
         const previousUsername = localStorage.getItem('LIGHTRAG-PREVIOUS-USER')
-        const isSameUser = previousUsername === response.username
+        const isSameUser = previousUsername === username
 
         // Clear chat history if different user
         if (!isSameUser) {
@@ -57,23 +76,28 @@ const OAuth2Callback = () => {
         }
 
         // Update previous username
-        localStorage.setItem('LIGHTRAG-PREVIOUS-USER', response.username)
+        localStorage.setItem('LIGHTRAG-PREVIOUS-USER', username)
 
         // Login with SSO mode flag
+        // Note: Token is stored in HTTP-only cookie and sent automatically with requests
+        // We pass a placeholder token here; the actual auth is cookie-based
         login(
-          response.access_token,
+          'cookie-based-auth',  // Placeholder - actual token is in HTTP-only cookie
           false,  // isGuest
           true,   // isSSO
-          response.core_version || null,
-          response.api_version || null,
-          response.webui_title || null,
-          response.webui_description || null
+          userData.core_version || null,
+          userData.api_version || null,
+          userData.webui_title || null,
+          userData.webui_description || null
         )
 
         // Set version check flag
-        if (response.core_version || response.api_version) {
+        if (userData.core_version || userData.api_version) {
           sessionStorage.setItem('VERSION_CHECKED_FROM_LOGIN', 'true')
         }
+
+        // Clean up the user metadata cookie (optional, for cleanliness)
+        deleteCookie('lightrag_user')
 
         toast.success(t('login.ssoSuccess', 'SSO login successful'))
         navigate('/')

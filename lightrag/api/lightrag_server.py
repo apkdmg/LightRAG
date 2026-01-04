@@ -1063,11 +1063,10 @@ def create_app(args):
         auth_url, state = keycloak.get_authorization_url()
         return {"authorization_url": auth_url, "state": state}
 
-    @app.get("/oauth2/callback")
-    async def oauth2_callback(code: str, state: str):
+    async def _process_oauth2_callback(code: str, state: str) -> dict:
         """
-        Handle OAuth2 callback from Keycloak.
-        Exchanges authorization code for tokens and returns a local JWT.
+        Internal function to process OAuth2 callback.
+        Returns token data dict on success, raises HTTPException on failure.
         """
         from .oauth2 import get_keycloak_client
 
@@ -1138,6 +1137,77 @@ def create_app(args):
             "webui_title": webui_title,
             "webui_description": webui_description,
         }
+
+    @app.get("/api/oauth2/callback")
+    async def api_oauth2_callback(code: str, state: str):
+        """
+        Handle OAuth2 callback for REST API clients.
+        Returns JSON response with access token (for programmatic use).
+        """
+        return await _process_oauth2_callback(code, state)
+
+    @app.get("/oauth2/callback")
+    async def oauth2_callback(code: str, state: str):
+        """
+        Handle OAuth2 callback from Keycloak for WebUI.
+        Sets token in HTTP-only secure cookie and redirects to frontend.
+
+        Security best practice: Tokens are stored in HTTP-only cookies to prevent
+        XSS attacks from accessing them. The frontend retrieves user info via
+        a separate readable cookie containing non-sensitive metadata.
+        """
+        from urllib.parse import urlencode
+        import json
+
+        try:
+            token_data = await _process_oauth2_callback(code, state)
+
+            # Create redirect response
+            redirect_response = RedirectResponse(
+                url="/webui/#/oauth2/callback?success=true",
+                status_code=status.HTTP_302_FOUND
+            )
+
+            # Set token in HTTP-only secure cookie (best practice)
+            # This prevents XSS attacks from stealing the token
+            is_secure = getattr(global_args, 'ssl', False)
+            redirect_response.set_cookie(
+                key="lightrag_token",
+                value=token_data["access_token"],
+                httponly=True,  # Prevents JavaScript access (XSS protection)
+                secure=is_secure,  # Only send over HTTPS in production
+                samesite="lax",  # CSRF protection
+                max_age=global_args.token_expire_hours * 3600,
+                path="/",
+            )
+
+            # Store non-sensitive metadata in a separate readable cookie for UI
+            # This allows the frontend to display user info without exposing the token
+            metadata = json.dumps({
+                "username": token_data["username"],
+                "role": token_data["role"],
+                "auth_mode": token_data["auth_mode"],
+                "core_version": token_data["core_version"],
+                "api_version": token_data["api_version"],
+                "webui_title": token_data["webui_title"],
+                "webui_description": token_data["webui_description"],
+            })
+            redirect_response.set_cookie(
+                key="lightrag_user",
+                value=metadata,
+                httponly=False,  # Frontend needs to read this
+                secure=is_secure,
+                samesite="lax",
+                max_age=global_args.token_expire_hours * 3600,
+                path="/",
+            )
+
+            return redirect_response
+
+        except HTTPException as e:
+            # Redirect to frontend with error details
+            error_params = urlencode({"error": "auth_failed", "error_description": e.detail})
+            return RedirectResponse(url=f"/webui/#/oauth2/callback?{error_params}")
 
     @app.get("/health", dependencies=[Depends(combined_auth)])
     async def get_status():
