@@ -1234,6 +1234,47 @@ def create_app(args):
             error_params = urlencode({"error": "auth_failed", "error_description": e.detail})
             return RedirectResponse(url=f"/webui/#/oauth2/callback?{error_params}")
 
+    @app.get("/debug/auth")
+    async def debug_auth(request: Request):
+        """
+        Debug endpoint to check what auth info the server receives.
+        This helps diagnose cookie/header issues.
+        """
+        # Get all cookies
+        cookies = dict(request.cookies)
+        # Mask token values for security (show first/last 10 chars)
+        masked_cookies = {}
+        for key, value in cookies.items():
+            if len(value) > 30:
+                masked_cookies[key] = f"{value[:10]}...{value[-10:]} (len={len(value)})"
+            else:
+                masked_cookies[key] = value
+
+        # Get authorization header
+        auth_header = request.headers.get("authorization", "")
+        if auth_header:
+            if len(auth_header) > 30:
+                auth_header = f"{auth_header[:20]}...{auth_header[-10:]} (len={len(auth_header)})"
+
+        # Get relevant headers
+        relevant_headers = {
+            "x-forwarded-proto": request.headers.get("x-forwarded-proto", "(not set)"),
+            "x-forwarded-ssl": request.headers.get("x-forwarded-ssl", "(not set)"),
+            "x-forwarded-for": request.headers.get("x-forwarded-for", "(not set)"),
+            "host": request.headers.get("host", "(not set)"),
+            "origin": request.headers.get("origin", "(not set)"),
+        }
+
+        return {
+            "cookies_received": masked_cookies,
+            "cookie_keys": list(cookies.keys()),
+            "has_lightrag_token": "lightrag_token" in cookies,
+            "authorization_header": auth_header or "(not set)",
+            "request_scheme": request.url.scheme,
+            "relevant_headers": relevant_headers,
+            "client_host": request.client.host if request.client else "(unknown)",
+        }
+
     @app.get("/health", dependencies=[Depends(combined_auth)])
     async def get_status():
         """Get current system status"""

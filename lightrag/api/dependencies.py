@@ -272,9 +272,15 @@ async def get_current_user(
     Raises:
         HTTPException: If authentication fails or token is invalid.
     """
+    # Debug logging for authentication flow
+    logger.debug(f"get_current_user called for {request.method} {request.url.path}")
+    logger.debug(f"  Authorization header present: {token is not None}")
+    logger.debug(f"  Cookies received: {list(request.cookies.keys())}")
+
     # Check if request was authenticated via API key (set by combined_dependency)
     api_key_user = getattr(request.state, "api_key_user", None)
     if api_key_user:
+        logger.debug(f"  Using API key authentication: {api_key_user['username']}")
         return UserInfo(
             username=api_key_user["username"],
             role=api_key_user["role"],
@@ -285,6 +291,12 @@ async def get_current_user(
     # If no token from header, check cookie (for SSO cookie-based auth)
     if not token:
         token = request.cookies.get("lightrag_token")
+        if token:
+            logger.debug(f"  Using cookie-based auth, token length: {len(token)}")
+        else:
+            logger.debug("  No token in header or cookie")
+    else:
+        logger.debug(f"  Using header token, length: {len(token)}")
 
     return await _resolve_user(token, request)
 
