@@ -24,8 +24,11 @@ const AppContent = () => {
     const checkAuth = async () => {
       try {
         const token = localStorage.getItem('LIGHTRAG-API-TOKEN')
+        // Check the store directly to get the most up-to-date auth state
+        // The hook value might be stale during navigation transitions
+        const authState = useAuthStore.getState()
 
-        if (token && isAuthenticated) {
+        if (token && authState.isAuthenticated) {
           setInitializing(false);
           return;
         }
@@ -35,7 +38,8 @@ const AppContent = () => {
         }
       } catch (error) {
         console.error('Auth initialization error:', error)
-        if (!isAuthenticated) {
+        const authState = useAuthStore.getState()
+        if (!authState.isAuthenticated) {
           useAuthStore.getState().logout()
         }
       } finally {
@@ -55,8 +59,13 @@ const AppContent = () => {
       const currentPath = window.location.hash.slice(1);
       // Don't redirect if on login page or OAuth2 callback page
       if (currentPath !== '/login' && !currentPath.startsWith('/oauth2/callback')) {
-        console.log('Not authenticated, redirecting to login');
-        navigate('/login');
+        // Double-check the auth state from the store directly
+        // This handles race conditions where the component hasn't re-rendered yet
+        const authState = useAuthStore.getState();
+        if (!authState.isAuthenticated) {
+          console.log('Not authenticated, redirecting to login');
+          navigate('/login');
+        }
       }
     }
   }, [initializing, isAuthenticated, navigate]);

@@ -113,12 +113,25 @@ const OAuth2Callback = () => {
 
         toast.success(t('login.ssoSuccess', 'SSO login successful'))
 
-        // Use setTimeout to ensure React has processed the auth state update
-        // before navigating. This prevents the AppRouter's redirect effect
-        // from firing before isAuthenticated is true.
-        setTimeout(() => {
-          navigate('/', { replace: true })
-        }, 100)
+        // Wait for the auth state to be confirmed before navigating
+        // This prevents race conditions with AppRouter's redirect effect
+        const waitForAuthState = () => {
+          return new Promise<void>((resolve) => {
+            const checkAuth = () => {
+              const authState = useAuthStore.getState()
+              if (authState.isAuthenticated) {
+                resolve()
+              } else {
+                // Check again in 50ms
+                setTimeout(checkAuth, 50)
+              }
+            }
+            checkAuth()
+          })
+        }
+
+        await waitForAuthState()
+        navigate('/', { replace: true })
       } catch (error) {
         console.error('OAuth2 callback failed:', error)
         const errorMsg = error instanceof Error ? error.message : 'Failed to complete SSO login'
