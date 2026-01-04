@@ -112,7 +112,13 @@ const OAuth2Callback = () => {
         deleteCookie('lightrag_user')
 
         toast.success(t('login.ssoSuccess', 'SSO login successful'))
-        navigate('/')
+
+        // Use setTimeout to ensure React has processed the auth state update
+        // before navigating. This prevents the AppRouter's redirect effect
+        // from firing before isAuthenticated is true.
+        setTimeout(() => {
+          navigate('/', { replace: true })
+        }, 100)
       } catch (error) {
         console.error('OAuth2 callback failed:', error)
         const errorMsg = error instanceof Error ? error.message : 'Failed to complete SSO login'
