@@ -1169,15 +1169,27 @@ def create_app(args):
             )
 
             # Determine if we should set secure cookies
-            # Check both the SSL config and the X-Forwarded-Proto header (for reverse proxy)
+            # Check multiple indicators for HTTPS:
+            # 1. SSL config in environment
+            # 2. X-Forwarded-Proto header from reverse proxy
+            # 3. Request URL scheme (may be set by Starlette's ProxyHeadersMiddleware)
             is_ssl_configured = getattr(global_args, 'ssl', False)
             forwarded_proto = request.headers.get("x-forwarded-proto", "").lower()
             is_behind_https_proxy = forwarded_proto == "https"
-            is_secure = is_ssl_configured or is_behind_https_proxy
+            request_scheme_is_https = request.url.scheme == "https"
+            # Also check X-Forwarded-Ssl header (used by some proxies)
+            forwarded_ssl = request.headers.get("x-forwarded-ssl", "").lower()
+            is_forwarded_ssl = forwarded_ssl == "on"
+
+            is_secure = is_ssl_configured or is_behind_https_proxy or request_scheme_is_https or is_forwarded_ssl
+
+            # Determine samesite attribute - use "none" for cross-site OAuth2 flow when secure
+            samesite_value = "none" if is_secure else "lax"
 
             logger.info(
-                f"OAuth2 callback: Setting cookies with secure={is_secure} "
-                f"(ssl_configured={is_ssl_configured}, forwarded_proto='{forwarded_proto}')"
+                f"OAuth2 callback: Setting cookies with secure={is_secure}, samesite={samesite_value} "
+                f"(ssl_configured={is_ssl_configured}, forwarded_proto='{forwarded_proto}', "
+                f"request_scheme='{request.url.scheme}', forwarded_ssl='{forwarded_ssl}')"
             )
 
             # Set token in HTTP-only secure cookie (best practice)
@@ -1187,7 +1199,7 @@ def create_app(args):
                 value=token_data["access_token"],
                 httponly=True,  # Prevents JavaScript access (XSS protection)
                 secure=is_secure,  # Only send over HTTPS in production
-                samesite="lax",  # CSRF protection
+                samesite=samesite_value,  # "none" for cross-site, "lax" for same-site
                 max_age=global_args.token_expire_hours * 3600,
                 path="/",
             )
@@ -1210,7 +1222,7 @@ def create_app(args):
                 value=quote(metadata),  # URL-encode to handle special characters
                 httponly=False,  # Frontend needs to read this
                 secure=is_secure,
-                samesite="lax",
+                samesite=samesite_value,  # Match the token cookie's samesite setting
                 max_age=global_args.token_expire_hours * 3600,
                 path="/",
             )
