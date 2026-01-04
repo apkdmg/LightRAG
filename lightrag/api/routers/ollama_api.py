@@ -12,6 +12,7 @@ from ascii_colors import trace_exception
 from lightrag import LightRAG, QueryParam
 from lightrag.utils import TiktokenTokenizer
 from lightrag.api.utils_api import get_combined_auth_dependency
+from lightrag.api.dependencies import resolve_workspace_from_request
 from fastapi import Depends
 
 
@@ -220,12 +221,37 @@ def parse_query_mode(query: str) -> tuple[str, SearchMode, bool, Optional[str]]:
 
 class OllamaAPI:
     def __init__(self, rag: LightRAG, top_k: int = 60, api_key: Optional[str] = None):
-        self.rag = rag
+        # Store as default RAG for single-instance mode fallback
+        self._default_rag = rag
         self.ollama_server_infos = rag.ollama_server_infos
         self.top_k = top_k
         self.api_key = api_key
         self.router = APIRouter(tags=["ollama"])
         self.setup_routes()
+
+    async def get_rag_for_request(self, request: Request) -> LightRAG:
+        """
+        Get RAG instance - multi-tenant or single instance.
+
+        In multi-tenant mode, resolves the workspace from the request
+        and returns the appropriate RAG instance for that workspace.
+        In single-instance mode, returns the default RAG instance.
+
+        Args:
+            request: The FastAPI request object
+
+        Returns:
+            LightRAG instance for the request's workspace
+        """
+        workspace_manager = getattr(request.app.state, "workspace_manager", None)
+
+        if workspace_manager is not None:
+            # Multi-tenant mode
+            workspace = await resolve_workspace_from_request(request)
+            return await workspace_manager.get_instance(workspace)
+        else:
+            # Single-instance mode
+            return self._default_rag
 
     def setup_routes(self):
         # Create combined auth dependency for Ollama API routes
@@ -296,16 +322,19 @@ class OllamaAPI:
                 # Parse the request body manually
                 request = await parse_request_body(raw_request, OllamaGenerateRequest)
 
+                # Get RAG instance for this request (multi-tenant aware)
+                rag = await self.get_rag_for_request(raw_request)
+
                 query = request.prompt
                 start_time = time.time_ns()
                 prompt_tokens = estimate_tokens(query)
 
                 if request.system:
-                    self.rag.llm_model_kwargs["system_prompt"] = request.system
+                    rag.llm_model_kwargs["system_prompt"] = request.system
 
                 if request.stream:
-                    response = await self.rag.llm_model_func(
-                        query, stream=True, **self.rag.llm_model_kwargs
+                    response = await rag.llm_model_func(
+                        query, stream=True, **rag.llm_model_kwargs
                     )
 
                     async def stream_generator():
@@ -434,8 +463,8 @@ class OllamaAPI:
                     )
                 else:
                     first_chunk_time = time.time_ns()
-                    response_text = await self.rag.llm_model_func(
-                        query, stream=False, **self.rag.llm_model_kwargs
+                    response_text = await rag.llm_model_func(
+                        query, stream=False, **rag.llm_model_kwargs
                     )
                     last_chunk_time = time.time_ns()
 
@@ -478,6 +507,9 @@ class OllamaAPI:
                 # Parse the request body manually
                 request = await parse_request_body(raw_request, OllamaChatRequest)
 
+                # Get RAG instance for this request (multi-tenant aware)
+                rag = await self.get_rag_for_request(raw_request)
+
                 # Get all messages
                 messages = request.messages
                 if not messages:
@@ -511,10 +543,10 @@ class OllamaAPI:
                     param_dict["user_prompt"] = user_prompt
 
                 if (
-                    hasattr(self.rag, "args")
-                    and self.rag.args.history_turns is not None
+                    hasattr(rag, "args")
+                    and rag.args.history_turns is not None
                 ):
-                    param_dict["history_turns"] = self.rag.args.history_turns
+                    param_dict["history_turns"] = rag.args.history_turns
 
                 query_param = QueryParam(**param_dict)
 
@@ -522,15 +554,15 @@ class OllamaAPI:
                     # Determine if the request is prefix with "/bypass"
                     if mode == SearchMode.bypass:
                         if request.system:
-                            self.rag.llm_model_kwargs["system_prompt"] = request.system
-                        response = await self.rag.llm_model_func(
+                            rag.llm_model_kwargs["system_prompt"] = request.system
+                        response = await rag.llm_model_func(
                             cleaned_query,
                             stream=True,
                             history_messages=conversation_history,
-                            **self.rag.llm_model_kwargs,
+                            **rag.llm_model_kwargs,
                         )
                     else:
-                        response = await self.rag.aquery(
+                        response = await rag.aquery(
                             cleaned_query, param=query_param
                         )
 
@@ -689,16 +721,16 @@ class OllamaAPI:
                     )
                     if match_result or mode == SearchMode.bypass:
                         if request.system:
-                            self.rag.llm_model_kwargs["system_prompt"] = request.system
+                            rag.llm_model_kwargs["system_prompt"] = request.system
 
-                        response_text = await self.rag.llm_model_func(
+                        response_text = await rag.llm_model_func(
                             cleaned_query,
                             stream=False,
                             history_messages=conversation_history,
-                            **self.rag.llm_model_kwargs,
+                            **rag.llm_model_kwargs,
                         )
                     else:
-                        response_text = await self.rag.aquery(
+                        response_text = await rag.aquery(
                             cleaned_query, param=query_param
                         )
 

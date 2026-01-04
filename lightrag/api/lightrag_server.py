@@ -51,6 +51,8 @@ from lightrag.api.routers.document_routes import (
 from lightrag.api.routers.query_routes import create_query_routes
 from lightrag.api.routers.graph_routes import create_graph_routes
 from lightrag.api.routers.ollama_api import OllamaAPI
+from lightrag.api.routers.openai_api import create_openai_routes
+from lightrag.api.routers.apikey_routes import create_apikey_routes
 from lightrag.api.routers.admin_routes import create_admin_routes
 from lightrag.api.routers.email_routes import create_email_routes
 
@@ -942,6 +944,16 @@ def create_app(args):
     # Add Ollama API routes
     ollama_api = OllamaAPI(rag, top_k=args.top_k, api_key=api_key)
     app.include_router(ollama_api.router, prefix="/api")
+
+    # Add OpenAI-compatible API routes
+    openai_router = create_openai_routes(rag, top_k=args.top_k, api_key=api_key)
+    app.include_router(openai_router)
+    logger.info("OpenAI-compatible API routes enabled (/v1/chat/completions, /v1/models)")
+
+    # Add per-user API key management routes
+    apikey_router = create_apikey_routes(api_key=api_key)
+    app.include_router(apikey_router)
+    logger.info("Per-user API key management routes enabled (/api-keys)")
 
     @app.get("/")
     async def redirect_to_webui():

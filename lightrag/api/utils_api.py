@@ -100,12 +100,30 @@ def get_combined_auth_dependency(api_key: Optional[str] = None):
             ):
                 return  # Whitelist path, allow access
 
-        # 2. Check for token in cookie if not in Authorization header
+        # 2. Check for per-user API key (sk-lightrag-...) FIRST
+        # These keys have the workspace embedded, so no X-Target-Workspace needed
+        # Must check before JWT validation since sk-lightrag- keys are not JWTs
+        auth_header = request.headers.get("Authorization", "")
+        if auth_header.startswith("Bearer sk-lightrag-"):
+            from .routers.apikey_routes import validate_user_api_key
+
+            user_api_key = auth_header[7:]  # Remove "Bearer " prefix
+            user_info = validate_user_api_key(user_api_key)
+            if user_info:
+                request.state.api_key_user = user_info
+                return  # Per-user API key validation successful
+            # Invalid per-user API key
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid API key",
+            )
+
+        # 3. Check for token in cookie if not in Authorization header
         # This supports SSO cookie-based authentication
         if not token:
             token = request.cookies.get("lightrag_token")
 
-        # 3. Validate token first if provided in the request (Ensure 401 error if token is invalid)
+        # 4. Validate JWT token if provided in the request
         if token:
             try:
                 # Use hybrid validation that supports both LightRAG JWT and Keycloak tokens
@@ -129,11 +147,11 @@ def get_combined_auth_dependency(api_key: Optional[str] = None):
                     raise
                 # For other exceptions, continue processing
 
-        # 3. Acept all request if no API protection needed
+        # 5. Accept all request if no API protection needed
         if not auth_configured and not api_key_configured:
             return
 
-        # 4. Validate API key if provided and API-Key authentication is configured
+        # 6. Validate shared API key (X-API-Key) if provided and configured
         if (
             api_key_configured
             and api_key_header_value
@@ -147,7 +165,7 @@ def get_combined_auth_dependency(api_key: Optional[str] = None):
                 "workspace_id": "service_account",
                 "metadata": {"auth_mode": "api_key"},
             }
-            return  # API key validation successful
+            return  # Shared API key validation successful
 
         ### Authentication failed ####
 
