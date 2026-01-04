@@ -1147,7 +1147,7 @@ def create_app(args):
         return await _process_oauth2_callback(code, state)
 
     @app.get("/oauth2/callback")
-    async def oauth2_callback(code: str, state: str):
+    async def oauth2_callback(request: Request, code: str, state: str):
         """
         Handle OAuth2 callback from Keycloak for WebUI.
         Sets token in HTTP-only secure cookie and redirects to frontend.
@@ -1168,9 +1168,20 @@ def create_app(args):
                 status_code=status.HTTP_302_FOUND
             )
 
+            # Determine if we should set secure cookies
+            # Check both the SSL config and the X-Forwarded-Proto header (for reverse proxy)
+            is_ssl_configured = getattr(global_args, 'ssl', False)
+            forwarded_proto = request.headers.get("x-forwarded-proto", "").lower()
+            is_behind_https_proxy = forwarded_proto == "https"
+            is_secure = is_ssl_configured or is_behind_https_proxy
+
+            logger.info(
+                f"OAuth2 callback: Setting cookies with secure={is_secure} "
+                f"(ssl_configured={is_ssl_configured}, forwarded_proto='{forwarded_proto}')"
+            )
+
             # Set token in HTTP-only secure cookie (best practice)
             # This prevents XSS attacks from stealing the token
-            is_secure = getattr(global_args, 'ssl', False)
             redirect_response.set_cookie(
                 key="lightrag_token",
                 value=token_data["access_token"],
