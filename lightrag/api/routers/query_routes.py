@@ -75,6 +75,7 @@ async def get_rag_for_request(request: Request, rag_instance=None):
         # Multi-tenant mode - get workspace-specific RAG instance (LightRAG or RAGAnything)
         # Use resolve_workspace_from_request to handle on-behalf operations
         workspace = await resolve_workspace_from_request(request)
+        logger.info(f"Query using workspace: {workspace}")
         return await workspace_manager.get_instance(workspace)
     else:
         # Single-instance mode - use the provided rag instance

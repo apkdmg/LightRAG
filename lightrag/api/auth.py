@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta
+import logging
 import re
 from typing import Optional
 
@@ -8,6 +9,8 @@ from fastapi import HTTPException, status
 from pydantic import BaseModel
 
 from .config import global_args
+
+logger = logging.getLogger(__name__)
 
 # use the .env that is inside the current folder
 # allows to use different .env file for each lightrag instance
@@ -223,16 +226,29 @@ def validate_any_token(token: str) -> dict:
                 }
 
             # Regular user access token
-            username = payload.get("preferred_username") or payload.get("sub")
+            # Use email for workspace_id derivation to ensure consistency with
+            # cookie-based SSO login (which uses email as the username/sub)
+            email = payload.get("email")
+            preferred_username = payload.get("preferred_username") or payload.get("sub")
+            # For display/logging, use preferred_username; for workspace, use email
+            username = preferred_username
+            # Derive workspace_id from email to match SSO login behavior
+            workspace_source = email or preferred_username
             role = "admin" if _is_admin_user(username) else "user"
+
+            logger.info(
+                f"OAuth2 user resolved: username={username}, "
+                f"workspace_source={workspace_source}, "
+                f"workspace_id={sanitize_workspace_id(workspace_source)}"
+            )
 
             return {
                 "username": username,
                 "role": role,
-                "workspace_id": sanitize_workspace_id(username),
+                "workspace_id": sanitize_workspace_id(workspace_source),
                 "metadata": {
                     "auth_mode": "keycloak_direct",
-                    "email": payload.get("email"),
+                    "email": email,
                 },
             }
         except HTTPException:
