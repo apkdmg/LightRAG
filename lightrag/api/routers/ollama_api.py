@@ -35,6 +35,9 @@ async def _call_aquery(rag_instance, query: str, param: "QueryParam"):
         param_dict = asdict(param)
         kwargs = {k: v for k, v in param_dict.items() if v is not None}
         mode = kwargs.pop("mode", "mix")
+        # Remove fields that RAGAnything sets internally in aquery_vlm_enhanced
+        kwargs.pop("only_need_prompt", None)
+        kwargs.pop("only_need_context", None)
         return await rag_instance.aquery(query, mode=mode, **kwargs)
     else:
         return await rag_instance.aquery(query, param=param)

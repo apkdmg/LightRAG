@@ -34,7 +34,8 @@ async def _call_aquery(rag_instance, query: str, param: "QueryParam"):
     mode is active, because it passes **kwargs (including param) to QueryParam constructor.
 
     Workaround: For RAGAnything, we unpack the QueryParam fields into keyword arguments
-    instead of passing the param object directly.
+    instead of passing the param object directly. We also filter out fields that
+    RAGAnything sets internally to avoid "got multiple values" errors.
     """
     if _is_raganything_instance(rag_instance):
         # RAGAnything: unpack QueryParam fields to avoid the bug
@@ -46,6 +47,10 @@ async def _call_aquery(rag_instance, query: str, param: "QueryParam"):
         kwargs = {k: v for k, v in param_dict.items() if v is not None}
         # Extract mode separately as it's a positional-style argument in RAGAnything
         mode = kwargs.pop("mode", "mix")
+        # Remove fields that RAGAnything sets internally in aquery_vlm_enhanced
+        # to avoid "got multiple values for keyword argument" errors
+        kwargs.pop("only_need_prompt", None)
+        kwargs.pop("only_need_context", None)
         logger.debug(f"Calling RAGAnything.aquery with mode={mode}, kwargs={list(kwargs.keys())}")
         return await rag_instance.aquery(query, mode=mode, **kwargs)
     else:
