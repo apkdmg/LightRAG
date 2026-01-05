@@ -1,0 +1,13 @@
+# OBO (On-Behalf-Of) Client Allowlist
+# Copy this file to {working_dir}/.obo_allowlist
+# Changes are picked up automatically within 60 seconds (no restart needed)
+
+# Format: [client_id:workspace1,workspace2] or [client_id:*] for all workspaces
+OBO_ALLOWED_CLIENTS=[backend-service:*],[partner-app:tenant_a,tenant_b]
+
+# Allow shared X-API-Key to do OBO
+OBO_API_KEY_ALLOWED=true
+OBO_API_KEY_WORKSPACES=*
+
+# Default policy for unlisted clients: deny or allow
+OBO_DEFAULT_POLICY=deny

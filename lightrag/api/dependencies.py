@@ -166,6 +166,28 @@ async def resolve_workspace_from_request(request: Request) -> str:
             )
 
         sanitized_target = sanitize_workspace_id(target_workspace)
+
+        # Check OBO allowlist for service accounts
+        if is_service_account:
+            from .obo_allowlist import check_obo_allowed
+
+            # Determine client identifier
+            if auth_mode == "api_key":
+                client_id = "api_key"
+            else:  # client_credentials
+                client_id = user.metadata.get("client_id", "unknown")
+
+            if not check_obo_allowed(client_id, sanitized_target):
+                # Return 401 Unauthorized (not 403) to avoid leaking authorization info
+                logger.warning(
+                    f"OBO denied for client '{client_id}' -> workspace '{sanitized_target}'"
+                )
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail="Unauthorized",
+                    headers={"WWW-Authenticate": "Bearer"},
+                )
+
         logger.info(
             f"Admin '{user.username}' operating on behalf of workspace: {sanitized_target}"
         )
@@ -346,6 +368,28 @@ async def get_current_workspace(
             )
 
         sanitized_target = sanitize_workspace_id(target_workspace)
+
+        # Check OBO allowlist for service accounts
+        if is_service_account:
+            from .obo_allowlist import check_obo_allowed
+
+            # Determine client identifier
+            if auth_mode == "api_key":
+                client_id = "api_key"
+            else:  # client_credentials
+                client_id = user.metadata.get("client_id", "unknown")
+
+            if not check_obo_allowed(client_id, sanitized_target):
+                # Return 401 Unauthorized (not 403) to avoid leaking authorization info
+                logger.warning(
+                    f"OBO denied for client '{client_id}' -> workspace '{sanitized_target}'"
+                )
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail="Unauthorized",
+                    headers={"WWW-Authenticate": "Bearer"},
+                )
+
         logger.info(
             f"Admin '{user.username}' operating on behalf of workspace: {sanitized_target}"
         )

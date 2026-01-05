@@ -428,6 +428,12 @@ def parse_args() -> argparse.Namespace:
     args.workspace_ttl_minutes = get_env_value("WORKSPACE_TTL_MINUTES", 60, int)
     args.auto_create_workspace = get_env_value("AUTO_CREATE_WORKSPACE", True, bool)
 
+    # OBO (On-Behalf-Of) Allowlist Configuration
+    # Uses .obo_allowlist file for hot-reload support - see OBO_ALLOWLIST.md
+    # These env vars are fallbacks only (file takes precedence)
+    args.obo_allowlist_path = get_env_value("OBO_ALLOWLIST_PATH", None)
+    args.obo_default_policy = get_env_value("OBO_DEFAULT_POLICY", "deny")
+
     # RAGAnything configuration (for multi-tenancy mode)
     args.enable_raganything = get_env_value("ENABLE_RAGANYTHING", False, bool)
     args.raganything_vision_model = get_env_value(
