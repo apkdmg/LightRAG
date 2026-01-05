@@ -275,6 +275,7 @@ class OllamaAPI:
         if workspace_manager is not None:
             # Multi-tenant mode
             workspace = await resolve_workspace_from_request(request)
+            logger.info(f"Ollama API using workspace: {workspace}")
             return await workspace_manager.get_instance(workspace)
         else:
             # Single-instance mode
