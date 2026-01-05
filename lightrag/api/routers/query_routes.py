@@ -16,6 +16,42 @@ from ascii_colors import trace_exception
 
 router = APIRouter(tags=["query"])
 
+logger = logging.getLogger(__name__)
+
+
+def _is_raganything_instance(rag_instance) -> bool:
+    """Check if the RAG instance is a RAGAnything instance."""
+    # Check by class name to avoid import dependency
+    return type(rag_instance).__name__ == "RAGAnything"
+
+
+async def _call_aquery(rag_instance, query: str, param: "QueryParam"):
+    """
+    Call aquery on the RAG instance with proper parameter handling.
+
+    This handles the incompatibility between LightRAG and RAGAnything's aquery signatures.
+    RAGAnything has a bug where passing param=QueryParam causes issues when VLM enhanced
+    mode is active, because it passes **kwargs (including param) to QueryParam constructor.
+
+    Workaround: For RAGAnything, we unpack the QueryParam fields into keyword arguments
+    instead of passing the param object directly.
+    """
+    if _is_raganything_instance(rag_instance):
+        # RAGAnything: unpack QueryParam fields to avoid the bug
+        # Extract all non-None fields from QueryParam
+        from dataclasses import asdict
+
+        param_dict = asdict(param)
+        # Remove None values to avoid overriding defaults
+        kwargs = {k: v for k, v in param_dict.items() if v is not None}
+        # Extract mode separately as it's a positional-style argument in RAGAnything
+        mode = kwargs.pop("mode", "mix")
+        logger.debug(f"Calling RAGAnything.aquery with mode={mode}, kwargs={list(kwargs.keys())}")
+        return await rag_instance.aquery(query, mode=mode, **kwargs)
+    else:
+        # LightRAG: use standard param= signature
+        return await rag_instance.aquery(query, param=param)
+
 
 async def get_rag_for_request(request: Request, rag_instance=None):
     """
@@ -202,7 +238,7 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
             rag_instance = await get_rag_for_request(http_request, _default_rag)
 
             param = request.to_query_params(False)
-            response = await rag_instance.aquery(request.query, param=param)
+            response = await _call_aquery(rag_instance, request.query, param)
 
             # If response is a string (e.g. cache hit), return directly
             if isinstance(response, str):
@@ -234,7 +270,7 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
             rag_instance = await get_rag_for_request(http_request, _default_rag)
 
             param = request.to_query_params(True)
-            response = await rag_instance.aquery(request.query, param=param)
+            response = await _call_aquery(rag_instance, request.query, param)
 
             from fastapi.responses import StreamingResponse
 

@@ -16,6 +16,30 @@ from lightrag.api.dependencies import resolve_workspace_from_request
 from fastapi import Depends
 
 
+def _is_raganything_instance(rag_instance) -> bool:
+    """Check if the RAG instance is a RAGAnything instance."""
+    return type(rag_instance).__name__ == "RAGAnything"
+
+
+async def _call_aquery(rag_instance, query: str, param: "QueryParam"):
+    """
+    Call aquery on the RAG instance with proper parameter handling.
+
+    Handles incompatibility between LightRAG and RAGAnything's aquery signatures.
+    RAGAnything has a bug where passing param=QueryParam causes issues when VLM enhanced
+    mode is active. Workaround: unpack QueryParam fields into keyword arguments.
+    """
+    if _is_raganything_instance(rag_instance):
+        from dataclasses import asdict
+
+        param_dict = asdict(param)
+        kwargs = {k: v for k, v in param_dict.items() if v is not None}
+        mode = kwargs.pop("mode", "mix")
+        return await rag_instance.aquery(query, mode=mode, **kwargs)
+    else:
+        return await rag_instance.aquery(query, param=param)
+
+
 # query mode according to query prefix (bypass is not LightRAG quer mode)
 class SearchMode(str, Enum):
     naive = "naive"
@@ -562,9 +586,7 @@ class OllamaAPI:
                             **rag.llm_model_kwargs,
                         )
                     else:
-                        response = await rag.aquery(
-                            cleaned_query, param=query_param
-                        )
+                        response = await _call_aquery(rag, cleaned_query, query_param)
 
                     async def stream_generator():
                         try:
@@ -730,8 +752,8 @@ class OllamaAPI:
                             **rag.llm_model_kwargs,
                         )
                     else:
-                        response_text = await rag.aquery(
-                            cleaned_query, param=query_param
+                        response_text = await _call_aquery(
+                            rag, cleaned_query, query_param
                         )
 
                     last_chunk_time = time.time_ns()
