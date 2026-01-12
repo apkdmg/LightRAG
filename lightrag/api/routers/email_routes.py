@@ -512,34 +512,22 @@ class EmailIngestionService:
         to_list = ", ".join(email.to_addresses) if email.to_addresses else "(none)"
         cc_list = ", ".join(email.cc_addresses) if email.cc_addresses else "(none)"
 
-        return f"""
-================================================================================
-EMAIL DOCUMENT
-================================================================================
+        return f"""EMAIL DOCUMENT
 Bundle-ID: {bundle_id}
 Message-ID: {email.message_id}
 Thread-ID: {email.thread_id or 'N/A'}
 
-FROM: {email.from_address}
-TO: {to_list}
-CC: {cc_list}
-SUBJECT: {email.subject}
-DATE: {date_str}
+From: {email.from_address}
+To: {to_list}
+Cc: {cc_list}
+Subject: {email.subject}
+Date: {date_str}
 
---------------------------------------------------------------------------------
-EMAIL BODY:
---------------------------------------------------------------------------------
+Content:
 {email.body_text.strip() if email.body_text else '(No text content)'}
 
---------------------------------------------------------------------------------
-ATTACHMENTS ({len(all_attachments)} files):
---------------------------------------------------------------------------------
+Attachments ({len(all_attachments)} files):
 {attachment_list}
-
-Note: Each attachment is stored as a separate document with Bundle-ID prefix
-'{bundle_id}' for cross-reference. Query using the bundle ID or email subject
-to retrieve related content.
-================================================================================
 """
 
     async def _process_inline_image(
@@ -556,28 +544,19 @@ to retrieve related content.
 
         date_str = email.date.isoformat() if email.date else "Unknown"
 
-        return f"""
-================================================================================
-EMAIL INLINE IMAGE
-================================================================================
+        return f"""EMAIL INLINE IMAGE
 Bundle-ID: {bundle_id}
-Image-Index: {index + 1} of {len(email.inline_images)}
-Filename: {image.filename}
+Image {index + 1} of {len(email.inline_images)}: {image.filename}
 Content-Type: {image.content_type}
 Content-ID: {image.content_id or 'N/A'}
 Size: {len(image.content)} bytes
 
-PARENT EMAIL CONTEXT:
-  From: {email.from_address}
-  Subject: {email.subject}
-  Date: {date_str}
-  Message-ID: {email.message_id}
+Parent Email: {email.subject}
+From: {email.from_address}
+Date: {date_str}
 
---------------------------------------------------------------------------------
-IMAGE DESCRIPTION:
---------------------------------------------------------------------------------
+Image Description:
 {description}
-================================================================================
 """
 
     async def _process_attachment(
@@ -594,27 +573,18 @@ IMAGE DESCRIPTION:
         date_str = email.date.isoformat() if email.date else "Unknown"
         total_attachments = len(email.attachments)
 
-        return f"""
-================================================================================
-EMAIL ATTACHMENT
-================================================================================
+        return f"""EMAIL ATTACHMENT
 Bundle-ID: {bundle_id}
-Attachment-Index: {index + 1} of {total_attachments}
-Filename: {attachment.filename}
+Attachment {index + 1} of {total_attachments}: {attachment.filename}
 Content-Type: {attachment.content_type}
 Size: {len(attachment.content)} bytes
 
-PARENT EMAIL CONTEXT:
-  From: {email.from_address}
-  Subject: {email.subject}
-  Date: {date_str}
-  Message-ID: {email.message_id}
+Parent Email: {email.subject}
+From: {email.from_address}
+Date: {date_str}
 
---------------------------------------------------------------------------------
-ATTACHMENT CONTENT:
---------------------------------------------------------------------------------
+Content:
 {content}
-================================================================================
 """
 
     async def _describe_image(self, image: ParsedAttachment) -> str:
@@ -1000,33 +970,22 @@ class EmailIngestionServiceRAGAnything:
         to_list = ", ".join(email.to_addresses) if email.to_addresses else "(none)"
         cc_list = ", ".join(email.cc_addresses) if email.cc_addresses else "(none)"
 
-        return f"""
-================================================================================
-EMAIL DOCUMENT
-================================================================================
+        return f"""EMAIL DOCUMENT
 Bundle-ID: {bundle_id}
 Message-ID: {email.message_id}
 Thread-ID: {email.thread_id or 'N/A'}
 
-FROM: {email.from_address}
-TO: {to_list}
-CC: {cc_list}
-SUBJECT: {email.subject}
-DATE: {date_str}
+From: {email.from_address}
+To: {to_list}
+Cc: {cc_list}
+Subject: {email.subject}
+Date: {date_str}
 
---------------------------------------------------------------------------------
-EMAIL BODY:
---------------------------------------------------------------------------------
+Content:
 {email.body_text.strip() if email.body_text else '(No text content)'}
 
---------------------------------------------------------------------------------
-ATTACHMENTS ({len(all_attachments)} files):
---------------------------------------------------------------------------------
+Attachments ({len(all_attachments)} files):
 {attachment_list}
-
-Note: Each attachment is processed with full multimodal support using RAGAnything.
-Query using the bundle ID '{bundle_id}' or email subject to retrieve related content.
-================================================================================
 """
 
     async def _process_attachment_multimodal(
@@ -1126,24 +1085,18 @@ Query using the bundle ID '{bundle_id}' or email subject to retrieve related con
         attachment_type = "INLINE IMAGE" if is_inline else "ATTACHMENT"
         total = len(email.inline_images) if is_inline else len(email.attachments)
 
-        return f"""
-================================================================================
-EMAIL {attachment_type}
-================================================================================
+        return f"""EMAIL {attachment_type}
 Bundle-ID: {bundle_id}
-Attachment-Index: {index + 1} of {total}
-Filename: {attachment.filename}
+{attachment_type.title()} {index + 1} of {total}: {attachment.filename}
 Content-Type: {attachment.content_type}
 Size: {len(attachment.content)} bytes
 
-PARENT EMAIL CONTEXT:
-  From: {email.from_address}
-  Subject: {email.subject}
-  Date: {date_str}
-  Message-ID: {email.message_id}
---------------------------------------------------------------------------------
-CONTENT:
---------------------------------------------------------------------------------"""
+Parent Email: {email.subject}
+From: {email.from_address}
+Date: {date_str}
+
+Content:
+"""
 
     def _build_attachment_fallback_text(
         self,
@@ -1159,10 +1112,8 @@ CONTENT:
             attachment, bundle_id, email, index, is_inline
         )
         return f"""{context}
-
 [Processing failed: {error_msg}]
-[Attachment: {attachment.filename} - {attachment.content_type}, {len(attachment.content)} bytes]
-================================================================================
+[File: {attachment.filename} - {attachment.content_type}, {len(attachment.content)} bytes]
 """
 
     def _save_attachment_to_temp(self, attachment: ParsedAttachment) -> str:
