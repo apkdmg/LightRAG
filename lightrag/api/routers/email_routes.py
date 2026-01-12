@@ -16,6 +16,7 @@ import base64
 import email
 import hashlib
 import logging
+import mimetypes
 import os
 import tempfile
 import traceback
@@ -236,7 +237,16 @@ class EmailParser:
                 elif part.get_payload(decode=True):
                     # This is an attachment or inline image
                     payload = part.get_payload(decode=True)
-                    filename = part.get_filename() or f"attachment_{len(attachments) + len(inline_images)}"
+                    filename = part.get_filename()
+
+                    # Generate filename with proper extension if missing
+                    if not filename:
+                        # Try to get extension from content-type first
+                        ext = get_extension_from_content_type(content_type)
+                        # Fallback to magic bytes detection for images
+                        if not ext and payload:
+                            ext = detect_image_type_from_bytes(payload) or ""
+                        filename = f"inline_{len(attachments) + len(inline_images)}{ext}"
 
                     attachment = ParsedAttachment(
                         filename=filename,
@@ -733,16 +743,122 @@ RAGANYTHING_SUPPORTED_EXTENSIONS = {
     ".txt", ".md",
 }
 
+# Magic bytes signatures for common image formats
+IMAGE_MAGIC_BYTES = {
+    b"\x89PNG\r\n\x1a\n": ".png",
+    b"\xff\xd8\xff": ".jpg",
+    b"GIF87a": ".gif",
+    b"GIF89a": ".gif",
+    b"BM": ".bmp",
+    b"RIFF": ".webp",  # RIFF....WEBP (check for WEBP later)
+    b"II*\x00": ".tiff",  # Little-endian TIFF
+    b"MM\x00*": ".tiff",  # Big-endian TIFF
+}
+
+# Content-type to extension mapping for common types
+CONTENT_TYPE_TO_EXTENSION = {
+    "image/png": ".png",
+    "image/jpeg": ".jpg",
+    "image/jpg": ".jpg",
+    "image/gif": ".gif",
+    "image/bmp": ".bmp",
+    "image/webp": ".webp",
+    "image/tiff": ".tiff",
+    "image/x-tiff": ".tiff",
+    "application/pdf": ".pdf",
+    "application/msword": ".doc",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
+    "application/vnd.ms-powerpoint": ".ppt",
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation": ".pptx",
+    "application/vnd.ms-excel": ".xls",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": ".xlsx",
+    "text/plain": ".txt",
+    "text/markdown": ".md",
+}
+
 
 def get_file_extension(filename: str) -> str:
     """Get lowercase file extension from filename."""
     return Path(filename).suffix.lower()
 
 
+def detect_image_type_from_bytes(content: bytes) -> Optional[str]:
+    """
+    Detect image file type from magic bytes.
+
+    Args:
+        content: Raw bytes of the file.
+
+    Returns:
+        File extension (e.g., ".png", ".jpg") or None if not detected.
+    """
+    if not content or len(content) < 8:
+        return None
+
+    # Check magic bytes
+    for magic, ext in IMAGE_MAGIC_BYTES.items():
+        if content.startswith(magic):
+            # Special case for WEBP: RIFF....WEBP
+            if magic == b"RIFF" and len(content) >= 12:
+                if content[8:12] != b"WEBP":
+                    continue
+            return ext
+
+    return None
+
+
+def get_extension_from_content_type(content_type: str) -> str:
+    """
+    Get file extension from content-type header.
+
+    Args:
+        content_type: MIME content type (e.g., "image/png").
+
+    Returns:
+        File extension (e.g., ".png") or empty string if not found.
+    """
+    content_type_lower = content_type.lower().split(";")[0].strip()
+
+    # First check our explicit mapping
+    if content_type_lower in CONTENT_TYPE_TO_EXTENSION:
+        return CONTENT_TYPE_TO_EXTENSION[content_type_lower]
+
+    # Fallback to mimetypes library
+    ext = mimetypes.guess_extension(content_type_lower)
+    if ext:
+        # mimetypes returns ".jpeg" but we prefer ".jpg"
+        if ext == ".jpeg":
+            return ".jpg"
+        return ext
+
+    return ""
+
+
 def is_raganything_parseable(content_type: str, filename: str) -> bool:
-    """Check if this attachment can be parsed by RAGAnything's doc_parser."""
+    """
+    Check if this attachment can be parsed by RAGAnything's doc_parser.
+
+    Checks both file extension and content-type to handle inline images
+    that may not have a proper filename with extension.
+
+    Args:
+        content_type: MIME content type (e.g., "image/png").
+        filename: Filename of the attachment.
+
+    Returns:
+        True if the file can be parsed by RAGAnything.
+    """
+    # First check file extension
     ext = get_file_extension(filename)
-    return ext in RAGANYTHING_SUPPORTED_EXTENSIONS
+    if ext in RAGANYTHING_SUPPORTED_EXTENSIONS:
+        return True
+
+    # Fallback: check content-type (important for inline images without extensions)
+    ext_from_type = get_extension_from_content_type(content_type)
+    if ext_from_type in RAGANYTHING_SUPPORTED_EXTENSIONS:
+        return True
+
+    return False
 
 
 class EmailIngestionServiceRAGAnything:
@@ -1051,7 +1167,10 @@ CONTENT:
 
     def _save_attachment_to_temp(self, attachment: ParsedAttachment) -> str:
         """Save attachment to a temporary file and return the path."""
-        ext = get_file_extension(attachment.filename) or ".bin"
+        ext = get_file_extension(attachment.filename)
+        # Fallback to content-type if filename has no extension
+        if not ext:
+            ext = get_extension_from_content_type(attachment.content_type) or ".bin"
         fd, temp_path = tempfile.mkstemp(suffix=ext, prefix="email_attach_")
 
         try:
