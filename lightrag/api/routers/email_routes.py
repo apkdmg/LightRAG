@@ -512,15 +512,13 @@ class EmailIngestionService:
         to_list = ", ".join(email.to_addresses) if email.to_addresses else "(none)"
         cc_list = ", ".join(email.cc_addresses) if email.cc_addresses else "(none)"
 
-        return f"""EMAIL DOCUMENT
+        return f"""Email: {email.subject}
 Bundle-ID: {bundle_id}
 Message-ID: {email.message_id}
-Thread-ID: {email.thread_id or 'N/A'}
 
 From: {email.from_address}
 To: {to_list}
 Cc: {cc_list}
-Subject: {email.subject}
 Date: {date_str}
 
 Content:
@@ -970,15 +968,13 @@ class EmailIngestionServiceRAGAnything:
         to_list = ", ".join(email.to_addresses) if email.to_addresses else "(none)"
         cc_list = ", ".join(email.cc_addresses) if email.cc_addresses else "(none)"
 
-        return f"""EMAIL DOCUMENT
+        return f"""Email: {email.subject}
 Bundle-ID: {bundle_id}
 Message-ID: {email.message_id}
-Thread-ID: {email.thread_id or 'N/A'}
 
 From: {email.from_address}
 To: {to_list}
 Cc: {cc_list}
-Subject: {email.subject}
 Date: {date_str}
 
 Content:
