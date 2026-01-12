@@ -515,6 +515,7 @@ class EmailIngestionService:
         return f"""Email: {email.subject}
 Bundle-ID: {bundle_id}
 Message-ID: {email.message_id}
+Thread-ID: {email.thread_id or 'N/A'}
 
 From: {email.from_address}
 To: {to_list}
@@ -971,6 +972,7 @@ class EmailIngestionServiceRAGAnything:
         return f"""Email: {email.subject}
 Bundle-ID: {bundle_id}
 Message-ID: {email.message_id}
+Thread-ID: {email.thread_id or 'N/A'}
 
 From: {email.from_address}
 To: {to_list}
