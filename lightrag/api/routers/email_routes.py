@@ -520,6 +520,7 @@ Thread-ID: {email.thread_id or 'N/A'}
 From: {email.from_address}
 To: {to_list}
 Cc: {cc_list}
+Subject: {email.subject}
 Date: {date_str}
 
 Content:
@@ -977,6 +978,7 @@ Thread-ID: {email.thread_id or 'N/A'}
 From: {email.from_address}
 To: {to_list}
 Cc: {cc_list}
+Subject: {email.subject}
 Date: {date_str}
 
 Content:
