@@ -1020,16 +1020,12 @@ Attachments ({len(all_attachments)} files):
         temp_path = self._save_attachment_to_temp(attachment)
 
         # Handle images directly - docling parser doesn't support image files
-        # Images need special handling with vision model for text/content extraction
+        # Let RAGAnything's multimodal processing handle image analysis
         if content_type.startswith("image/"):
-            # Get detailed image description using vision model if available
-            image_description = await self._describe_image_with_vision(attachment)
-
-            # Add context header with image description as first item
-            full_context = f"{context_header}\n\nImage Analysis:\n{image_description}"
+            # Add context header as text item
             content_items.append({
                 "type": "text",
-                "text": full_context,
+                "text": context_header,
                 "page_idx": page_idx,
             })
             page_idx += 1
@@ -1044,7 +1040,7 @@ Attachments ({len(all_attachments)} files):
             })
             page_idx += 1
 
-            logger.info(f"Processed image {attachment.filename} with vision model")
+            logger.info(f"Added image {attachment.filename} for multimodal processing")
             return content_items, page_idx
 
         # Use doc_parser for documents (PDF, DOCX, etc.) - not images
