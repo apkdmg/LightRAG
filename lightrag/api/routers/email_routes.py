@@ -606,7 +606,7 @@ Content:
 
             response = await self.vision_model_func(
                 prompt,
-                images=[f"data:{image.content_type};base64,{image_b64}"]
+                image_data=image_b64
             )
 
             return response if response else f"[Image: {image.filename}]"
@@ -1197,7 +1197,7 @@ Content:
 
             response = await self.vision_model_func(
                 prompt,
-                images=[f"data:{image.content_type};base64,{image_b64}"]
+                image_data=image_b64
             )
 
             return response if response else f"[Image: {image.filename} - No description generated]"
