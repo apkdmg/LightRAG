@@ -1014,11 +1014,34 @@ Attachments ({len(all_attachments)} files):
             attachment, bundle_id, email, index, is_inline
         )
 
-        # Check if this can be parsed by RAGAnything
-        if self.doc_parser and is_raganything_parseable(content_type, attachment.filename):
-            # Save attachment to temp file
-            temp_path = self._save_attachment_to_temp(attachment)
+        # Save attachment to temp file (needed for both images and documents)
+        temp_path = self._save_attachment_to_temp(attachment)
 
+        # Handle standalone images directly (doc_parser doesn't handle them well)
+        if content_type.startswith("image/"):
+            # Add context header as first item
+            content_items.append({
+                "type": "text",
+                "text": context_header,
+                "page_idx": page_idx,
+            })
+            page_idx += 1
+
+            # Add image content item directly for RAGAnything multimodal processing
+            content_items.append({
+                "type": "image",
+                "img_path": temp_path,
+                "image_caption": [f"Inline image from email: {email.subject}"],
+                "image_footnote": [f"Content-ID: {attachment.content_id or 'N/A'}"],
+                "page_idx": page_idx,
+            })
+            page_idx += 1
+
+            logger.debug(f"Added image content item for {attachment.filename}: {temp_path}")
+            return content_items, page_idx
+
+        # For documents (PDF, DOCX, etc.), use doc_parser
+        if self.doc_parser and is_raganything_parseable(content_type, attachment.filename):
             try:
                 # Parse using RAGAnything's doc_parser
                 loop = asyncio.get_event_loop()
@@ -1042,7 +1065,7 @@ Attachments ({len(all_attachments)} files):
                         item_copy = item.copy()
                         item_copy["page_idx"] = page_idx
 
-                        # For images, the path needs to be absolute
+                        # For images extracted from documents, ensure path is absolute
                         if item_copy.get("type") == "image" and "img_path" in item_copy:
                             img_path = item_copy["img_path"]
                             if not os.path.isabs(img_path):
