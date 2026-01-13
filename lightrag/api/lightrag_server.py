@@ -687,23 +687,25 @@ def create_app(args):
                     system_prompt=None,
                     history_messages=[],
                     messages=[
-                        {"role": "system", "content": system_prompt}
-                        if system_prompt
-                        else None,
-                        {
-                            "role": "user",
-                            "content": [
-                                {"type": "text", "text": prompt},
-                                {
-                                    "type": "image_url",
-                                    "image_url": {
-                                        "url": f"data:image/jpeg;base64,{image_data}"
+                        msg for msg in [
+                            {"role": "system", "content": system_prompt}
+                            if system_prompt
+                            else None,
+                            {
+                                "role": "user",
+                                "content": [
+                                    {"type": "text", "text": prompt},
+                                    {
+                                        "type": "image_url",
+                                        "image_url": {
+                                            "url": f"data:image/jpeg;base64,{image_data}"
+                                        },
                                     },
-                                },
-                            ],
-                        }
-                        if image_data
-                        else {"role": "user", "content": prompt},
+                                ],
+                            }
+                            if image_data
+                            else {"role": "user", "content": prompt},
+                        ] if msg is not None
                     ],
                     api_key=args.raganything_vision_api_key or api_key,
                     base_url=args.raganything_vision_host or base_url,
@@ -810,23 +812,25 @@ def create_app(args):
                         system_prompt=None,
                         history_messages=[],
                         messages=[
-                            {"role": "system", "content": system_prompt}
-                            if system_prompt
-                            else None,
-                            {
-                                "role": "user",
-                                "content": [
-                                    {"type": "text", "text": prompt},
-                                    {
-                                        "type": "image_url",
-                                        "image_url": {
-                                            "url": f"data:image/jpeg;base64,{image_data}"
+                            msg for msg in [
+                                {"role": "system", "content": system_prompt}
+                                if system_prompt
+                                else None,
+                                {
+                                    "role": "user",
+                                    "content": [
+                                        {"type": "text", "text": prompt},
+                                        {
+                                            "type": "image_url",
+                                            "image_url": {
+                                                "url": f"data:image/jpeg;base64,{image_data}"
+                                            },
                                         },
-                                    },
-                                ],
-                            }
-                            if image_data
-                            else {"role": "user", "content": prompt},
+                                    ],
+                                }
+                                if image_data
+                                else {"role": "user", "content": prompt},
+                            ] if msg is not None
                         ],
                         api_key=args.raganything_vision_api_key or api_key,
                         base_url=args.raganything_vision_host or base_url,
