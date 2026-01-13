@@ -840,15 +840,17 @@ class EmailIngestionServiceRAGAnything:
     preserving Bundle-ID associations across all content.
     """
 
-    def __init__(self, rag_anything_instance: Any):
+    def __init__(self, rag_anything_instance: Any, vision_model_func: Optional[Any] = None):
         """
         Initialize the RAGAnything email ingestion service.
 
         Args:
             rag_anything_instance: The RAGAnything instance with doc_parser.
+            vision_model_func: Optional vision model for detailed image description.
         """
         self.rag_anything = rag_anything_instance
         self.doc_parser = getattr(rag_anything_instance, "doc_parser", None)
+        self.vision_model_func = vision_model_func
         self._temp_files: List[str] = []  # Track temp files for cleanup
 
     async def ingest_email(self, parsed_email: ParsedEmail) -> Dict[str, Any]:
@@ -1019,10 +1021,14 @@ Attachments ({len(all_attachments)} files):
 
         # Handle standalone images directly (doc_parser doesn't handle them well)
         if content_type.startswith("image/"):
-            # Add context header as first item
+            # Get detailed image description using vision model if available
+            image_description = await self._describe_image_with_vision(attachment)
+
+            # Add context header with image description as first item
+            full_context = f"{context_header}\n\nImage Analysis:\n{image_description}"
             content_items.append({
                 "type": "text",
-                "text": context_header,
+                "text": full_context,
                 "page_idx": page_idx,
             })
             page_idx += 1
@@ -1155,6 +1161,49 @@ Content:
         self._temp_files.append(temp_path)
         logger.debug(f"Saved attachment to temp file: {temp_path}")
         return temp_path
+
+    async def _describe_image_with_vision(self, image: ParsedAttachment) -> str:
+        """
+        Generate a detailed description for an image using vision model.
+
+        This extracts text, names, and other important information from images
+        that would otherwise be missed by general image processing.
+
+        Args:
+            image: The parsed attachment containing the image.
+
+        Returns:
+            Detailed description of the image content.
+        """
+        if self.vision_model_func is None:
+            return f"[Image: {image.filename} - {image.content_type}, {len(image.content)} bytes. No vision model available for detailed description.]"
+
+        try:
+            # Encode image as base64
+            image_b64 = base64.b64encode(image.content).decode("utf-8")
+
+            # Call vision model with detailed extraction prompt
+            prompt = (
+                "Analyze this image thoroughly and extract ALL information:\n"
+                "1. List ALL names of people shown or mentioned in the image\n"
+                "2. Extract ALL text visible in the image (titles, labels, captions)\n"
+                "3. Describe any photos of people (position, role if indicated)\n"
+                "4. Note any dates, numbers, or important data\n"
+                "5. Describe charts, tables, or organizational information\n"
+                "6. Include any contact information or identifiers\n\n"
+                "Be comprehensive - extract every piece of text and name visible."
+            )
+
+            response = await self.vision_model_func(
+                prompt,
+                images=[f"data:{image.content_type};base64,{image_b64}"]
+            )
+
+            return response if response else f"[Image: {image.filename} - No description generated]"
+
+        except Exception as e:
+            logger.warning(f"Vision model failed for {image.filename}: {e}")
+            return f"[Image: {image.filename} - {image.content_type}, {len(image.content)} bytes. Vision processing failed: {e}]"
 
     async def _extract_attachment_as_text(
         self, attachment: ParsedAttachment, content_type: str
@@ -1403,7 +1452,21 @@ Priority order: `scheme` > `framework`
                 rag_anything_instance = await get_raganything_for_request(
                     http_request, _default_rag_anything
                 )
-                service = EmailIngestionServiceRAGAnything(rag_anything_instance)
+
+                # Get vision model for detailed image description
+                vision_model_func = None
+                workspace_manager = getattr(http_request.app.state, "workspace_manager", None)
+                if workspace_manager:
+                    shared = getattr(workspace_manager, "_shared", None)
+                    if shared:
+                        vision_model_func = getattr(shared, "vision_model_func", None)
+                elif rag_anything_instance is not None:
+                    # Single-instance mode - get vision_model_func from RAGAnything
+                    vision_model_func = getattr(
+                        rag_anything_instance, "vision_model_func", None
+                    )
+
+                service = EmailIngestionServiceRAGAnything(rag_anything_instance, vision_model_func)
                 logger.info("Using RAGAnything multimodal email ingestion service")
             else:
                 # Use LightRAG with optional vision model for basic processing
