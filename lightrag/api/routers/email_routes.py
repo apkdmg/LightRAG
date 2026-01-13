@@ -1019,7 +1019,35 @@ Attachments ({len(all_attachments)} files):
         # Save attachment to temp file
         temp_path = self._save_attachment_to_temp(attachment)
 
-        # Use doc_parser for all supported file types (including images)
+        # Handle images directly - docling parser doesn't support image files
+        # Images need special handling with vision model for text/content extraction
+        if content_type.startswith("image/"):
+            # Get detailed image description using vision model if available
+            image_description = await self._describe_image_with_vision(attachment)
+
+            # Add context header with image description as first item
+            full_context = f"{context_header}\n\nImage Analysis:\n{image_description}"
+            content_items.append({
+                "type": "text",
+                "text": full_context,
+                "page_idx": page_idx,
+            })
+            page_idx += 1
+
+            # Add image content item for RAGAnything multimodal processing
+            content_items.append({
+                "type": "image",
+                "img_path": temp_path,
+                "image_caption": [f"Image from email: {email.subject}"],
+                "image_footnote": [f"Content-ID: {attachment.content_id or 'N/A'}"],
+                "page_idx": page_idx,
+            })
+            page_idx += 1
+
+            logger.info(f"Processed image {attachment.filename} with vision model")
+            return content_items, page_idx
+
+        # Use doc_parser for documents (PDF, DOCX, etc.) - not images
         if self.doc_parser and is_raganything_parseable(content_type, attachment.filename):
             try:
                 # Parse using RAGAnything's doc_parser
