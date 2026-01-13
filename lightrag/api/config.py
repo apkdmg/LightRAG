@@ -439,6 +439,12 @@ def parse_args() -> argparse.Namespace:
     args.raganything_vision_model = get_env_value(
         "RAGANYTHING_VISION_MODEL", "gpt-4o", str
     )
+    args.raganything_vision_api_key = get_env_value(
+        "RAGANYTHING_VISION_API_KEY", "", str
+    )
+    args.raganything_vision_host = get_env_value(
+        "RAGANYTHING_VISION_HOST", "", str
+    )
     args.raganything_embedding_model = get_env_value(
         "RAGANYTHING_EMBEDDING_MODEL", "", str
     )
