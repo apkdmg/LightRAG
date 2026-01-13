@@ -1016,37 +1016,10 @@ Attachments ({len(all_attachments)} files):
             attachment, bundle_id, email, index, is_inline
         )
 
-        # Save attachment to temp file (needed for both images and documents)
+        # Save attachment to temp file
         temp_path = self._save_attachment_to_temp(attachment)
 
-        # Handle standalone images directly (doc_parser doesn't handle them well)
-        if content_type.startswith("image/"):
-            # Get detailed image description using vision model if available
-            image_description = await self._describe_image_with_vision(attachment)
-
-            # Add context header with image description as first item
-            full_context = f"{context_header}\n\nImage Analysis:\n{image_description}"
-            content_items.append({
-                "type": "text",
-                "text": full_context,
-                "page_idx": page_idx,
-            })
-            page_idx += 1
-
-            # Add image content item directly for RAGAnything multimodal processing
-            content_items.append({
-                "type": "image",
-                "img_path": temp_path,
-                "image_caption": [f"Inline image from email: {email.subject}"],
-                "image_footnote": [f"Content-ID: {attachment.content_id or 'N/A'}"],
-                "page_idx": page_idx,
-            })
-            page_idx += 1
-
-            logger.debug(f"Added image content item for {attachment.filename}: {temp_path}")
-            return content_items, page_idx
-
-        # For documents (PDF, DOCX, etc.), use doc_parser
+        # Use doc_parser for all supported file types (including images)
         if self.doc_parser and is_raganything_parseable(content_type, attachment.filename):
             try:
                 # Parse using RAGAnything's doc_parser
