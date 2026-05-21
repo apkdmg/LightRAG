@@ -61,12 +61,16 @@ Base = 1.5.0; re-apply enterprise hooks. `auth.py` is security-critical — hand
 `lightrag_server.py` re-ported and committed. `env.example` / `pyproject.toml` carry
 only enterprise env vars + test config — folded into Phase 3 / Phase 5.
 
-### Phase 3 — Native multimodal, drop raganything
+### Phase 3 — Native multimodal + multi-tenancy
 - Remove all `raganything` imports / dependency
 - `workspace_manager.py` — drop RAGAnything instance caching; per-tenant plain `LightRAG`
+- Build the `WorkspaceManager` init in `lightrag_server.py` (currently stubbed to `None`)
+- Thread `get_rag_for_request()` workspace resolution through the document / query /
+  graph / ollama routers; drop the raganything `aquery` wrappers and the scheme feature
 - Delete `ragmanager.py` if unused
 - Emails — vision func from own `VLM_LLM_*` config, not a RAGAnything instance
 - File uploads — native pipeline; `VLM_PROCESS_ENABLE=true`, `vlm` role
+- `env.example` — add OAuth2 / OBO / multi-tenancy vars; drop `RAGANYTHING_*`
 
 ### Phase 4 — WebUI
 Rebuild with Bun (`bun run build`) — do not port built assets. Re-apply source changes
