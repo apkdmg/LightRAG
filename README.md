@@ -286,6 +286,107 @@ For a streaming response implementation example, please see `examples/lightrag_o
 
 **Note 2**: Only `lightrag_openai_demo.py` and `lightrag_openai_compatible_demo.py` are officially supported sample codes. Other sample files are community contributions that haven't undergone full testing and optimization.
 
+## Enterprise Features
+
+This build of LightRAG Server adds enterprise-grade features for multi-user
+deployments, secure authentication, and integration with existing tools.
+**Multi-tenancy and OAuth2/Keycloak SSO are enabled by default** — set
+`ENABLE_MULTI_TENANCY=false` / `OAUTH2_ENABLED=false` to opt out.
+
+### Multi-Tenancy
+
+Multiple users share one server with fully isolated workspaces — each user's
+knowledge graph, embeddings, and documents are kept separate.
+
+- Workspace IDs are derived from user identity (e.g. `user@example.com` →
+  `user_example_com`).
+- A `WorkspaceManager` builds per-workspace `LightRAG` instances on demand and
+  LRU-evicts them; stateless components (embedding, LLM, tokenizer) are shared.
+- Admin and on-behalf-of operations are exposed under `/admin/*` to the
+  usernames listed in `ADMIN_ACCOUNTS`.
+
+### OAuth2 / Keycloak SSO
+
+- Authorization-Code flow (with PKCE) for interactive users.
+- Client-Credentials flow for service accounts and automation.
+- Hybrid token validation — LightRAG JWTs and Keycloak tokens both accepted.
+- SSO logout.
+
+```bash
+OAUTH2_ENABLED=true
+OAUTH2_CLIENT_ID=your-client-id
+OAUTH2_CLIENT_SECRET=your-client-secret
+OAUTH2_ISSUER=https://keycloak.example.com/realms/your-realm
+OAUTH2_AUTHORIZATION_ENDPOINT=https://keycloak.example.com/realms/your-realm/protocol/openid-connect/auth
+OAUTH2_TOKEN_ENDPOINT=https://keycloak.example.com/realms/your-realm/protocol/openid-connect/token
+OAUTH2_JWKS_URI=https://keycloak.example.com/realms/your-realm/protocol/openid-connect/certs
+OAUTH2_REDIRECT_URI=http://localhost:9621/oauth2/callback
+```
+
+See [Keycloak SSO Setup](./docs/KEYCLOAK_SSO_SETUP.md) for full configuration.
+
+### OpenAI-Compatible API
+
+OpenAI-format endpoints let tools that speak the OpenAI API talk to LightRAG.
+
+- `GET /v1/models` — list available models
+- `POST /v1/chat/completions` — chat completion (streaming and non-streaming)
+
+Models: `lightrag` (default, mix mode), plus `lightrag-local`,
+`lightrag-global`, `lightrag-hybrid`, `lightrag-naive`, `lightrag-mix`.
+
+```bash
+curl -X POST "http://localhost:9621/v1/chat/completions" \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer YOUR_TOKEN" \
+  -d '{"model": "lightrag", "messages": [{"role": "user", "content": "What is LightRAG?"}], "stream": false}'
+```
+
+Query mode is chosen by a message prefix (`/local …`), the model name
+(`lightrag-global`), or the default (mix).
+
+### Per-User API Keys
+
+Personal API keys allow programmatic access without managing OAuth tokens.
+
+- Key format `sk-lightrag-{workspace_hash}-{random}` — bound to the user's workspace.
+- Optional expiry; last-used tracking; keys are hashed before storage.
+- `POST /api-keys` create · `GET /api-keys` list · `DELETE /api-keys/{key_id}` revoke.
+
+```bash
+curl -X POST "http://localhost:9621/api-keys" \
+  -H "Authorization: Bearer YOUR_JWT_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"name": "My API Key", "expires_in_days": 30}'
+```
+
+### Email Ingestion
+
+Ingest emails with attachments as linked document bundles.
+
+- Input: raw `.eml` files (recommended) or structured JSON plus attachment files.
+- Headers (From / To / CC / Subject / Date / Message-ID) and attachment text are
+  extracted; inline images are described by the native VLM when one is configured.
+- Background processing with a track ID; a shared Bundle-ID links the bundle.
+
+```bash
+# Ingest an .eml file
+curl -X POST "http://localhost:9621/documents/email" \
+  -H "Authorization: Bearer YOUR_TOKEN" \
+  -F "email_file=@/path/to/email.eml"
+
+# Or structured input
+curl -X POST "http://localhost:9621/documents/email" \
+  -H "Authorization: Bearer YOUR_TOKEN" \
+  -F 'metadata={"from":"sender@example.com","to":["recipient@example.com"],"subject":"Meeting Notes"}' \
+  -F "body_text=Email body content here" \
+  -F "attachments=@/path/to/attachment.pdf"
+```
+
+Multimodal processing (images / tables / equations) is handled by LightRAG's
+**native** pipeline — no external package is required. For installation and
+configuration, see the [Linux Installation Guide](./docs/LINUX_INSTALLATION_GUIDE.md).
+
 ## Programming with LightRAG Core
 
 For the complete Core API reference — including init parameters, `QueryParam`, LLM/embedding provider examples (OpenAI, Ollama, Azure, Gemini, HuggingFace, LlamaIndex), reranker injection, insert operations, entity/relation management, and delete/merge — see **[docs/ProgramingWithCore.md](./docs/ProgramingWithCore.md)**.
