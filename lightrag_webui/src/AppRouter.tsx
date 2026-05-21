@@ -6,6 +6,7 @@ import { navigationService } from '@/services/navigation'
 import { Toaster } from 'sonner'
 import App from './App'
 import LoginPage from '@/features/LoginPage'
+import OAuth2Callback from '@/features/OAuth2Callback'
 import ThemeProvider from '@/components/ThemeProvider'
 
 const AppContent = () => {
@@ -24,8 +25,11 @@ const AppContent = () => {
     const checkAuth = async () => {
       try {
         const token = localStorage.getItem('LIGHTRAG-API-TOKEN')
+        // Check the store directly to get the most up-to-date auth state
+        // The hook value might be stale during navigation transitions
+        const authState = useAuthStore.getState()
 
-        if (token && isAuthenticated) {
+        if (token && authState.isAuthenticated) {
           setInitializing(false);
           return;
         }
@@ -35,7 +39,8 @@ const AppContent = () => {
         }
       } catch (error) {
         console.error('Auth initialization error:', error)
-        if (!isAuthenticated) {
+        const authState = useAuthStore.getState()
+        if (!authState.isAuthenticated) {
           useAuthStore.getState().logout()
         }
       } finally {
@@ -53,9 +58,15 @@ const AppContent = () => {
   useEffect(() => {
     if (!initializing && !isAuthenticated) {
       const currentPath = window.location.hash.slice(1);
-      if (currentPath !== '/login') {
-        console.log('Not authenticated, redirecting to login');
-        navigate('/login');
+      // Don't redirect if on login page or OAuth2 callback page
+      if (currentPath !== '/login' && !currentPath.startsWith('/oauth2/callback')) {
+        // Double-check the auth state from the store directly
+        // This handles race conditions where the component hasn't re-rendered yet
+        const authState = useAuthStore.getState();
+        if (!authState.isAuthenticated) {
+          console.log('Not authenticated, redirecting to login');
+          navigate('/login');
+        }
       }
     }
   }, [initializing, isAuthenticated, navigate]);
@@ -68,6 +79,7 @@ const AppContent = () => {
   return (
     <Routes>
       <Route path="/login" element={<LoginPage />} />
+      <Route path="/oauth2/callback" element={<OAuth2Callback />} />
       <Route
         path="/*"
         element={isAuthenticated ? <App /> : null}

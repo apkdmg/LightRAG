@@ -28,7 +28,8 @@ interface BackendState {
 
 interface AuthState {
   isAuthenticated: boolean;
-  isGuestMode: boolean;  // Add guest mode flag
+  isGuestMode: boolean;  // Guest mode flag
+  isSSOMode: boolean;    // SSO/OAuth2 mode flag
   coreVersion: string | null;
   apiVersion: string | null;
   username: string | null; // login username
@@ -37,7 +38,7 @@ interface AuthState {
   lastTokenRenewal: string | null; // Human-readable local time of last token renewal (for debugging and monitoring)
   tokenExpiresAt: number | null; // Token expiration timestamp (extracted from JWT)
 
-  login: (token: string, isGuest?: boolean, coreVersion?: string | null, apiVersion?: string | null, webuiTitle?: string | null, webuiDescription?: string | null) => void;
+  login: (token: string, isGuest?: boolean, isSSO?: boolean, coreVersion?: string | null, apiVersion?: string | null, webuiTitle?: string | null, webuiDescription?: string | null) => void;
   logout: () => void;
   setVersion: (coreVersion: string | null, apiVersion: string | null) => void;
   setCustomTitle: (webuiTitle: string | null, webuiDescription: string | null) => void;
@@ -202,13 +203,14 @@ const getTokenExpiresAt = (token: string): number | null => {
   return payload.exp ? payload.exp * 1000 : null; // Convert to milliseconds
 };
 
-const initAuthState = (): { isAuthenticated: boolean; isGuestMode: boolean; coreVersion: string | null; apiVersion: string | null; username: string | null; webuiTitle: string | null; webuiDescription: string | null; lastTokenRenewal: string | null; tokenExpiresAt: number | null } => {
+const initAuthState = (): { isAuthenticated: boolean; isGuestMode: boolean; isSSOMode: boolean; coreVersion: string | null; apiVersion: string | null; username: string | null; webuiTitle: string | null; webuiDescription: string | null; lastTokenRenewal: string | null; tokenExpiresAt: number | null } => {
   const token = localStorage.getItem('LIGHTRAG-API-TOKEN');
   const coreVersion = localStorage.getItem('LIGHTRAG-CORE-VERSION');
   const apiVersion = localStorage.getItem('LIGHTRAG-API-VERSION');
   const webuiTitle = localStorage.getItem('LIGHTRAG-WEBUI-TITLE');
   const webuiDescription = localStorage.getItem('LIGHTRAG-WEBUI-DESCRIPTION');
   const lastTokenRenewal = localStorage.getItem('LIGHTRAG-LAST-TOKEN-RENEWAL');
+  const isSSOMode = localStorage.getItem('LIGHTRAG-SSO-MODE') === 'true';
   const username = token ? getUsernameFromToken(token) : null;
   const tokenExpiresAt = token ? getTokenExpiresAt(token) : null;
 
@@ -216,6 +218,7 @@ const initAuthState = (): { isAuthenticated: boolean; isGuestMode: boolean; core
     return {
       isAuthenticated: false,
       isGuestMode: false,
+      isSSOMode: false,
       coreVersion: coreVersion,
       apiVersion: apiVersion,
       username: null,
@@ -229,6 +232,7 @@ const initAuthState = (): { isAuthenticated: boolean; isGuestMode: boolean; core
   return {
     isAuthenticated: true,
     isGuestMode: isGuestToken(token),
+    isSSOMode: isSSOMode,
     coreVersion: coreVersion,
     apiVersion: apiVersion,
     username: username,
@@ -246,6 +250,7 @@ export const useAuthStore = create<AuthState>(set => {
   return {
     isAuthenticated: initialState.isAuthenticated,
     isGuestMode: initialState.isGuestMode,
+    isSSOMode: initialState.isSSOMode,
     coreVersion: initialState.coreVersion,
     apiVersion: initialState.apiVersion,
     username: initialState.username,
@@ -254,8 +259,15 @@ export const useAuthStore = create<AuthState>(set => {
     lastTokenRenewal: initialState.lastTokenRenewal,
     tokenExpiresAt: initialState.tokenExpiresAt,
 
-    login: (token, isGuest = false, coreVersion = null, apiVersion = null, webuiTitle = null, webuiDescription = null) => {
+    login: (token, isGuest = false, isSSO = false, coreVersion = null, apiVersion = null, webuiTitle = null, webuiDescription = null) => {
       localStorage.setItem('LIGHTRAG-API-TOKEN', token);
+
+      // Store SSO mode flag
+      if (isSSO) {
+        localStorage.setItem('LIGHTRAG-SSO-MODE', 'true');
+      } else {
+        localStorage.removeItem('LIGHTRAG-SSO-MODE');
+      }
 
       if (coreVersion) {
         localStorage.setItem('LIGHTRAG-CORE-VERSION', coreVersion);
@@ -287,6 +299,7 @@ export const useAuthStore = create<AuthState>(set => {
       set({
         isAuthenticated: true,
         isGuestMode: isGuest,
+        isSSOMode: isSSO,
         username: username,
         coreVersion: coreVersion,
         apiVersion: apiVersion,
@@ -298,8 +311,12 @@ export const useAuthStore = create<AuthState>(set => {
     },
 
     logout: () => {
+      // Capture SSO mode before clearing localStorage
+      const wasSSOMode = localStorage.getItem('LIGHTRAG-SSO-MODE') === 'true';
+
       localStorage.removeItem('LIGHTRAG-API-TOKEN');
       localStorage.removeItem('LIGHTRAG-LAST-TOKEN-RENEWAL');
+      localStorage.removeItem('LIGHTRAG-SSO-MODE');
 
       const coreVersion = localStorage.getItem('LIGHTRAG-CORE-VERSION');
       const apiVersion = localStorage.getItem('LIGHTRAG-API-VERSION');
@@ -309,6 +326,7 @@ export const useAuthStore = create<AuthState>(set => {
       set({
         isAuthenticated: false,
         isGuestMode: false,
+        isSSOMode: false,
         username: null,
         coreVersion: coreVersion,
         apiVersion: apiVersion,
@@ -317,6 +335,12 @@ export const useAuthStore = create<AuthState>(set => {
         lastTokenRenewal: null,
         tokenExpiresAt: null,
       });
+
+      // For SSO users, redirect to the backend logout endpoint so the server
+      // can clear the HTTP-only cookie and log out from Keycloak.
+      if (wasSSOMode) {
+        window.location.href = '/oauth2/logout';
+      }
     },
 
     setVersion: (coreVersion, apiVersion) => {
