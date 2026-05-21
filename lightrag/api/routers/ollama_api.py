@@ -226,6 +226,22 @@ class OllamaAPI:
         self.router = APIRouter(tags=["ollama"])
         self.setup_routes()
 
+    async def _resolve_rag(self, http_request: Request) -> LightRAG:
+        """Resolve the LightRAG instance for this request.
+
+        Multi-tenant mode: the per-workspace instance from the WorkspaceManager.
+        Single-instance mode: the default instance passed at construction.
+        """
+        workspace_manager = getattr(
+            http_request.app.state, "workspace_manager", None
+        )
+        if workspace_manager is None:
+            return self.rag
+        from lightrag.api.dependencies import resolve_workspace_from_request
+
+        workspace = await resolve_workspace_from_request(http_request)
+        return await workspace_manager.get_instance(workspace)
+
     def setup_routes(self):
         # Create combined auth dependency for Ollama API routes
         combined_auth = get_combined_auth_dependency(self.api_key)
@@ -295,20 +311,23 @@ class OllamaAPI:
                 # Parse the request body manually
                 request = await parse_request_body(raw_request, OllamaGenerateRequest)
 
+                # Resolve the workspace-specific RAG instance (multi-tenant aware)
+                rag = await self._resolve_rag(raw_request)
+
                 query = request.prompt
                 start_time = time.time_ns()
                 prompt_tokens = estimate_tokens(query)
 
                 role_kwargs = (
-                    dict(self.rag.role_llm_kwargs["query"])
-                    if self.rag.role_llm_kwargs["query"] is not None
-                    else dict(self.rag.llm_model_kwargs)
+                    dict(rag.role_llm_kwargs["query"])
+                    if rag.role_llm_kwargs["query"] is not None
+                    else dict(rag.llm_model_kwargs)
                 )
                 if request.system:
                     role_kwargs["system_prompt"] = request.system
 
                 if request.stream:
-                    response = await (self.rag.role_llm_funcs["query"])(
+                    response = await (rag.role_llm_funcs["query"])(
                         query, stream=True, **role_kwargs
                     )
 
@@ -433,7 +452,7 @@ class OllamaAPI:
                     )
                 else:
                     first_chunk_time = time.time_ns()
-                    response_text = await (self.rag.role_llm_funcs["query"])(
+                    response_text = await (rag.role_llm_funcs["query"])(
                         query, stream=False, **role_kwargs
                     )
                     last_chunk_time = time.time_ns()
@@ -476,6 +495,9 @@ class OllamaAPI:
             try:
                 # Parse the request body manually
                 request = await parse_request_body(raw_request, OllamaChatRequest)
+
+                # Resolve the workspace-specific RAG instance (multi-tenant aware)
+                rag = await self._resolve_rag(raw_request)
 
                 # Get all messages
                 messages = request.messages
@@ -521,20 +543,20 @@ class OllamaAPI:
                     # Determine if the request is prefix with "/bypass"
                     if mode == SearchMode.bypass:
                         role_kwargs = (
-                            dict(self.rag.role_llm_kwargs["query"])
-                            if self.rag.role_llm_kwargs["query"] is not None
-                            else dict(self.rag.llm_model_kwargs)
+                            dict(rag.role_llm_kwargs["query"])
+                            if rag.role_llm_kwargs["query"] is not None
+                            else dict(rag.llm_model_kwargs)
                         )
                         if request.system:
                             role_kwargs["system_prompt"] = request.system
-                        response = await (self.rag.role_llm_funcs["query"])(
+                        response = await (rag.role_llm_funcs["query"])(
                             cleaned_query,
                             stream=True,
                             history_messages=conversation_history,
                             **role_kwargs,
                         )
                     else:
-                        response = await self.rag.aquery(
+                        response = await rag.aquery(
                             cleaned_query, param=query_param
                         )
 
@@ -688,21 +710,21 @@ class OllamaAPI:
                     )
                     if match_result or mode == SearchMode.bypass:
                         role_kwargs = (
-                            dict(self.rag.role_llm_kwargs["query"])
-                            if self.rag.role_llm_kwargs["query"] is not None
-                            else dict(self.rag.llm_model_kwargs)
+                            dict(rag.role_llm_kwargs["query"])
+                            if rag.role_llm_kwargs["query"] is not None
+                            else dict(rag.llm_model_kwargs)
                         )
                         if request.system:
                             role_kwargs["system_prompt"] = request.system
 
-                        response_text = await (self.rag.role_llm_funcs["query"])(
+                        response_text = await (rag.role_llm_funcs["query"])(
                             cleaned_query,
                             stream=False,
                             history_messages=conversation_history,
                             **role_kwargs,
                         )
                     else:
-                        response_text = await self.rag.aquery(
+                        response_text = await rag.aquery(
                             cleaned_query, param=query_param
                         )
 
