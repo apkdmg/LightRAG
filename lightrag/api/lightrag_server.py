@@ -2,7 +2,7 @@
 LightRAG FastAPI Server
 """
 
-from fastapi import FastAPI, Depends, HTTPException, Request
+from fastapi import FastAPI, Depends, HTTPException, Request, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, FileResponse, Response
 from fastapi.openapi.docs import (
@@ -54,6 +54,10 @@ from lightrag.parser_routing import validate_parser_routing_config
 from lightrag.api.routers.query_routes import create_query_routes
 from lightrag.api.routers.graph_routes import create_graph_routes
 from lightrag.api.routers.ollama_api import OllamaAPI
+from lightrag.api.routers.openai_api import create_openai_routes
+from lightrag.api.routers.apikey_routes import create_apikey_routes
+from lightrag.api.routers.admin_routes import create_admin_routes
+from lightrag.api.routers.email_routes import create_email_routes
 
 from lightrag.utils import logger, set_verbose_debug
 from lightrag.kg.shared_storage import (
@@ -469,6 +473,10 @@ def create_app(args):
         finally:
             # Clean up database connections
             await rag.finalize_storages()
+
+            # Shut down the workspace manager if multi-tenancy is enabled
+            if getattr(app.state, "workspace_manager", None):
+                await app.state.workspace_manager.shutdown()
 
             if "LIGHTRAG_GUNICORN_MODE" not in os.environ:
                 # Only perform cleanup in Uvicorn single-process mode
@@ -1652,6 +1660,11 @@ def create_app(args):
         )
     )
 
+    # Multi-tenancy: the WorkspaceManager is initialised in Phase 3, once
+    # workspace_manager.py is reworked for native multimodal. Until then the
+    # server runs in single-instance mode and routers fall back to `rag`.
+    app.state.workspace_manager = None
+
     # Add routes
     # root_path is set on the app for reverse proxy support;
     # routes stay at their natural paths and are prefixed by the proxy or uvicorn --root-path
@@ -1659,9 +1672,28 @@ def create_app(args):
     app.include_router(create_query_routes(rag, api_key, args.top_k))
     app.include_router(create_graph_routes(rag, api_key))
 
+    # Email ingestion routes (native multimodal wired up in Phase 3)
+    app.include_router(create_email_routes(rag, None, api_key))
+    logger.info("Email ingestion routes enabled")
+
+    # Admin routes for multi-tenancy management
+    if args.enable_multi_tenancy:
+        app.include_router(create_admin_routes())
+        logger.info("Admin routes enabled for multi-tenancy management")
+
     # Add Ollama API routes
     ollama_api = OllamaAPI(rag, top_k=args.top_k, api_key=api_key)
     app.include_router(ollama_api.router, prefix="/api")
+
+    # OpenAI-compatible API routes
+    app.include_router(create_openai_routes(rag, top_k=args.top_k, api_key=api_key))
+    logger.info(
+        "OpenAI-compatible API routes enabled (/v1/chat/completions, /v1/models)"
+    )
+
+    # Per-user API key management routes
+    app.include_router(create_apikey_routes(api_key=api_key))
+    logger.info("Per-user API key management routes enabled (/api-keys)")
 
     # Custom Swagger UI endpoint for offline support
     @app.get("/docs", include_in_schema=False)
@@ -1700,6 +1732,12 @@ def create_app(args):
     async def get_auth_status():
         """Get authentication status and guest token if auth is not configured"""
 
+        # OAuth2/SSO configuration status
+        oauth2_info = {
+            "oauth2_enabled": global_args.oauth2_enabled,
+            "oauth2_provider": "keycloak" if global_args.oauth2_enabled else None,
+        }
+
         if not auth_handler.accounts:
             # Authentication not configured, return guest token
             guest_token = auth_handler.create_token(
@@ -1715,6 +1753,7 @@ def create_app(args):
                 "api_version": api_version_display,
                 "webui_title": webui_title,
                 "webui_description": webui_description,
+                **oauth2_info,
             }
 
         return {
@@ -1724,6 +1763,7 @@ def create_app(args):
             "api_version": api_version_display,
             "webui_title": webui_title,
             "webui_description": webui_description,
+            **oauth2_info,
         }
 
     @app.post("/login")
@@ -1747,18 +1787,326 @@ def create_app(args):
         if not auth_handler.verify_password(username, form_data.password):
             raise HTTPException(status_code=401, detail="Incorrect credentials")
 
-        # Regular user login
+        # Determine the user role based on ADMIN_ACCOUNTS configuration
+        admin_usernames = {
+            name.strip()
+            for name in (global_args.admin_accounts or "").split(",")
+            if name.strip()
+        }
+        role = "admin" if username in admin_usernames else "user"
+
         user_token = auth_handler.create_token(
-            username=username, role="user", metadata={"auth_mode": "enabled"}
+            username=username, role=role, metadata={"auth_mode": "enabled"}
         )
         return {
             "access_token": user_token,
             "token_type": "bearer",
             "auth_mode": "enabled",
+            "role": role,
             "core_version": core_version,
             "api_version": api_version_display,
             "webui_title": webui_title,
             "webui_description": webui_description,
+        }
+
+    # ==================== OAuth2/SSO Endpoints ====================
+
+    @app.get("/oauth2/config")
+    async def oauth2_config():
+        """
+        Return OAuth2 configuration status for frontend.
+        Does not expose sensitive information like client_secret.
+        """
+        return {
+            "oauth2_enabled": global_args.oauth2_enabled,
+            "oauth2_provider": "keycloak" if global_args.oauth2_enabled else None,
+        }
+
+    @app.get("/oauth2/authorize")
+    async def oauth2_authorize():
+        """
+        Initiate OAuth2 authorization flow.
+        Returns the Keycloak authorization URL for frontend redirect.
+        """
+        from .oauth2 import get_keycloak_client
+
+        keycloak = get_keycloak_client()
+        if not keycloak:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="OAuth2/SSO is not configured. Set OAUTH2_ENABLED=true in environment.",
+            )
+
+        auth_url, state = keycloak.get_authorization_url()
+        return {"authorization_url": auth_url, "state": state}
+
+    async def _process_oauth2_callback(code: str, state: str) -> dict:
+        """
+        Internal function to process OAuth2 callback.
+        Returns token data dict on success, raises HTTPException on failure.
+        """
+        from .oauth2 import get_keycloak_client
+
+        keycloak = get_keycloak_client()
+        if not keycloak:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="OAuth2/SSO is not configured",
+            )
+
+        # Exchange authorization code for tokens
+        tokens = await keycloak.exchange_code(code, state)
+        id_token = tokens.get("id_token")
+
+        if not id_token:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="No ID token received from identity provider",
+            )
+
+        # Validate ID token using JWKS
+        token_payload = keycloak.validate_id_token(id_token)
+        user_info = keycloak.extract_user_info(token_payload)
+
+        # Get username (prefer email, fallback to preferred_username or sub)
+        username = (
+            user_info.get("email")
+            or user_info.get("preferred_username")
+            or user_info.get("sub")
+        )
+
+        if not username:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Could not determine username from identity provider token",
+            )
+
+        # Determine role: only ADMIN_ACCOUNTS get admin, all SSO users get "user"
+        admin_usernames = set()
+        if global_args.admin_accounts:
+            admin_usernames = {
+                name.strip()
+                for name in global_args.admin_accounts.split(",")
+                if name.strip()
+            }
+        role = "admin" if username in admin_usernames else "user"
+
+        # Create local JWT token
+        user_token = auth_handler.create_token(
+            username=username,
+            role=role,
+            metadata={
+                "auth_mode": "sso",
+                "sso_provider": "keycloak",
+                "keycloak_sub": user_info.get("sub"),
+                "name": user_info.get("name"),
+            },
+        )
+
+        return {
+            "access_token": user_token,
+            "token_type": "bearer",
+            "auth_mode": "sso",
+            "role": role,
+            "username": username,
+            "core_version": core_version,
+            "api_version": api_version_display,
+            "webui_title": webui_title,
+            "webui_description": webui_description,
+        }
+
+    @app.get("/api/oauth2/callback")
+    async def api_oauth2_callback(code: str, state: str):
+        """
+        Handle OAuth2 callback for REST API clients.
+        Returns JSON response with access token (for programmatic use).
+        """
+        return await _process_oauth2_callback(code, state)
+
+    @app.get("/oauth2/callback")
+    async def oauth2_callback(request: Request, code: str, state: str):
+        """
+        Handle OAuth2 callback from Keycloak for WebUI.
+        Sets token in HTTP-only secure cookie and redirects to frontend.
+
+        Security best practice: Tokens are stored in HTTP-only cookies to prevent
+        XSS attacks from accessing them. The frontend retrieves user info via
+        a separate readable cookie containing non-sensitive metadata.
+        """
+        from urllib.parse import urlencode
+        import json
+
+        try:
+            token_data = await _process_oauth2_callback(code, state)
+
+            # Create redirect response
+            redirect_response = RedirectResponse(
+                url="/webui/#/oauth2/callback?success=true",
+                status_code=status.HTTP_302_FOUND,
+            )
+
+            # Determine if we should set secure cookies
+            # Check multiple indicators for HTTPS:
+            # 1. SSL config in environment
+            # 2. X-Forwarded-Proto header from reverse proxy
+            # 3. Request URL scheme (may be set by Starlette's ProxyHeadersMiddleware)
+            is_ssl_configured = getattr(global_args, "ssl", False)
+            forwarded_proto = request.headers.get("x-forwarded-proto", "").lower()
+            is_behind_https_proxy = forwarded_proto == "https"
+            request_scheme_is_https = request.url.scheme == "https"
+            # Also check X-Forwarded-Ssl header (used by some proxies)
+            forwarded_ssl = request.headers.get("x-forwarded-ssl", "").lower()
+            is_forwarded_ssl = forwarded_ssl == "on"
+
+            is_secure = (
+                is_ssl_configured
+                or is_behind_https_proxy
+                or request_scheme_is_https
+                or is_forwarded_ssl
+            )
+
+            # Determine samesite attribute - use "none" for cross-site OAuth2 flow when secure
+            samesite_value = "none" if is_secure else "lax"
+
+            logger.info(
+                f"OAuth2 callback: Setting cookies with secure={is_secure}, samesite={samesite_value} "
+                f"(ssl_configured={is_ssl_configured}, forwarded_proto='{forwarded_proto}', "
+                f"request_scheme='{request.url.scheme}', forwarded_ssl='{forwarded_ssl}')"
+            )
+
+            # Set token in HTTP-only secure cookie (best practice)
+            # This prevents XSS attacks from stealing the token
+            redirect_response.set_cookie(
+                key="lightrag_token",
+                value=token_data["access_token"],
+                httponly=True,  # Prevents JavaScript access (XSS protection)
+                secure=is_secure,  # Only send over HTTPS in production
+                samesite=samesite_value,  # "none" for cross-site, "lax" for same-site
+                max_age=int(global_args.token_expire_hours * 3600),
+                path="/",
+            )
+
+            # Store non-sensitive metadata in a separate readable cookie for UI
+            # This allows the frontend to display user info without exposing the token
+            # URL-encode the JSON to safely store it in a cookie
+            from urllib.parse import quote
+
+            metadata = json.dumps(
+                {
+                    "username": token_data["username"],
+                    "role": token_data["role"],
+                    "auth_mode": token_data["auth_mode"],
+                    "core_version": token_data["core_version"],
+                    "api_version": token_data["api_version"],
+                    "webui_title": token_data["webui_title"],
+                    "webui_description": token_data["webui_description"],
+                }
+            )
+            redirect_response.set_cookie(
+                key="lightrag_user",
+                value=quote(metadata),  # URL-encode to handle special characters
+                httponly=False,  # Frontend needs to read this
+                secure=is_secure,
+                samesite=samesite_value,  # Match the token cookie's samesite setting
+                max_age=int(global_args.token_expire_hours * 3600),
+                path="/",
+            )
+
+            return redirect_response
+
+        except HTTPException as e:
+            # Redirect to frontend with error details
+            error_params = urlencode(
+                {"error": "auth_failed", "error_description": e.detail}
+            )
+            return RedirectResponse(url=f"/webui/#/oauth2/callback?{error_params}")
+
+    @app.get("/oauth2/logout")
+    async def oauth2_logout(request: Request):
+        """
+        Logout from Keycloak SSO and clear local session.
+
+        This endpoint:
+        1. Clears the HTTP-only lightrag_token cookie
+        2. Redirects to Keycloak's logout endpoint
+        3. Keycloak will then redirect back to the login page
+
+        For SSO users, this ensures they are logged out from both
+        LightRAG and Keycloak, allowing them to login with different credentials.
+        """
+        from .oauth2 import get_keycloak_client
+
+        keycloak_client = get_keycloak_client()
+
+        if not keycloak_client:
+            # OAuth2 not enabled, just clear cookie and redirect to login
+            response = RedirectResponse(
+                url="/webui/#/login", status_code=status.HTTP_302_FOUND
+            )
+            response.delete_cookie(key="lightrag_token", path="/")
+            response.delete_cookie(key="lightrag_user", path="/")
+            return response
+
+        # Determine the post-logout redirect URI
+        # Use the same host as the current request
+        host = request.headers.get("host", "localhost:8020")
+        forwarded_proto = request.headers.get("x-forwarded-proto", request.url.scheme)
+        post_logout_uri = f"{forwarded_proto}://{host}/webui/#/login"
+
+        # Get Keycloak logout URL
+        logout_url = keycloak_client.get_logout_url(post_logout_uri)
+
+        # Create redirect response and clear cookies
+        response = RedirectResponse(
+            url=logout_url, status_code=status.HTTP_302_FOUND
+        )
+
+        # Clear both authentication cookies
+        response.delete_cookie(key="lightrag_token", path="/")
+        response.delete_cookie(key="lightrag_user", path="/")
+
+        logger.info("SSO logout initiated, redirecting to Keycloak logout")
+        return response
+
+    @app.get("/debug/auth")
+    async def debug_auth(request: Request):
+        """
+        Debug endpoint to check what auth info the server receives.
+        This helps diagnose cookie/header issues.
+        """
+        # Get all cookies
+        cookies = dict(request.cookies)
+        # Mask token values for security (show first/last 10 chars)
+        masked_cookies = {}
+        for key, value in cookies.items():
+            if len(value) > 30:
+                masked_cookies[key] = f"{value[:10]}...{value[-10:]} (len={len(value)})"
+            else:
+                masked_cookies[key] = value
+
+        # Get authorization header
+        auth_header = request.headers.get("authorization", "")
+        if auth_header:
+            if len(auth_header) > 30:
+                auth_header = f"{auth_header[:20]}...{auth_header[-10:]} (len={len(auth_header)})"
+
+        # Get relevant headers
+        relevant_headers = {
+            "x-forwarded-proto": request.headers.get("x-forwarded-proto", "(not set)"),
+            "x-forwarded-ssl": request.headers.get("x-forwarded-ssl", "(not set)"),
+            "x-forwarded-for": request.headers.get("x-forwarded-for", "(not set)"),
+            "host": request.headers.get("host", "(not set)"),
+            "origin": request.headers.get("origin", "(not set)"),
+        }
+
+        return {
+            "cookies_received": masked_cookies,
+            "cookie_keys": list(cookies.keys()),
+            "has_lightrag_token": "lightrag_token" in cookies,
+            "authorization_header": auth_header or "(not set)",
+            "request_scheme": request.url.scheme,
+            "relevant_headers": relevant_headers,
+            "client_host": request.client.host if request.client else "(unknown)",
         }
 
     @app.get(
