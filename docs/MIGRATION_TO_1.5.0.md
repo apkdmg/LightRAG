@@ -50,12 +50,16 @@ Base = 1.5.0; re-apply enterprise hooks. `auth.py` is security-critical — hand
 - `lightrag/api/utils_api.py` — per-user API key + cookie-token + hybrid auth (43 lines)
 - `lightrag/api/lightrag_server.py` — register the enterprise routers, OAuth2 endpoints,
   WorkspaceManager init; drop raganything init (use 1.5.0's native `vlm` role)
-- `lightrag/api/routers/document_routes.py` — workspace scoping; drop raganything
-  branching and the scheme feature
-- `lightrag/api/routers/{query,graph,ollama}_routes.py` — workspace scoping; drop the
-  raganything `aquery` wrappers
+- `lightrag/api/routers/{document,query,graph,ollama}_routes.py` — **no Phase 2 change.**
+  Verified (residue analysis of `git diff 9bc5f157 RAGAnything`) that their entire
+  enterprise diff is raganything `aquery` wrappers (dropped) + the scheme feature
+  (dropped) + workspace resolution. The workspace resolution moves to Phase 3, bundled
+  with the `WorkspaceManager`. 1.5.0's versions of these four files stand as-is.
 - `routers/__init__.py` — no change (factories imported directly in `lightrag_server.py`)
-- `env.example`, `pyproject.toml` — enterprise vars; `RAGANYTHING_*` dropped
+
+**Phase 2 status: COMPLETE.** `config.py`, `auth.py`, `utils_api.py`,
+`lightrag_server.py` re-ported and committed. `env.example` / `pyproject.toml` carry
+only enterprise env vars + test config — folded into Phase 3 / Phase 5.
 
 ### Phase 3 — Native multimodal, drop raganything
 - Remove all `raganything` imports / dependency
