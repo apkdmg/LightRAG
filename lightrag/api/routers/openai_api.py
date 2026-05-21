@@ -29,33 +29,6 @@ from lightrag.api.dependencies import resolve_workspace_from_request
 from .ollama_api import parse_query_mode, SearchMode
 
 
-def _is_raganything_instance(rag_instance) -> bool:
-    """Check if the RAG instance is a RAGAnything instance."""
-    return type(rag_instance).__name__ == "RAGAnything"
-
-
-async def _call_aquery(rag_instance, query: str, param: "QueryParam"):
-    """
-    Call aquery on the RAG instance with proper parameter handling.
-
-    Handles incompatibility between LightRAG and RAGAnything's aquery signatures.
-    RAGAnything has a bug where passing param=QueryParam causes issues when VLM enhanced
-    mode is active. Workaround: unpack QueryParam fields into keyword arguments.
-    """
-    if _is_raganything_instance(rag_instance):
-        from dataclasses import asdict
-
-        param_dict = asdict(param)
-        kwargs = {k: v for k, v in param_dict.items() if v is not None}
-        mode = kwargs.pop("mode", "mix")
-        # Remove fields that RAGAnything sets internally in aquery_vlm_enhanced
-        kwargs.pop("only_need_prompt", None)
-        kwargs.pop("only_need_context", None)
-        return await rag_instance.aquery(query, mode=mode, **kwargs)
-    else:
-        return await rag_instance.aquery(query, param=param)
-
-
 # Pydantic models for OpenAI API
 class ChatMessage(BaseModel):
     """OpenAI-compatible chat message."""
@@ -340,7 +313,7 @@ class OpenAIAPI:
                     **rag.llm_model_kwargs,
                 )
             else:
-                response = await _call_aquery(rag, query, param)
+                response = await rag.aquery(query, param=param)
 
             # Handle string response (non-streaming from aquery)
             if isinstance(response, str):
@@ -477,7 +450,7 @@ class OpenAIAPI:
                 **rag.llm_model_kwargs,
             )
         else:
-            response_text = await _call_aquery(rag, query, param)
+            response_text = await rag.aquery(query, param=param)
 
         if not response_text:
             response_text = "No response generated"
