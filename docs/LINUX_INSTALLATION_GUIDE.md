@@ -234,6 +234,7 @@ pip install --upgrade pip setuptools wheel
 ```bash
 # Install core + API dependencies
 pip install -e ".[api]"
+# (upstream's recommended alternative: `uv sync --extra api`)
 ```
 
 Multimodal document processing is **built into LightRAG 1.5.0** — no extra
@@ -839,6 +840,7 @@ sudo systemctl status lightrag
 
 For more information, see:
 - [Main Documentation](../README.md)
-- [API Documentation](../lightrag/api/README.md)
+- [API Server Guide](./LightRAG-API-Server.md)
+- [Frontend Build Guide](./FrontendBuildGuide.md)
 - [Docker Deployment](./DockerDeployment.md)
 - [Kubernetes Deployment](../k8s-deploy/README.md)
