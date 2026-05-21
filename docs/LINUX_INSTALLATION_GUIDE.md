@@ -1,6 +1,9 @@
 # LightRAG Linux Server Installation Guide
 
-A step-by-step guide to install and configure LightRAG with RAGAnything on a Linux server.
+A step-by-step guide to install and configure the LightRAG enterprise server
+(LightRAG 1.5.0, branch `enterprise-1.5.0`) on a Linux server. Multimodal
+document processing is built in natively; OAuth2/Keycloak SSO and multi-tenant
+workspace isolation are enabled by default.
 
 ## Table of Contents
 
@@ -99,7 +102,7 @@ sudo usermod -aG docker $USER
 ```bash
 git clone https://github.com/apkdmg/LightRAG.git
 cd LightRAG
-git checkout RAGAnything
+git checkout enterprise-1.5.0
 ```
 
 #### Step 3: Configure Environment
@@ -132,10 +135,17 @@ EMBEDDING_DIM=1536
 EMBEDDING_BINDING_HOST=https://api.openai.com/v1
 EMBEDDING_BINDING_API_KEY=sk-your-api-key-here
 
-# Authentication
-AUTH_ACCOUNTS=admin:your-secure-password
+# Authentication — TOKEN_SECRET is required (it signs every JWT)
 TOKEN_SECRET=your-random-secret-key-min-32-chars
 LIGHTRAG_API_KEY=your-api-key-for-programmatic-access
+# Username/password accounts (optional — omit for SSO-only or guest access)
+AUTH_ACCOUNTS=admin:your-secure-password
+ADMIN_ACCOUNTS=admin
+
+# OAuth2 / Keycloak SSO is ENABLED BY DEFAULT — supply real credentials,
+# or set OAUTH2_ENABLED=false to use username/password login only.
+OAUTH2_CLIENT_ID=lightrag
+OAUTH2_CLIENT_SECRET=your-keycloak-client-secret
 ```
 
 #### Step 4: Create Data Directories
@@ -164,8 +174,8 @@ docker compose ps
 # Health check
 curl http://localhost:9621/health
 
-# Get server capabilities
-curl http://localhost:9621/documents/capabilities
+# Check authentication / SSO status
+curl http://localhost:9621/auth-status
 ```
 
 ---
@@ -203,7 +213,7 @@ sudo dnf install -y \
 ```bash
 git clone https://github.com/apkdmg/LightRAG.git
 cd LightRAG
-git checkout RAGAnything
+git checkout enterprise-1.5.0
 ```
 
 #### Step 3: Create Virtual Environment
@@ -219,20 +229,26 @@ source venv/bin/activate
 pip install --upgrade pip setuptools wheel
 ```
 
-#### Step 4: Install LightRAG
+#### Step 4: Install LightRAG and Build the WebUI
 
 ```bash
-# Install with API dependencies
+# Install core + API dependencies
 pip install -e ".[api]"
+```
 
-# For RAGAnything support (multimodal processing)
-pip install raganything
+Multimodal document processing is **built into LightRAG 1.5.0** — no extra
+package is required (RAGAnything is no longer used). Native DOCX parsing works
+out of the box; for image/table extraction from PDFs, configure an external
+parser (`mineru` or `docling`) via the `LIGHTRAG_PARSER` setting.
 
-# For PDF processing
-pip install pypdf2 pymupdf
+The WebUI's built assets are not committed to git, so build them once
+([Bun](https://bun.sh) is required):
 
-# For Office documents
-pip install python-docx python-pptx openpyxl
+```bash
+cd lightrag_webui
+bun install --frozen-lockfile
+bun run build          # outputs to lightrag/api/webui/
+cd ..
 ```
 
 #### Step 5: Configure Environment
@@ -421,12 +437,15 @@ EMBEDDING_BINDING_API_KEY=sk-your-key
 # MIN_RERANK_SCORE=0.3
 
 # ============================================================================
-# VISION MODEL (For RAGAnything)
+# VLM / MULTIMODAL (native — describes images, tables, equations)
 # ============================================================================
-# VISION_BINDING=openai
-# VISION_MODEL=gpt-4o
-# VISION_BINDING_HOST=https://api.openai.com/v1
-# VISION_BINDING_API_KEY=sk-your-key
+# Enables VLM analysis of image/table/equation items in documents and the
+# vision description of inline images in ingested emails.
+# VLM_PROCESS_ENABLE=true
+# VLM_LLM_BINDING=openai
+# VLM_LLM_MODEL=gpt-4o
+# VLM_LLM_BINDING_HOST=https://api.openai.com/v1
+# VLM_LLM_BINDING_API_KEY=sk-your-key
 
 # ============================================================================
 # STORAGE CONFIGURATION
@@ -446,10 +465,29 @@ DOC_STATUS_STORAGE=JsonDocStatusStorage
 # ============================================================================
 # AUTHENTICATION
 # ============================================================================
-AUTH_ACCOUNTS=admin:secure-password,user1:user-password
+# TOKEN_SECRET is REQUIRED — it signs every JWT (including SSO-issued tokens).
+# With AUTH_ACCOUNTS set, the server refuses to start unless TOKEN_SECRET is
+# changed from its default value.
 TOKEN_SECRET=your-random-secret-key-at-least-32-characters-long
 TOKEN_EXPIRE_HOURS=48
 LIGHTRAG_API_KEY=your-api-key-for-programmatic-access
+
+# Username/password accounts (optional — omit for SSO-only or guest access).
+AUTH_ACCOUNTS=admin:secure-password,user1:user-password
+# Usernames granted the admin role (comma-separated) — required for the
+# multi-tenancy admin API and on-behalf-of operations.
+ADMIN_ACCOUNTS=admin
+
+# ============================================================================
+# OAUTH2 / KEYCLOAK SSO  (ENABLED BY DEFAULT)
+# ============================================================================
+# Set OAUTH2_ENABLED=false to disable SSO and use password/guest login only.
+OAUTH2_ENABLED=true
+OAUTH2_CLIENT_ID=lightrag
+OAUTH2_CLIENT_SECRET=your-keycloak-client-secret
+OAUTH2_ISSUER=https://id.unimas.my/realms/UNIMAS
+OAUTH2_REDIRECT_URI=http://your-host:9621/oauth2/callback
+# Full Keycloak configuration: see docs/KEYCLOAK_SSO_SETUP.md
 
 # ============================================================================
 # QUERY PARAMETERS
@@ -479,19 +517,21 @@ EMBEDDING_FUNC_MAX_ASYNC=16
 EMBEDDING_BATCH_NUM=32
 
 # ============================================================================
-# MULTI-TENANCY (Optional)
+# MULTI-TENANCY  (ENABLED BY DEFAULT — per-user workspace isolation)
 # ============================================================================
-# ENABLE_MULTI_TENANCY=true
-# MAX_WORKSPACE_INSTANCES=100
-# WORKSPACE_TTL_MINUTES=60
+# Set ENABLE_MULTI_TENANCY=false for a single shared workspace.
+ENABLE_MULTI_TENANCY=true
+MAX_WORKSPACE_INSTANCES=10000
+WORKSPACE_TTL_MINUTES=60
+AUTO_CREATE_WORKSPACE=true
 
 # ============================================================================
-# RAGANYTHING (Multimodal Processing)
+# DOCUMENT PARSING (native multimodal — RAGAnything is no longer used)
 # ============================================================================
-# RAGANYTHING_PARSER=mineru
-# RAGANYTHING_ENABLE_IMAGE_PROCESSING=true
-# RAGANYTHING_ENABLE_TABLE_PROCESSING=true
-# RAGANYTHING_ENABLE_EQUATION_PROCESSING=true
+# Native DOCX parsing is built in. For PDF / image parsing, route to an
+# external parser (mineru or docling) via LIGHTRAG_PARSER. See env.example
+# for the parser-routing syntax and the MINERU_* / DOCLING_* settings.
+# LIGHTRAG_PARSER=*:native-teP,*:legacy-R
 ```
 
 ---
@@ -723,8 +763,8 @@ EMBEDDING_BATCH_NUM=16
 # Server health
 curl http://localhost:9621/health
 
-# Server capabilities
-curl http://localhost:9621/documents/capabilities
+# Authentication / SSO status
+curl http://localhost:9621/auth-status
 
 # API documentation
 # Open in browser: http://localhost:9621/docs
@@ -739,18 +779,31 @@ curl http://localhost:9621/documents/capabilities
 | Endpoint | Method | Description |
 |----------|--------|-------------|
 | `/health` | GET | Health check |
-| `/login` | POST | Get JWT token |
-| `/documents/upload` | POST | Upload document |
-| `/documents/scan` | POST | Scan input directory |
-| `/documents/capabilities` | GET | Server capabilities |
-| `/query` | POST | Query knowledge base |
-| `/graph/nodes` | GET | List graph nodes |
+| `/auth-status` | GET | Authentication / SSO status |
+| `/login` | POST | Username/password login (JWT) |
+| `/oauth2/authorize` | GET | Start Keycloak SSO login |
+| `/documents/upload` | POST | Upload a document |
+| `/documents/scan` | POST | Scan the input directory |
+| `/documents/email` | POST | Ingest an email (.eml or structured) |
+| `/query` | POST | Query the knowledge base |
+| `/v1/chat/completions` | POST | OpenAI-compatible chat API |
+| `/api-keys` | GET/POST | Per-user API key management |
+| `/admin/workspaces` | GET | Multi-tenancy admin |
+| `/graphs` | GET | Knowledge graph |
 | `/docs` | GET | Swagger UI |
 
-### Default Credentials
+### Login & Credentials
 
-- **WebUI:** admin / (password from AUTH_ACCOUNTS)
-- **API Key:** (value from LIGHTRAG_API_KEY)
+There is **no built-in default user**. How login works depends on configuration:
+
+- **OAuth2 / SSO (default):** users sign in via Keycloak ("Sign in with SSO").
+  Requires `OAUTH2_CLIENT_ID` / `OAUTH2_CLIENT_SECRET`.
+- **Username/password:** available only when `AUTH_ACCOUNTS` is set
+  (e.g. `admin:<password>`).
+- **Guest mode:** if `AUTH_ACCOUNTS` is unset *and* SSO is not configured, the
+  WebUI enters as a guest with no login.
+- **Admin role:** granted to the usernames listed in `ADMIN_ACCOUNTS`.
+- **API key:** the shared `LIGHTRAG_API_KEY`, or per-user keys minted via `/api-keys`.
 
 ### Useful Commands
 
