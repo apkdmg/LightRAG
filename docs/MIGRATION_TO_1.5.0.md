@@ -72,6 +72,13 @@ only enterprise env vars + test config — folded into Phase 3 / Phase 5.
 - File uploads — native pipeline; `VLM_PROCESS_ENABLE=true`, `vlm` role
 - `env.example` — add OAuth2 / OBO / multi-tenancy vars; drop `RAGANYTHING_*`
 
+**Phase 3 status: COMPLETE.** Codebase is raganything-free (verified by a full
+scan of `lightrag/`). Multi-tenancy fully wired — factory-based `WorkspaceManager`
++ `build_rag` + `resolve_rag`/`resolve_doc_manager` threaded through all four
+routers. Email ingestion uses a native VLM vision function; document uploads use
+1.5.0's native parser pipeline. `ragmanager.py` was never staged. `openai_api.py`
+raganything wrapper removed. `lightrag/api/` compiles clean.
+
 ### Phase 4 — WebUI
 Rebuild with Bun (`bun run build`) — do not port built assets. Re-apply source changes
 (`App.tsx`, `AppRouter.tsx`, `LoginPage.tsx`, `api/lightrag.ts`, `stores/state.ts`,
