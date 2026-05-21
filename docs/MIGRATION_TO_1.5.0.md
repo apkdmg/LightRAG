@@ -90,8 +90,19 @@ dev-proxy tweak skipped; no stray `package-lock.json`. Note: `lightrag/api/webui
 gitignored in 1.5.0 — built assets are generated at package time, not committed.
 
 ### Phase 5 — Tests & CI
-Reconcile `tests/conftest.py` with 1.5.0; port `tests/{api,unit,integration}/`; reconcile
-`.github/workflows/test.yml`.
+
+**Phase 5 status: COMPLETE.** The enterprise "test infrastructure" (a 402-line
+`conftest.py`, a `test.yml`, empty `tests/{api,unit,integration}/` dirs, `tests/README.md`)
+is empty scaffolding — no actual `test_*.py` files — and is fully superseded by 1.5.0's
+139-file test suite with its own `conftest.py` and CI workflows. Porting it would *break*
+1.5.0's suite, so nothing is ported; 1.5.0's test infrastructure is kept.
+
+Verified instead that the migration introduces **zero test regressions**: the 1.5.0
+offline suite shows 270 failures on `enterprise-1.5.0` — identical to 270 on pristine
+`upstream/main` (all environmental — this offline sandbox blocks network the suite needs).
+One regression caught during the check — the Phase 3 `document_routes` `Depends`
+parameters broke 1.5.0's direct-call unit tests — was fixed (`http_request: Request = None`
++ inline resolution).
 
 ### Phase 6 — Verification
 - Enterprise: OAuth2 login/logout, multi-tenant isolation, OpenAI-compat endpoint,
