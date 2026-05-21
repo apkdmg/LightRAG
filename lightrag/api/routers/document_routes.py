@@ -2609,12 +2609,14 @@ def create_document_routes(
     # Create combined auth dependency for document routes
     combined_auth = get_combined_auth_dependency(api_key)
 
-    # Per-workspace DocumentManager cache — keeps the in-memory indexed_files
-    # tracking alive across requests when multi-tenancy is enabled.
+    # Per-workspace DocumentManager cache (keeps in-memory indexed_files
+    # tracking alive across requests in multi-tenant mode).
     _workspace_doc_managers: dict = {}
 
-    async def resolve_rag(http_request: Request):
-        """Per-workspace LightRAG in multi-tenant mode, else the default ``rag``."""
+    async def resolve_rag(http_request):
+        """Per-workspace LightRAG, or the default rag (None request = direct call)."""
+        if http_request is None:
+            return rag
         workspace_manager = getattr(
             http_request.app.state, "workspace_manager", None
         )
@@ -2625,8 +2627,10 @@ def create_document_routes(
         workspace = await resolve_workspace_from_request(http_request)
         return await workspace_manager.get_instance(workspace)
 
-    async def resolve_doc_manager(http_request: Request):
-        """Per-workspace DocumentManager in multi-tenant mode, else the default."""
+    async def resolve_doc_manager(http_request):
+        """Per-workspace DocumentManager, or the default (None request = direct call)."""
+        if http_request is None:
+            return doc_manager
         workspace_manager = getattr(
             http_request.app.state, "workspace_manager", None
         )
@@ -2643,14 +2647,11 @@ def create_document_routes(
             )
         return _workspace_doc_managers[workspace]
 
+
     @router.post(
         "/scan", response_model=ScanResponse, dependencies=[Depends(combined_auth)]
     )
-    async def scan_for_new_documents(
-        background_tasks: BackgroundTasks,
-        rag=Depends(resolve_rag),
-        doc_manager=Depends(resolve_doc_manager),
-    ):
+    async def scan_for_new_documents(background_tasks: BackgroundTasks, http_request: Request = None):
         """
         Trigger the scanning process for new documents.
 
@@ -2677,6 +2678,8 @@ def create_document_routes(
         Returns:
             ScanResponse: A response object containing the scanning status and track_id
         """
+        rag = await resolve_rag(http_request)
+        doc_manager = await resolve_doc_manager(http_request)
         from lightrag.exceptions import PipelineNotInitializedError
         from lightrag.kg.shared_storage import get_namespace_data, get_namespace_lock
 
@@ -2774,10 +2777,8 @@ def create_document_routes(
         "/upload", response_model=InsertResponse, dependencies=[Depends(combined_auth)]
     )
     async def upload_to_input_dir(
-        background_tasks: BackgroundTasks,
-        file: UploadFile = File(...),
-        rag=Depends(resolve_rag),
-        doc_manager=Depends(resolve_doc_manager),
+        background_tasks: BackgroundTasks, file: UploadFile = File(...),
+        http_request: Request = None,
     ):
         """
         Upload a file to the input directory and index it.
@@ -2851,6 +2852,8 @@ def create_document_routes(
                 conflict or scan-classifying / destructive job in
                 flight, 413 file too large, 500 other errors.
         """
+        rag = await resolve_rag(http_request)
+        doc_manager = await resolve_doc_manager(http_request)
         slot_reserved = False
         try:
             # Reject upload while a scan is in its CLASSIFICATION
@@ -3019,9 +3022,8 @@ def create_document_routes(
         "/text", response_model=InsertResponse, dependencies=[Depends(combined_auth)]
     )
     async def insert_text(
-        request: InsertTextRequest,
-        background_tasks: BackgroundTasks,
-        rag=Depends(resolve_rag),
+        request: InsertTextRequest, background_tasks: BackgroundTasks,
+        http_request: Request = None,
     ):
         """
         Insert text into the RAG system.
@@ -3049,6 +3051,7 @@ def create_document_routes(
             HTTPException: 400 invalid file_source, 409 same-name conflict
                 or scan/destructive job in flight, 500 other errors.
         """
+        rag = await resolve_rag(http_request)
         slot_reserved = False
         try:
             # Reject text insertion while a scan is in progress AND reserve
@@ -3114,9 +3117,8 @@ def create_document_routes(
         dependencies=[Depends(combined_auth)],
     )
     async def insert_texts(
-        request: InsertTextsRequest,
-        background_tasks: BackgroundTasks,
-        rag=Depends(resolve_rag),
+        request: InsertTextsRequest, background_tasks: BackgroundTasks,
+        http_request: Request = None,
     ):
         """
         Insert multiple texts into the RAG system.
@@ -3145,6 +3147,7 @@ def create_document_routes(
                 conflict or scan/destructive job in flight, 500 other
                 errors.
         """
+        rag = await resolve_rag(http_request)
         slot_reserved = False
         try:
             # Reject batch text insertion while a scan is in progress AND
@@ -3226,10 +3229,7 @@ def create_document_routes(
     @router.delete(
         "", response_model=ClearDocumentsResponse, dependencies=[Depends(combined_auth)]
     )
-    async def clear_documents(
-        rag=Depends(resolve_rag),
-        doc_manager=Depends(resolve_doc_manager),
-    ):
+    async def clear_documents(http_request: Request = None):
         """
         Clear all documents from the RAG system.
 
@@ -3262,6 +3262,8 @@ def create_document_routes(
             HTTPException: Raised when a serious error occurs during the clearing process,
                           with status code 500 and error details in the detail field.
         """
+        rag = await resolve_rag(http_request)
+        doc_manager = await resolve_doc_manager(http_request)
         from lightrag.kg.shared_storage import (
             get_namespace_data,
             get_namespace_lock,
@@ -3442,9 +3444,7 @@ def create_document_routes(
         dependencies=[Depends(combined_auth)],
         response_model=PipelineStatusResponse,
     )
-    async def get_pipeline_status(
-        rag=Depends(resolve_rag),
-    ) -> PipelineStatusResponse:
+    async def get_pipeline_status(http_request: Request = None) -> PipelineStatusResponse:
         """
         Get the current status of the document indexing pipeline.
 
@@ -3468,6 +3468,7 @@ def create_document_routes(
         Raises:
             HTTPException: If an error occurs while retrieving pipeline status (500)
         """
+        rag = await resolve_rag(http_request)
         try:
             from lightrag.kg.shared_storage import (
                 get_namespace_data,
@@ -3543,9 +3544,7 @@ def create_document_routes(
     @router.get(
         "", response_model=DocsStatusesResponse, dependencies=[Depends(combined_auth)]
     )
-    async def documents(
-        rag=Depends(resolve_rag),
-    ) -> DocsStatusesResponse:
+    async def documents(http_request: Request = None) -> DocsStatusesResponse:
         """
         Get the status of all documents in the system. This endpoint is deprecated; use /documents/paginated instead.
         To prevent excessive resource consumption, a maximum of 1,000 records is returned.
@@ -3563,6 +3562,7 @@ def create_document_routes(
         Raises:
             HTTPException: If an error occurs while retrieving document statuses (500).
         """
+        rag = await resolve_rag(http_request)
         try:
             statuses = (
                 DocStatus.PENDING,
@@ -3663,8 +3663,7 @@ def create_document_routes(
     async def delete_document(
         delete_request: DeleteDocRequest,
         background_tasks: BackgroundTasks,
-        rag=Depends(resolve_rag),
-        doc_manager=Depends(resolve_doc_manager),
+        http_request: Request = None,
     ) -> DeleteDocByIdResponse:
         """
         Delete documents and all their associated data by their IDs using background processing.
@@ -3699,6 +3698,8 @@ def create_document_routes(
             HTTPException:
               - 500: If an unexpected internal error occurs during initialization.
         """
+        rag = await resolve_rag(http_request)
+        doc_manager = await resolve_doc_manager(http_request)
         doc_ids = delete_request.doc_ids
 
         slot_acquired = False
@@ -3755,7 +3756,7 @@ def create_document_routes(
         response_model=ClearCacheResponse,
         dependencies=[Depends(combined_auth)],
     )
-    async def clear_cache(request: ClearCacheRequest, rag=Depends(resolve_rag)):
+    async def clear_cache(request: ClearCacheRequest, http_request: Request = None):
         """
         Clear all cache data from the LLM response cache storage.
 
@@ -3771,6 +3772,7 @@ def create_document_routes(
         Raises:
             HTTPException: If an error occurs during cache clearing (500).
         """
+        rag = await resolve_rag(http_request)
         try:
             # Call the aclear_cache method (no modes parameter)
             await rag.aclear_cache()
@@ -3789,7 +3791,7 @@ def create_document_routes(
         response_model=DeletionResult,
         dependencies=[Depends(combined_auth)],
     )
-    async def delete_entity(request: DeleteEntityRequest, rag=Depends(resolve_rag)):
+    async def delete_entity(request: DeleteEntityRequest, http_request: Request = None):
         """
         Delete an entity and all its relationships from the knowledge graph.
 
@@ -3802,6 +3804,7 @@ def create_document_routes(
         Raises:
             HTTPException: If the entity is not found (404) or an error occurs (500).
         """
+        rag = await resolve_rag(http_request)
         try:
             result = await rag.adelete_by_entity(entity_name=request.entity_name)
             if result.status == "not_found":
@@ -3824,7 +3827,7 @@ def create_document_routes(
         response_model=DeletionResult,
         dependencies=[Depends(combined_auth)],
     )
-    async def delete_relation(request: DeleteRelationRequest, rag=Depends(resolve_rag)):
+    async def delete_relation(request: DeleteRelationRequest, http_request: Request = None):
         """
         Delete a relationship between two entities from the knowledge graph.
 
@@ -3837,6 +3840,7 @@ def create_document_routes(
         Raises:
             HTTPException: If the relation is not found (404) or an error occurs (500).
         """
+        rag = await resolve_rag(http_request)
         try:
             result = await rag.adelete_by_relation(
                 source_entity=request.source_entity,
@@ -3862,9 +3866,7 @@ def create_document_routes(
         response_model=TrackStatusResponse,
         dependencies=[Depends(combined_auth)],
     )
-    async def get_track_status(
-        track_id: str, rag=Depends(resolve_rag)
-    ) -> TrackStatusResponse:
+    async def get_track_status(track_id: str, http_request: Request = None) -> TrackStatusResponse:
         """
         Get the processing status of documents by tracking ID.
 
@@ -3883,6 +3885,7 @@ def create_document_routes(
         Raises:
             HTTPException: If track_id is invalid (400) or an error occurs (500).
         """
+        rag = await resolve_rag(http_request)
         try:
             # Validate track_id
             if not track_id or not track_id.strip():
@@ -3940,7 +3943,7 @@ def create_document_routes(
     )
     async def get_documents_paginated(
         request: DocumentsRequest,
-        rag=Depends(resolve_rag),
+        http_request: Request = None,
     ) -> PaginatedDocsResponse:
         """
         Get documents with pagination support.
@@ -3961,6 +3964,7 @@ def create_document_routes(
         Raises:
             HTTPException: If an error occurs while retrieving documents (500).
         """
+        rag = await resolve_rag(http_request)
         trace_id = uuid4().hex[:8]
         request_start = time.perf_counter()
         status_filter_value = (
@@ -4120,9 +4124,7 @@ def create_document_routes(
         response_model=StatusCountsResponse,
         dependencies=[Depends(combined_auth)],
     )
-    async def get_document_status_counts(
-        rag=Depends(resolve_rag),
-    ) -> StatusCountsResponse:
+    async def get_document_status_counts(http_request: Request = None) -> StatusCountsResponse:
         """
         Get counts of documents by status.
 
@@ -4135,6 +4137,7 @@ def create_document_routes(
         Raises:
             HTTPException: If an error occurs while retrieving status counts (500).
         """
+        rag = await resolve_rag(http_request)
         try:
             status_counts = await rag.doc_status.get_all_status_counts()
             return StatusCountsResponse(status_counts=status_counts)
@@ -4149,9 +4152,7 @@ def create_document_routes(
         response_model=ReprocessResponse,
         dependencies=[Depends(combined_auth)],
     )
-    async def reprocess_failed_documents(
-        background_tasks: BackgroundTasks, rag=Depends(resolve_rag)
-    ):
+    async def reprocess_failed_documents(background_tasks: BackgroundTasks, http_request: Request = None):
         """
         Reprocess failed and pending documents.
 
@@ -4176,6 +4177,7 @@ def create_document_routes(
         Raises:
             HTTPException: If an error occurs while initiating reprocessing (500).
         """
+        rag = await resolve_rag(http_request)
         try:
             # Start the reprocessing in the background
             # Note: Reprocessed documents retain their original track_id from initial upload
@@ -4197,7 +4199,7 @@ def create_document_routes(
         response_model=CancelPipelineResponse,
         dependencies=[Depends(combined_auth)],
     )
-    async def cancel_pipeline(rag=Depends(resolve_rag)):
+    async def cancel_pipeline(http_request: Request = None):
         """
         Request cancellation of the currently running pipeline.
 
@@ -4218,6 +4220,7 @@ def create_document_routes(
         Raises:
             HTTPException: If an error occurs while setting cancellation flag (500).
         """
+        rag = await resolve_rag(http_request)
         try:
             from lightrag.kg.shared_storage import (
                 get_namespace_data,
