@@ -312,6 +312,10 @@ knowledge graph, embeddings, and documents are kept separate.
 - Hybrid token validation — LightRAG JWTs and Keycloak tokens both accepted.
 - SSO logout.
 
+LightRAG does **not** perform OIDC discovery — the realm endpoints below do not
+auto-derive from `OAUTH2_ISSUER`. Set all of them (the defaults point at the
+UNIMAS realm).
+
 ```bash
 OAUTH2_ENABLED=true
 OAUTH2_CLIENT_ID=your-client-id
@@ -319,8 +323,10 @@ OAUTH2_CLIENT_SECRET=your-client-secret
 OAUTH2_ISSUER=https://keycloak.example.com/realms/your-realm
 OAUTH2_AUTHORIZATION_ENDPOINT=https://keycloak.example.com/realms/your-realm/protocol/openid-connect/auth
 OAUTH2_TOKEN_ENDPOINT=https://keycloak.example.com/realms/your-realm/protocol/openid-connect/token
+OAUTH2_USERINFO_ENDPOINT=https://keycloak.example.com/realms/your-realm/protocol/openid-connect/userinfo
 OAUTH2_JWKS_URI=https://keycloak.example.com/realms/your-realm/protocol/openid-connect/certs
 OAUTH2_REDIRECT_URI=http://localhost:9621/oauth2/callback
+OAUTH2_SCOPES=openid profile email
 ```
 
 See [Keycloak SSO Setup](./docs/KEYCLOAK_SSO_SETUP.md) for full configuration.

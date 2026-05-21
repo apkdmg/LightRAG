@@ -144,6 +144,9 @@ ADMIN_ACCOUNTS=admin
 
 # OAuth2 / Keycloak SSO is ENABLED BY DEFAULT — supply real credentials,
 # or set OAUTH2_ENABLED=false to use username/password login only.
+# These two lines assume the default UNIMAS realm. For any other Keycloak,
+# you must also set the OAUTH2_ISSUER / *_ENDPOINT / *_JWKS_URI vars — see
+# the full OAuth2 block in the .env reference below (they do NOT auto-derive).
 OAUTH2_CLIENT_ID=lightrag
 OAUTH2_CLIENT_SECRET=your-keycloak-client-secret
 ```
@@ -484,10 +487,25 @@ ADMIN_ACCOUNTS=admin
 # ============================================================================
 # Set OAUTH2_ENABLED=false to disable SSO and use password/guest login only.
 OAUTH2_ENABLED=true
+
+# Confidential-client credentials — required for the built-in SSO login flow
+# (the /oauth2/authorize -> /oauth2/callback authorization-code exchange).
 OAUTH2_CLIENT_ID=lightrag
 OAUTH2_CLIENT_SECRET=your-keycloak-client-secret
+
+# Realm endpoints. LightRAG does NOT perform OIDC discovery — these are NOT
+# derived from OAUTH2_ISSUER. For a non-UNIMAS Keycloak you MUST override all
+# five values below (swap host + realm consistently); otherwise they keep
+# pointing at the UNIMAS defaults shown here.
 OAUTH2_ISSUER=https://id.unimas.my/realms/UNIMAS
+OAUTH2_AUTHORIZATION_ENDPOINT=https://id.unimas.my/realms/UNIMAS/protocol/openid-connect/auth
+OAUTH2_TOKEN_ENDPOINT=https://id.unimas.my/realms/UNIMAS/protocol/openid-connect/token
+OAUTH2_USERINFO_ENDPOINT=https://id.unimas.my/realms/UNIMAS/protocol/openid-connect/userinfo
+OAUTH2_JWKS_URI=https://id.unimas.my/realms/UNIMAS/protocol/openid-connect/certs
+
+# Must exactly match a "Valid Redirect URI" registered on the Keycloak client.
 OAUTH2_REDIRECT_URI=http://your-host:9621/oauth2/callback
+OAUTH2_SCOPES=openid profile email
 # Full Keycloak configuration: see docs/KEYCLOAK_SSO_SETUP.md
 
 # ============================================================================
