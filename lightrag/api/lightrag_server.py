@@ -1696,8 +1696,23 @@ def create_app(args):
     app.include_router(create_query_routes(rag, api_key, args.top_k))
     app.include_router(create_graph_routes(rag, api_key))
 
-    # Email ingestion routes (native multimodal wired up in Phase 3)
-    app.include_router(create_email_routes(rag, None, api_key))
+    # Email ingestion routes — native inline-image vision via the vlm role.
+    if args.vlm_process_enable:
+        _vlm_func = create_role_llm_func("vlm")
+
+        async def email_vision_func(prompt, image_data=None, **kwargs):
+            """Describe an inline email image via the native vlm role.
+
+            ``image_data`` is a raw base64 string; the binding's image_inputs
+            handling auto-detects the MIME type.
+            """
+            if not image_data:
+                return await _vlm_func(prompt, **kwargs)
+            return await _vlm_func(prompt, image_inputs=[image_data], **kwargs)
+    else:
+        email_vision_func = None
+
+    app.include_router(create_email_routes(rag, email_vision_func, api_key))
     logger.info("Email ingestion routes enabled")
 
     # Admin routes for multi-tenancy management
