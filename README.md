@@ -384,8 +384,11 @@ curl -X POST "http://localhost:9621/documents/email" \
 ```
 
 Multimodal processing (images / tables / equations) is handled by LightRAG's
-**native** pipeline — no external package is required. For installation and
-configuration, see the [Linux Installation Guide](./docs/LINUX_INSTALLATION_GUIDE.md).
+**native** pipeline — no external package is required.
+
+- For installation and configuration: [Linux Installation Guide](./docs/LINUX_INSTALLATION_GUIDE.md)
+- For connecting external apps, services, and tools (auth, multi-tenancy, the
+  REST / OpenAI / Ollama APIs): [Integration Guide](./docs/INTEGRATION_GUIDE.md)
 
 ## Programming with LightRAG Core
 
