@@ -481,6 +481,11 @@ def get_keycloak_client() -> Optional[KeycloakClient]:
     from .config import global_args
 
     if _keycloak_client is None and getattr(global_args, "oauth2_enabled", False):
+        # OAuth2 is enabled but unusable without client credentials — return
+        # None so callers surface a clear "not configured" error instead of
+        # redirecting to Keycloak with an empty client_id.
+        if not global_args.oauth2_client_id or not global_args.oauth2_client_secret:
+            return None
         config = OAuth2Config(
             enabled=global_args.oauth2_enabled,
             client_id=global_args.oauth2_client_id,

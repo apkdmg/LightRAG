@@ -446,6 +446,18 @@ def create_app(args):
         if not os.path.exists(args.ssl_keyfile):
             raise Exception(f"SSL key file not found: {args.ssl_keyfile}")
 
+    # Warn early if OAuth2/SSO is enabled but its client credentials are
+    # missing — the SSO login flow would otherwise fail at runtime.
+    if args.oauth2_enabled and (
+        not args.oauth2_client_id or not args.oauth2_client_secret
+    ):
+        logger.warning(
+            "OAuth2/SSO is enabled (OAUTH2_ENABLED=true) but OAUTH2_CLIENT_ID "
+            "and/or OAUTH2_CLIENT_SECRET is not set — SSO login will be "
+            "unavailable until both are configured in .env. Set "
+            "OAUTH2_ENABLED=false to use username/password (JWT) login only."
+        )
+
     # Check if API key is provided either through env var or args
     api_key = os.getenv("LIGHTRAG_API_KEY") or args.key
 
@@ -1873,7 +1885,10 @@ def create_app(args):
         if not keycloak:
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="OAuth2/SSO is not configured. Set OAUTH2_ENABLED=true in environment.",
+                detail=(
+                    "OAuth2/SSO is not available. Ensure OAUTH2_ENABLED=true "
+                    "and that OAUTH2_CLIENT_ID and OAUTH2_CLIENT_SECRET are set."
+                ),
             )
 
         auth_url, state = keycloak.get_authorization_url()
