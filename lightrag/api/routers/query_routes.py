@@ -4,7 +4,7 @@ This module contains all query-related routes for the LightRAG API.
 
 import json
 from typing import Any, Dict, List, Literal, Optional
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from lightrag.base import QueryParam
 from lightrag.api.utils_api import get_combined_auth_dependency
 from lightrag.utils import logger
@@ -197,6 +197,22 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
 
     combined_auth = get_combined_auth_dependency(api_key)
 
+    async def resolve_rag(http_request: Request):
+        """Resolve the LightRAG instance for this request.
+
+        Multi-tenant mode: the per-workspace instance from the WorkspaceManager.
+        Single-instance mode: the default ``rag`` passed to this factory.
+        """
+        workspace_manager = getattr(
+            http_request.app.state, "workspace_manager", None
+        )
+        if workspace_manager is None:
+            return rag
+        from ..dependencies import resolve_workspace_from_request
+
+        workspace = await resolve_workspace_from_request(http_request)
+        return await workspace_manager.get_instance(workspace)
+
     @router.post(
         "/query",
         response_model=QueryResponse,
@@ -326,7 +342,7 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
             },
         },
     )
-    async def query_text(request: QueryRequest):
+    async def query_text(request: QueryRequest, rag=Depends(resolve_rag)):
         """
         Comprehensive RAG query endpoint with non-streaming response. Parameter "stream" is ignored.
 
@@ -536,7 +552,7 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
             },
         },
     )
-    async def query_text_stream(request: QueryRequest):
+    async def query_text_stream(request: QueryRequest, rag=Depends(resolve_rag)):
         """
         Advanced RAG query endpoint with flexible streaming response.
 
@@ -1039,7 +1055,7 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
             },
         },
     )
-    async def query_data(request: QueryRequest):
+    async def query_data(request: QueryRequest, rag=Depends(resolve_rag)):
         """
         Advanced data retrieval endpoint for structured RAG analysis.
 
