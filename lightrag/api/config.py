@@ -647,7 +647,8 @@ def parse_args() -> argparse.Namespace:
     args.jwt_algorithm = get_env_value("JWT_ALGORITHM", "HS256")
 
     # OAuth2/Keycloak SSO Configuration
-    args.oauth2_enabled = get_env_value("OAUTH2_ENABLED", False, bool)
+    # Enabled by default — set OAUTH2_ENABLED=false to disable.
+    args.oauth2_enabled = get_env_value("OAUTH2_ENABLED", True, bool)
     args.oauth2_client_id = get_env_value("OAUTH2_CLIENT_ID", "")
     args.oauth2_client_secret = get_env_value("OAUTH2_CLIENT_SECRET", None)
     args.oauth2_issuer = get_env_value(
@@ -721,7 +722,8 @@ def parse_args() -> argparse.Namespace:
     )
 
     # Multi-tenancy configuration
-    args.enable_multi_tenancy = get_env_value("ENABLE_MULTI_TENANCY", False, bool)
+    # Enabled by default — set ENABLE_MULTI_TENANCY=false to disable.
+    args.enable_multi_tenancy = get_env_value("ENABLE_MULTI_TENANCY", True, bool)
     args.max_workspace_instances = get_env_value("MAX_WORKSPACE_INSTANCES", 10000, int)
     args.workspace_ttl_minutes = get_env_value("WORKSPACE_TTL_MINUTES", 60, int)
     args.auto_create_workspace = get_env_value("AUTO_CREATE_WORKSPACE", True, bool)
