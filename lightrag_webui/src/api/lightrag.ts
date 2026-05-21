@@ -300,6 +300,8 @@ export type AuthStatusResponse = {
   api_version?: string
   webui_title?: string
   webui_description?: string
+  oauth2_enabled?: boolean
+  oauth2_provider?: string | null
 }
 
 export type PipelineStatusResponse = {
@@ -320,8 +322,33 @@ export type PipelineStatusResponse = {
 export type LoginResponse = {
   access_token: string
   token_type: string
-  auth_mode?: 'enabled' | 'disabled'  // Authentication mode identifier
+  auth_mode?: 'enabled' | 'disabled' | 'sso'  // Authentication mode identifier
   message?: string                    // Optional message
+  role?: string
+  username?: string
+  core_version?: string
+  api_version?: string
+  webui_title?: string
+  webui_description?: string
+}
+
+// OAuth2 / SSO types
+export type OAuth2ConfigResponse = {
+  oauth2_enabled: boolean
+  oauth2_provider: string | null
+}
+
+export type OAuth2AuthorizeResponse = {
+  authorization_url: string
+  state: string
+}
+
+export type OAuth2CallbackResponse = {
+  access_token: string
+  token_type: string
+  auth_mode: 'sso'
+  role: string
+  username: string
   core_version?: string
   api_version?: string
   webui_title?: string
@@ -336,7 +363,8 @@ const axiosInstance = axios.create({
   baseURL: backendBaseUrl,
   headers: {
     'Content-Type': 'application/json'
-  }
+  },
+  withCredentials: true  // Send cookies (HTTP-only SSO token cookie) with requests
 })
 
 // ========== Token Management ==========
@@ -397,9 +425,11 @@ axiosInstance.interceptors.request.use((config) => {
 
   const apiKey = useSettingsStore.getState().apiKey
   const token = localStorage.getItem('LIGHTRAG-API-TOKEN');
+  const isSSOMode = localStorage.getItem('LIGHTRAG-SSO-MODE') === 'true';
 
-  // Always include token if it exists, regardless of path
-  if (token) {
+  // In SSO mode, rely on the HTTP-only cookie (withCredentials) and do not
+  // send an Authorization header — the stored token is a placeholder.
+  if (token && !isSSOMode) {
     config.headers['Authorization'] = `Bearer ${token}`
   }
   if (apiKey) {
@@ -573,11 +603,13 @@ export const queryTextStream = async (
 ) => {
   const apiKey = useSettingsStore.getState().apiKey;
   const token = localStorage.getItem('LIGHTRAG-API-TOKEN');
+  const isSSOMode = localStorage.getItem('LIGHTRAG-SSO-MODE') === 'true';
   const headers: HeadersInit = {
     'Content-Type': 'application/json',
     'Accept': 'application/x-ndjson',
   };
-  if (token) {
+  // In SSO mode, rely on the HTTP-only cookie instead of the header.
+  if (token && !isSSOMode) {
     headers['Authorization'] = `Bearer ${token}`;
   }
   if (apiKey) {
@@ -589,6 +621,7 @@ export const queryTextStream = async (
       method: 'POST',
       headers: headers,
       body: JSON.stringify(request),
+      credentials: 'include',  // Send cookies (SSO HTTP-only cookie) with the request
     });
 
     if (!response.ok) {
@@ -1232,5 +1265,41 @@ export const getDocumentsPaginatedWithTimeout = (
  */
 export const getDocumentStatusCounts = async (): Promise<StatusCountsResponse> => {
   const response = await axiosInstance.get('/documents/status_counts')
+  return response.data
+}
+
+// ==================== OAuth2 / SSO API ====================
+
+/**
+ * Get OAuth2 configuration status (enabled flag and provider).
+ */
+export const getOAuth2Config = async (): Promise<OAuth2ConfigResponse> => {
+  try {
+    const response = await axiosInstance.get('/oauth2/config')
+    return response.data
+  } catch (error) {
+    console.error('Failed to get OAuth2 config:', error)
+    return { oauth2_enabled: false, oauth2_provider: null }
+  }
+}
+
+/**
+ * Initiate the OAuth2 login flow; returns the provider authorization URL.
+ */
+export const initiateOAuth2Login = async (): Promise<OAuth2AuthorizeResponse> => {
+  const response = await axiosInstance.get('/oauth2/authorize')
+  return response.data
+}
+
+/**
+ * Exchange an OAuth2 authorization code for tokens.
+ */
+export const handleOAuth2Callback = async (
+  code: string,
+  state: string
+): Promise<OAuth2CallbackResponse> => {
+  const response = await axiosInstance.get('/oauth2/callback', {
+    params: { code, state }
+  })
   return response.data
 }
