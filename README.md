@@ -7,35 +7,22 @@
 # 🚀 LightRAG: Simple and Fast Retrieval-Augmented Generation
 
 <div align="center">
-    <a href="https://trendshift.io/repositories/13043" target="_blank"><img src="https://trendshift.io/api/badge/repositories/13043" alt="HKUDS%2FLightRAG | Trendshift" style="width: 250px; height: 55px;" width="250" height="55"/></a>
-</div>
-<p>
-</p>
-<div align="center">
   <div style="width: 100%; height: 2px; margin: 20px 0; background: linear-gradient(90deg, transparent, #00d9ff, transparent);"></div>
 </div>
 
 <div align="center">
   <div style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); border-radius: 15px; padding: 25px; text-align: center;">
     <p>
-      <a href='https://github.com/HKUDS/LightRAG'><img src='https://img.shields.io/badge/🔥Project-Page-00d9ff?style=for-the-badge&logo=github&logoColor=white&labelColor=1a1a2e'></a>
+      <a href='https://github.com/apkdmg/LightRAG'><img src='https://img.shields.io/badge/🔥Project-Page-00d9ff?style=for-the-badge&logo=github&logoColor=white&labelColor=1a1a2e'></a>
       <a href='https://arxiv.org/abs/2410.05779'><img src='https://img.shields.io/badge/📄arXiv-2410.05779-ff6b6b?style=for-the-badge&logo=arxiv&logoColor=white&labelColor=1a1a2e'></a>
-      <a href="https://github.com/HKUDS/LightRAG/stargazers"><img src='https://img.shields.io/github/stars/HKUDS/LightRAG?color=00d9ff&style=for-the-badge&logo=star&logoColor=white&labelColor=1a1a2e' /></a>
+      <a href="https://github.com/apkdmg/LightRAG/stargazers"><img src='https://img.shields.io/github/stars/apkdmg/LightRAG?color=00d9ff&style=for-the-badge&logo=star&logoColor=white&labelColor=1a1a2e' /></a>
     </p>
     <p>
       <img src="https://img.shields.io/badge/🐍Python-3.10-4ecdc4?style=for-the-badge&logo=python&logoColor=white&labelColor=1a1a2e">
-      <a href="https://pypi.org/project/lightrag-hku/"><img src="https://img.shields.io/pypi/v/lightrag-hku.svg?style=for-the-badge&logo=pypi&logoColor=white&labelColor=1a1a2e&color=ff6b6b"></a>
-    </p>
-    <p>
-      <a href="https://discord.gg/yF2MmDJyGJ"><img src="https://img.shields.io/badge/💬Discord-Community-7289da?style=for-the-badge&logo=discord&logoColor=white&labelColor=1a1a2e"></a>
-      <a href="https://github.com/HKUDS/LightRAG/issues/285"><img src="https://img.shields.io/badge/💬WeChat-Group-07c160?style=for-the-badge&logo=wechat&logoColor=white&labelColor=1a1a2e"></a>
     </p>
     <p>
       <a href="README-zh.md"><img src="https://img.shields.io/badge/🇨🇳中文版-1a1a2e?style=for-the-badge"></a>
       <a href="README.md"><img src="https://img.shields.io/badge/🇺🇸English-1a1a2e?style=for-the-badge"></a>
-    </p>
-    <p>
-      <a href="https://pepy.tech/projects/lightrag-hku"><img src="https://static.pepy.tech/personalized-badge/lightrag-hku?period=total&units=INTERNATIONAL_SYSTEM&left_color=BLACK&right_color=GREEN&left_text=downloads"></a>
     </p>
   </div>
 </div>
@@ -85,7 +72,7 @@
 - [2025.08]🎯[New Feature] **Reranker** is now supported, significantly boosting performance for mixed queries (set as default query mode).
 - [2025.08]🎯[New Feature] Added **Document Deletion** with automatic KG regeneration to ensure optimal query performance.
 - [2025.06]🎯[New Release] Our team has released [RAG-Anything](https://github.com/HKUDS/RAG-Anything) — an **All-in-One Multimodal RAG** system for seamless processing of text, images, tables, and equations.
-- [2025.06]🎯[New Feature] LightRAG now supports comprehensive multimodal data handling through [RAG-Anything](https://github.com/HKUDS/RAG-Anything) integration, enabling seamless document parsing and RAG capabilities across diverse formats including PDFs, images, Office documents, tables, and formulas. Please refer to the new [multimodal section](https://github.com/HKUDS/LightRAG/?tab=readme-ov-file#multimodal-document-processing-rag-anything-integration) for details.
+- [2025.06]🎯[New Feature] LightRAG now supports comprehensive multimodal data handling through [RAG-Anything](https://github.com/HKUDS/RAG-Anything) integration, enabling seamless document parsing and RAG capabilities across diverse formats including PDFs, images, Office documents, tables, and formulas. Please refer to the new [multimodal section](#multimodal-document-processing) for details.
 - [2025.03]🎯[New Feature] LightRAG now supports citation functionality, enabling proper source attribution and enhanced document traceability.
 - [2025.02]🎯[New Feature] You can now use MongoDB as an all-in-one storage solution for unified data management.
 - [2025.02]🎯[New Release] Our team has released [VideoRAG](https://github.com/HKUDS/VideoRAG)-a RAG system for understanding extremely long-context videos
@@ -93,7 +80,7 @@
 - [2025.01]🎯You can now use PostgreSQL as an all-in-one storage solution for data management.
 - [2024.11]🎯[New Resource] A comprehensive guide to LightRAG is now available on [LearnOpenCV](https://learnopencv.com/lightrag). — explore in-depth tutorials and best practices. Many thanks to the blog author for this excellent contribution!
 - [2024.11]🎯[New Feature] Introducing the LightRAG WebUI — an interface that allows you to insert, query, and visualize LightRAG knowledge through an intuitive web-based dashboard.
-- [2024.11]🎯[New Feature] You can now [use Neo4J for Storage](https://github.com/HKUDS/LightRAG?tab=readme-ov-file#using-neo4j-for-storage)-enabling graph database support.
+- [2024.11]🎯[New Feature] You can now use Neo4J for Storage-enabling graph database support.
 - [2024.10]🎯[New Feature] We've added a link to a [LightRAG Introduction Video](https://youtu.be/oageL-1I0GE). — a walkthrough of LightRAG's capabilities. Thanks to the author for this excellent contribution!
 - [2024.10]🎯[New Channel] We have created a [Discord channel](https://discord.gg/yF2MmDJyGJ)!💬 Welcome to join our community for sharing, discussions, and collaboration! 🎉🎉
 
@@ -121,36 +108,12 @@
 
 The LightRAG Server is designed to provide Web UI and API support. The Web UI facilitates document indexing, knowledge graph exploration, and a simple RAG query interface. LightRAG Server also provide an Ollama compatible interfaces, aiming to emulate LightRAG as an Ollama chat model. This allows AI chat bot, such as Open WebUI, to access LightRAG easily.
 
-* Install from PyPI
-
-```bash
-### Install LightRAG Server as tool using uv (recommended)
-uv tool install "lightrag-hku[api]"
-
-### Or using pip
-# python -m venv .venv
-# source .venv/bin/activate  # Windows: .venv\Scripts\activate
-# pip install "lightrag-hku[api]"
-
-### Build front-end artifacts
-cd lightrag_webui
-bun install --frozen-lockfile
-bun run build
-cd ..
-
-# Setup env file
-# Obtain the env.example file by downloading it from the GitHub repository root
-# or by copying it from a local source checkout.
-cp env.example .env  # Update the .env with your LLM and embedding configurations
-# Launch the server
-lightrag-server
-```
-
 * Installation from Source
 
 ```bash
-git clone https://github.com/HKUDS/LightRAG.git
+git clone https://github.com/apkdmg/LightRAG.git
 cd LightRAG
+git checkout enterprise-1.5.0   # the branch carrying the enterprise features
 
 # Bootstrap the development environment (recommended)
 make dev
@@ -187,16 +150,13 @@ lightrag-server
 * Launching the LightRAG Server with Docker Compose
 
 ```bash
-git clone https://github.com/HKUDS/LightRAG.git
+git clone https://github.com/apkdmg/LightRAG.git
 cd LightRAG
+git checkout enterprise-1.5.0   # the branch carrying the enterprise features
 cp env.example .env  # Update the .env with your LLM and embedding configurations
 # modify LLM and Embedding settings in .env
 docker compose up
 ```
-
-> Historical versions of LightRAG docker images can be found here: [LightRAG Docker Images]( https://github.com/HKUDS/LightRAG/pkgs/container/lightrag)
->
-> Official GHCR images published by GitHub Actions are signed with Sigstore Cosign using GitHub OIDC. See [docs/DockerDeployment.md](./docs/DockerDeployment.md#verify-official-ghcr-images-with-cosign) for verification commands.
 
 ### Create .env File With Setup Tool
 
@@ -229,13 +189,6 @@ source .venv/bin/activate  # Activate the virtual environment (Linux/macOS)
 # Or on Windows: .venv\Scripts\activate
 
 # Or: pip install -e .
-```
-
-* Install from PyPI
-
-```bash
-uv pip install lightrag-hku
-# Or: pip install lightrag-hku
 ```
 
 ## Quick Start
@@ -292,6 +245,27 @@ This build of LightRAG Server adds enterprise-grade features for multi-user
 deployments, secure authentication, and integration with existing tools.
 **Multi-tenancy and OAuth2/Keycloak SSO are enabled by default** — set
 `ENABLE_MULTI_TENANCY=false` / `OAUTH2_ENABLED=false` to opt out.
+
+### How This Fork Differs from Upstream
+
+This is a fork of [HKUDS/LightRAG](https://github.com/HKUDS/LightRAG), tracking
+upstream release **1.5.0**. The **core RAG library is unmodified** — graph
+construction, retrieval, prompts, storage backends, and the native multimodal
+pipeline all behave exactly as upstream. The enterprise capabilities are added
+as **additive API-layer modules** (extra routers, an authentication layer, and a
+per-workspace instance manager), so future upstream releases keep merging cleanly.
+
+| Capability | Upstream LightRAG 1.5.0 | This fork |
+|---|---|---|
+| Workspaces | Single shared workspace | Per-user isolated workspaces (multi-tenancy) |
+| Authentication | Username/password → JWT | OAuth2 / Keycloak SSO + JWT, with hybrid token validation |
+| API keys | One shared `LIGHTRAG_API_KEY` | Shared key **plus** per-user keys (`/api-keys`) |
+| Chat API | Ollama-compatible (`/api/chat`) | Ollama-compatible **plus** OpenAI-compatible (`/v1/chat/completions`) |
+| Email ingestion | — | `.eml` ingestion endpoint (`/documents/email`) |
+| Service accounts | — | Client-Credentials flow + on-behalf-of (OBO) allowlist |
+| Core RAG & multimodal pipeline | Baseline | Identical — inherited from upstream unchanged |
+
+The sections below describe each fork-exclusive capability in detail.
 
 ### Multi-Tenancy
 
@@ -482,7 +456,7 @@ LightRAG consistently outperforms NaiveRAG, RQ-RAG, HyDE, and GraphRAG across ag
 
 ## ⭐ Star History
 
-[![Star History Chart](https://api.star-history.com/svg?repos=HKUDS/LightRAG&type=Date)](https://star-history.com/#HKUDS/LightRAG&Date)
+[![Star History Chart](https://api.star-history.com/svg?repos=apkdmg/LightRAG&type=Date)](https://star-history.com/#apkdmg/LightRAG&Date)
 
 ## 🤝 Contribution
 
@@ -498,8 +472,8 @@ LightRAG consistently outperforms NaiveRAG, RQ-RAG, HyDE, and GraphRAG across ag
 </div>
 
 <div align="center">
-  <a href="https://github.com/HKUDS/LightRAG/graphs/contributors">
-    <img src="https://contrib.rocks/image?repo=HKUDS/LightRAG" style="border-radius: 15px; box-shadow: 0 0 20px rgba(0, 217, 255, 0.3);" />
+  <a href="https://github.com/apkdmg/LightRAG/graphs/contributors">
+    <img src="https://contrib.rocks/image?repo=apkdmg/LightRAG" style="border-radius: 15px; box-shadow: 0 0 20px rgba(0, 217, 255, 0.3);" />
   </a>
 </div>
 
@@ -524,13 +498,13 @@ primaryClass={cs.IR}
     <img src="https://user-images.githubusercontent.com/74038190/212284100-561aa473-3905-4a80-b561-0d28506553ee.gif" width="500">
   </div>
   <div style="margin-top: 20px;">
-    <a href="https://github.com/HKUDS/LightRAG" style="text-decoration: none;">
+    <a href="https://github.com/apkdmg/LightRAG" style="text-decoration: none;">
       <img src="https://img.shields.io/badge/⭐%20Star%20us%20on%20GitHub-1a1a2e?style=for-the-badge&logo=github&logoColor=white">
     </a>
-    <a href="https://github.com/HKUDS/LightRAG/issues" style="text-decoration: none;">
+    <a href="https://github.com/apkdmg/LightRAG/issues" style="text-decoration: none;">
       <img src="https://img.shields.io/badge/🐛%20Report%20Issues-ff6b6b?style=for-the-badge&logo=github&logoColor=white">
     </a>
-    <a href="https://github.com/HKUDS/LightRAG/discussions" style="text-decoration: none;">
+    <a href="https://github.com/apkdmg/LightRAG/discussions" style="text-decoration: none;">
       <img src="https://img.shields.io/badge/💬%20Discussions-4ecdc4?style=for-the-badge&logo=github&logoColor=white">
     </a>
   </div>
