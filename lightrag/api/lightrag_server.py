@@ -1577,93 +1577,117 @@ def create_app(args):
         "language": args.summary_language,
     }
 
-    role_llm_configs = {
-        spec.name: {
-            **resolve_role_llm_settings(spec.name),
-            "func": create_role_llm_func(spec.name),
-            "kwargs": create_role_llm_model_kwargs(spec.name),
+    def build_rag(workspace: str) -> LightRAG:
+        """Construct an (un-initialized) LightRAG instance for a workspace.
+
+        Used for the single-instance server ``rag`` and, in multi-tenant mode,
+        by the WorkspaceManager to build per-workspace instances on demand.
+        The caller is responsible for ``await rag.initialize_storages()``.
+        """
+        role_llm_configs = {
+            spec.name: {
+                **resolve_role_llm_settings(spec.name),
+                "func": create_role_llm_func(spec.name),
+                "kwargs": create_role_llm_model_kwargs(spec.name),
+            }
+            for spec in ROLES
         }
-        for spec in ROLES
-    }
 
-    # Initialize RAG with unified configuration
-    try:
-        rag = LightRAG(
-            working_dir=args.working_dir,
-            workspace=args.workspace,
-            llm_model_func=create_llm_model_func(args.llm_binding),
-            llm_model_name=args.llm_model,
-            llm_model_max_async=args.max_async,
-            summary_max_tokens=args.summary_max_tokens,
-            summary_context_size=args.summary_context_size,
-            chunk_token_size=int(args.chunk_size),
-            chunk_overlap_token_size=int(args.chunk_overlap_size),
-            llm_model_kwargs=create_llm_model_kwargs(
-                args.llm_binding, args, llm_timeout
-            ),
-            embedding_func=embedding_func,
-            default_llm_timeout=llm_timeout,
-            default_embedding_timeout=embedding_timeout,
-            kv_storage=args.kv_storage,
-            graph_storage=args.graph_storage,
-            vector_storage=args.vector_storage,
-            doc_status_storage=args.doc_status_storage,
-            vector_db_storage_cls_kwargs={
-                "cosine_better_than_threshold": args.cosine_threshold
-            },
-            enable_llm_cache_for_entity_extract=args.enable_llm_cache_for_extract,
-            enable_llm_cache=args.enable_llm_cache,
-            vlm_process_enable=args.vlm_process_enable,
-            rerank_model_func=rerank_model_func,
-            rerank_model_max_async=args.rerank_max_async,
-            default_rerank_timeout=args.rerank_timeout,
-            max_parallel_insert=args.max_parallel_insert,
-            max_graph_nodes=args.max_graph_nodes,
-            addon_params=addon_params,
-            ollama_server_infos=ollama_server_infos,
-            role_llm_configs={
-                spec.name: RoleLLMConfig(
-                    func=role_llm_configs[spec.name]["func"],
-                    kwargs=role_llm_configs[spec.name]["kwargs"],
-                    max_async=role_llm_configs[spec.name]["max_async"],
-                    timeout=role_llm_configs[spec.name]["timeout"],
-                    metadata={
-                        "base_binding": args.llm_binding,
-                        "binding": role_llm_configs[spec.name]["binding"],
-                        "model": role_llm_configs[spec.name]["model"],
-                        "host": role_llm_configs[spec.name]["host"],
-                        "api_key": role_llm_configs[spec.name]["api_key"],
-                        "provider_options": role_llm_configs[spec.name][
-                            "provider_options"
-                        ],
-                        "bedrock_aws_options": role_llm_configs[spec.name][
-                            "bedrock_aws_options"
-                        ],
-                        "is_cross_provider": role_llm_configs[spec.name][
-                            "is_cross_provider"
-                        ],
-                    },
-                )
-                for spec in ROLES
-            },
+        # Initialize RAG with unified configuration
+        try:
+            rag = LightRAG(
+                working_dir=args.working_dir,
+                workspace=workspace,
+                llm_model_func=create_llm_model_func(args.llm_binding),
+                llm_model_name=args.llm_model,
+                llm_model_max_async=args.max_async,
+                summary_max_tokens=args.summary_max_tokens,
+                summary_context_size=args.summary_context_size,
+                chunk_token_size=int(args.chunk_size),
+                chunk_overlap_token_size=int(args.chunk_overlap_size),
+                llm_model_kwargs=create_llm_model_kwargs(
+                    args.llm_binding, args, llm_timeout
+                ),
+                embedding_func=embedding_func,
+                default_llm_timeout=llm_timeout,
+                default_embedding_timeout=embedding_timeout,
+                kv_storage=args.kv_storage,
+                graph_storage=args.graph_storage,
+                vector_storage=args.vector_storage,
+                doc_status_storage=args.doc_status_storage,
+                vector_db_storage_cls_kwargs={
+                    "cosine_better_than_threshold": args.cosine_threshold
+                },
+                enable_llm_cache_for_entity_extract=args.enable_llm_cache_for_extract,
+                enable_llm_cache=args.enable_llm_cache,
+                vlm_process_enable=args.vlm_process_enable,
+                rerank_model_func=rerank_model_func,
+                rerank_model_max_async=args.rerank_max_async,
+                default_rerank_timeout=args.rerank_timeout,
+                max_parallel_insert=args.max_parallel_insert,
+                max_graph_nodes=args.max_graph_nodes,
+                addon_params=addon_params,
+                ollama_server_infos=ollama_server_infos,
+                role_llm_configs={
+                    spec.name: RoleLLMConfig(
+                        func=role_llm_configs[spec.name]["func"],
+                        kwargs=role_llm_configs[spec.name]["kwargs"],
+                        max_async=role_llm_configs[spec.name]["max_async"],
+                        timeout=role_llm_configs[spec.name]["timeout"],
+                        metadata={
+                            "base_binding": args.llm_binding,
+                            "binding": role_llm_configs[spec.name]["binding"],
+                            "model": role_llm_configs[spec.name]["model"],
+                            "host": role_llm_configs[spec.name]["host"],
+                            "api_key": role_llm_configs[spec.name]["api_key"],
+                            "provider_options": role_llm_configs[spec.name][
+                                "provider_options"
+                            ],
+                            "bedrock_aws_options": role_llm_configs[spec.name][
+                                "bedrock_aws_options"
+                            ],
+                            "is_cross_provider": role_llm_configs[spec.name][
+                                "is_cross_provider"
+                            ],
+                        },
+                    )
+                    for spec in ROLES
+                },
+            )
+        except Exception as e:
+            logger.error(f"Failed to initialize LightRAG: {e}")
+            raise
+
+        _log_role_provider_options(rag)
+
+        rag.register_role_llm_builder(
+            lambda role, meta: (
+                create_role_llm_func(role, meta),
+                create_role_llm_model_kwargs(role, meta),
+            )
         )
-    except Exception as e:
-        logger.error(f"Failed to initialize LightRAG: {e}")
-        raise
+        return rag
 
-    _log_role_provider_options(rag)
+    # Single-instance RAG. In multi-tenant mode the WorkspaceManager builds
+    # per-workspace instances lazily via the same `build_rag` factory.
+    rag = build_rag(args.workspace)
 
-    rag.register_role_llm_builder(
-        lambda role, meta: (
-            create_role_llm_func(role, meta),
-            create_role_llm_model_kwargs(role, meta),
+    # Multi-tenancy: wire the factory-based WorkspaceManager when enabled.
+    if args.enable_multi_tenancy:
+        from lightrag.api.workspace_manager import WorkspaceManager
+
+        app.state.workspace_manager = WorkspaceManager(
+            instance_factory=build_rag,
+            max_instances=args.max_workspace_instances,
+            ttl_minutes=args.workspace_ttl_minutes,
         )
-    )
-
-    # Multi-tenancy: the WorkspaceManager is initialised in Phase 3, once
-    # workspace_manager.py is reworked for native multimodal. Until then the
-    # server runs in single-instance mode and routers fall back to `rag`.
-    app.state.workspace_manager = None
+        logger.info(
+            "Multi-tenancy enabled: WorkspaceManager active "
+            f"(max_instances={args.max_workspace_instances}, "
+            f"ttl_minutes={args.workspace_ttl_minutes})"
+        )
+    else:
+        app.state.workspace_manager = None
 
     # Add routes
     # root_path is set on the app for reverse proxy support;
