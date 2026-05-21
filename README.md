@@ -50,7 +50,10 @@
 </div>
 
 ---
+
 ## 🎉 News
+
+- [X] [2025.07.05]🎯📢LightRAG Server now supports enterprise features: Multi-tenancy, OAuth2/Keycloak SSO, OpenAI-compatible API, per-user API keys, and email ingestion with RAGAnything integration.
 - [X] [2025.06.16]🎯📢Our team has released [RAG-Anything](https://github.com/HKUDS/RAG-Anything) an All-in-One Multimodal RAG System for seamless text, image, table, and equation processing.
 - [X] [2025.06.05]🎯📢LightRAG now supports comprehensive multimodal data handling through [RAG-Anything](https://github.com/HKUDS/RAG-Anything) integration, enabling seamless document parsing and RAG capabilities across diverse formats including PDFs, images, Office documents, tables, and formulas. Please refer to the new [multimodal section](https://github.com/HKUDS/LightRAG/?tab=readme-ov-file#multimodal-document-processing-rag-anything-integration) for details.
 - [X] [2025.03.18]🎯📢LightRAG now supports citation functionality, enabling proper source attribution.
@@ -1519,6 +1522,147 @@ When switching between different embedding models, you must clear the data direc
 ## LightRAG API
 
 The LightRAG Server is designed to provide Web UI and API support.  **For more information about LightRAG Server, please refer to [LightRAG Server](./lightrag/api/README.md).**
+
+## Enterprise Features
+
+LightRAG Server includes enterprise-grade features for multi-user deployments, secure authentication, and seamless integration with existing tools.
+
+### Multi-Tenancy Support
+
+LightRAG Server supports multi-tenancy, allowing multiple users to access the same server with isolated workspaces. Each user's data (knowledge graphs, embeddings, documents) is completely isolated.
+
+**How it works:**
+
+- Workspace IDs are automatically derived from user identity (username or email)
+- Example: `user@example.com` → workspace `user_example_com`
+- WorkspaceManager uses LRU caching to efficiently manage multiple RAG instances
+- Stateless components (embedding, LLM, tokenizer) are shared across all workspaces for efficiency
+
+### OAuth2/Keycloak SSO Authentication
+
+LightRAG Server supports OAuth2 Single Sign-On with Keycloak, enabling enterprise authentication.
+
+**Features:**
+
+- Authorization Code flow with PKCE for web users
+- Client Credentials flow for service accounts and automation
+- Hybrid token validation (LightRAG JWT + Keycloak tokens)
+- SSO logout support
+
+**Configuration:**
+
+```bash
+OAUTH2_ENABLED=true
+OAUTH2_CLIENT_ID=your-client-id
+OAUTH2_CLIENT_SECRET=your-client-secret
+OAUTH2_AUTHORIZATION_ENDPOINT=https://keycloak.example.com/realms/your-realm/protocol/openid-connect/auth
+OAUTH2_TOKEN_ENDPOINT=https://keycloak.example.com/realms/your-realm/protocol/openid-connect/token
+OAUTH2_JWKS_URI=https://keycloak.example.com/realms/your-realm/protocol/openid-connect/certs
+OAUTH2_ISSUER=https://keycloak.example.com/realms/your-realm
+OAUTH2_REDIRECT_URI=http://localhost:9621/oauth2/callback
+```
+
+### OpenAI-Compatible API
+
+LightRAG Server provides OpenAI-compatible API endpoints, allowing integration with tools that support the OpenAI API format.
+
+**Endpoints:**
+
+- `GET /v1/models` - List available models
+- `POST /v1/chat/completions` - Chat completion (streaming and non-streaming)
+
+**Available Models:**
+
+- `lightrag` (default, uses mix mode)
+- `lightrag-local`, `lightrag-global`, `lightrag-hybrid`, `lightrag-naive`, `lightrag-mix`
+
+**Example Usage:**
+
+```bash
+# Query using OpenAI-compatible endpoint
+curl -X POST "http://localhost:9621/v1/chat/completions" \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer YOUR_TOKEN" \
+  -d '{
+    "model": "lightrag",
+    "messages": [{"role": "user", "content": "What is LightRAG?"}],
+    "stream": false
+  }'
+```
+
+**Query Mode Selection:**
+
+1. Message prefix: `/local What is X?` → uses local mode
+2. Model name: `lightrag-global` → uses global mode
+3. Default: mix mode
+
+### Per-User API Keys
+
+Users can create personal API keys for programmatic access without managing OAuth tokens.
+
+**Key Format:** `sk-lightrag-{workspace_hash}-{random_32_chars}`
+
+**Features:**
+
+- Keys are bound to the user's workspace
+- Optional expiration (in days)
+- Last-used tracking
+- Keys are hashed before storage (secure)
+
+**API Endpoints:**
+
+- `POST /api-keys` - Create a new API key
+- `GET /api-keys` - List your API keys (metadata only)
+- `DELETE /api-keys/{key_id}` - Revoke a key
+
+**Example Usage:**
+
+```bash
+# Create an API key
+curl -X POST "http://localhost:9621/api-keys" \
+  -H "Authorization: Bearer YOUR_JWT_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"name": "My API Key", "expires_in_days": 30}'
+
+# Use the API key for queries
+curl -X POST "http://localhost:9621/query" \
+  -H "Authorization: Bearer sk-lightrag-abc12345-..." \
+  -H "Content-Type: application/json" \
+  -d '{"query": "What is LightRAG?", "mode": "hybrid"}'
+```
+
+### Email Ingestion
+
+LightRAG Server supports ingesting emails with attachments, with optional RAGAnything integration for multimodal processing.
+
+**Supported Input Formats:**
+
+- Raw `.eml` files (recommended)
+- Structured JSON with attachments
+
+**Features:**
+
+- Extracts email headers (From, To, CC, Subject, Date, Message-ID)
+- Processes attachments (PDF, DOCX, PPTX, images, etc.)
+- RAGAnything integration for enhanced multimodal processing
+- Background processing with track ID for status monitoring
+- Bundle-ID linking for attachment relationships
+
+**Example Usage:**
+
+```bash
+# Ingest an .eml file
+curl -X POST "http://localhost:9621/documents/email" \
+  -H "Authorization: Bearer YOUR_TOKEN" \
+  -F "email_file=@/path/to/email.eml"
+
+# Ingest with structured JSON
+curl -X POST "http://localhost:9621/documents/email" \
+  -H "Authorization: Bearer YOUR_TOKEN" \
+  -F 'metadata={"from":"sender@example.com","to":["recipient@example.com"],"subject":"Meeting Notes"}' \
+  -F "body_text=Email body content here" \
+  -F "attachments=@/path/to/attachment.pdf"
+```
 
 ## Graph Visualization
 
