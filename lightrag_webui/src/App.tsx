@@ -117,6 +117,7 @@ function App() {
           useAuthStore.getState().login(
             status.access_token, // Use the new token
             true, // Guest mode
+            false, // Not SSO
             status.core_version,
             status.api_version,
             status.webui_title || null,
@@ -128,6 +129,7 @@ function App() {
           useAuthStore.getState().login(
             token,
             isGuestMode,
+            false, // Not SSO
             status.core_version,
             status.api_version,
             status.webui_title || null,

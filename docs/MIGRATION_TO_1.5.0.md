@@ -80,10 +80,14 @@ routers. Email ingestion uses a native VLM vision function; document uploads use
 raganything wrapper removed. `lightrag/api/` compiles clean.
 
 ### Phase 4 — WebUI
-Rebuild with Bun (`bun run build`) — do not port built assets. Re-apply source changes
-(`App.tsx`, `AppRouter.tsx`, `LoginPage.tsx`, `api/lightrag.ts`, `stores/state.ts`,
-`OAuth2Callback.tsx`). Drop `SchemeManager/*`, `SchemeContext.tsx`. Delete stray
-`package-lock.json` (Bun-only project).
+
+**Phase 4 status: COMPLETE.** OAuth2/SSO source changes re-applied to `AppRouter.tsx`,
+`stores/state.ts`, `features/LoginPage.tsx`, `api/lightrag.ts`, `App.tsx` (the two
+`login()` calls needed the new `isSSO` arg), and the 5 locale files; `OAuth2Callback.tsx`
+came from Phase 1. `bun run build` succeeds, `tsc -b --noEmit` is clean, `eslint` is
+clean. `SchemeManager`/`SchemeContext` were hzywhite's (never staged); `vite.config.ts`
+dev-proxy tweak skipped; no stray `package-lock.json`. Note: `lightrag/api/webui/` is
+gitignored in 1.5.0 — built assets are generated at package time, not committed.
 
 ### Phase 5 — Tests & CI
 Reconcile `tests/conftest.py` with 1.5.0; port `tests/{api,unit,integration}/`; reconcile
