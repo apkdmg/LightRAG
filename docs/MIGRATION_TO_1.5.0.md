@@ -35,19 +35,27 @@ compile until later phases wire them up and remove `raganything` references.
 - `docs/{KEYCLOAK_SSO_SETUP,OAuth2-SSO-Authentication,LINUX_INSTALLATION_GUIDE,Hybrid-Token-Authentication-Implementation-Plan}.md`
 - `lightrag_webui/src/features/OAuth2Callback.tsx`
 
-### Phase 2 — Re-port modified API/core files
+### Phase 2 — Re-port modified API files
+
+**Verified:** `git diff 9bc5f157 RAGAnything` shows the 57 enterprise commits touched the
+**API layer only**. `lightrag.py`, `base.py`, `operate.py`, `prompt.py` have **zero**
+enterprise changes — the core-library edits seen in cruder `main...RAGAnything` analysis
+belong to the dropped hzywhite / PR-#2042 commits. 1.5.0's core library is used unchanged.
+
 Base = 1.5.0; re-apply enterprise hooks. `auth.py` is security-critical — hand-port.
 
-- `lightrag/api/routers/__init__.py` — export new routers
-- `lightrag/api/lightrag_server.py` — register routers, OAuth2 middleware, auth deps; drop raganything init
-- `lightrag/api/auth.py` — hybrid token validation, cookie-token, OBO
-- `lightrag/api/config.py` — OAuth2/multitenancy/OpenAI config; `RAGANYTHING_*` → `VLM_LLM_*`
-- `lightrag/api/utils_api.py` — auth helpers
-- `lightrag/api/routers/{document,query,graph,ollama}_routes.py` — workspace scoping; drop raganything branching
-- `lightrag/lightrag.py` — `move_file_to_enqueue`/`input_dir` if still wanted; drop `multimodal_content`/`scheme_name`
-- `lightrag/base.py` — drop `multimodal_*` (native has them)
-- `lightrag/operate.py`, `prompt.py` — re-assess; likely already covered upstream
-- `env.example`, `pyproject.toml`
+- `lightrag/api/config.py` — DONE: enterprise auth / OAuth2 / multi-tenancy / OBO config
+- `lightrag/api/auth.py` — `workspace_id` in the JWT, `sanitize_workspace_id`,
+  `_is_admin_user`, `validate_any_token` hybrid validator (LightRAG JWT + Keycloak)
+- `lightrag/api/utils_api.py` — per-user API key + cookie-token + hybrid auth (43 lines)
+- `lightrag/api/lightrag_server.py` — register the enterprise routers, OAuth2 endpoints,
+  WorkspaceManager init; drop raganything init (use 1.5.0's native `vlm` role)
+- `lightrag/api/routers/document_routes.py` — workspace scoping; drop raganything
+  branching and the scheme feature
+- `lightrag/api/routers/{query,graph,ollama}_routes.py` — workspace scoping; drop the
+  raganything `aquery` wrappers
+- `routers/__init__.py` — no change (factories imported directly in `lightrag_server.py`)
+- `env.example`, `pyproject.toml` — enterprise vars; `RAGANYTHING_*` dropped
 
 ### Phase 3 — Native multimodal, drop raganything
 - Remove all `raganything` imports / dependency
