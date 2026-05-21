@@ -133,10 +133,38 @@ def get_combined_auth_dependency(api_key: Optional[str] = None):
             ):
                 return  # Whitelist path, allow access
 
-        # 2. Validate token first if provided in the request (Ensure 401 error if token is invalid)
+        # 2. Check for a per-user API key (sk-lightrag-...) FIRST.
+        # These keys have the workspace embedded, so no X-Target-Workspace
+        # header is needed. Must be checked before JWT validation since
+        # sk-lightrag- keys are not JWTs.
+        auth_header = request.headers.get("Authorization", "")
+        if auth_header.startswith("Bearer sk-lightrag-"):
+            from .routers.apikey_routes import validate_user_api_key
+
+            user_api_key = auth_header[7:]  # Remove "Bearer " prefix
+            user_info = validate_user_api_key(user_api_key)
+            if user_info:
+                request.state.api_key_user = user_info
+                return  # Per-user API key validation successful
+            # Invalid per-user API key
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid API key",
+            )
+
+        # 3. Fall back to a token in the cookie if absent from the
+        # Authorization header — supports SSO cookie-based authentication.
+        if not token:
+            token = request.cookies.get("lightrag_token")
+
+        # 4. Validate JWT token first if provided (ensures 401 if invalid)
         if token:
             try:
-                token_info = auth_handler.validate_token(token)
+                # Hybrid validation: supports both LightRAG JWT and
+                # Keycloak (user / service-account) tokens.
+                from .auth import validate_any_token
+
+                token_info = validate_any_token(token)
 
                 # ========== Token Auto-Renewal Logic ==========
                 from lightrag.api.config import global_args
@@ -229,17 +257,25 @@ def get_combined_auth_dependency(api_key: Optional[str] = None):
                     raise
                 # For other exceptions, continue processing
 
-        # 3. Acept all request if no API protection needed
+        # 5. Accept all requests if no API protection is needed
         if not auth_configured and not api_key_configured:
             return
 
-        # 4. Validate API key if provided and API-Key authentication is configured
+        # 6. Validate the shared API key (X-API-Key) if configured
         if (
             api_key_configured
             and api_key_header_value
             and api_key_header_value == api_key
         ):
-            return  # API key validation successful
+            # Store service-account user info in request state so downstream
+            # dependencies (get_current_user) can resolve a valid identity.
+            request.state.api_key_user = {
+                "username": "api_key_service_account",
+                "role": "admin",  # shared-key holder may act on behalf of others
+                "workspace_id": "service_account",
+                "metadata": {"auth_mode": "api_key"},
+            }
+            return  # Shared API key validation successful
 
         ### Authentication failed ####
 
