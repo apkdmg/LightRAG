@@ -43,13 +43,7 @@ from pydantic import BaseModel, Field
 
 from lightrag.api.dependencies import resolve_workspace_from_request
 from lightrag.api.utils_api import get_combined_auth_dependency
-from lightrag.api.routers.document_routes import (
-    is_raganything_available,
-    get_default_framework,
-    resolve_scheme,
-    validate_framework_availability,
-    generate_track_id,
-)
+from lightrag.utils import generate_track_id
 
 logger = logging.getLogger("lightrag.api.email")
 
@@ -699,19 +693,9 @@ Content:
 
 
 # ============================================================================
-# RAGAnything Email Ingestion Service
+# Email attachment helpers
 # ============================================================================
 
-
-# File extensions supported by RAGAnything's parser
-RAGANYTHING_SUPPORTED_EXTENSIONS = {
-    ".pdf",
-    ".doc", ".docx",
-    ".ppt", ".pptx",
-    ".xls", ".xlsx",
-    ".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".gif", ".webp",
-    ".txt", ".md",
-}
 
 # Magic bytes signatures for common image formats
 IMAGE_MAGIC_BYTES = {
@@ -804,430 +788,6 @@ def get_extension_from_content_type(content_type: str) -> str:
     return ""
 
 
-def is_raganything_parseable(content_type: str, filename: str) -> bool:
-    """
-    Check if this attachment can be parsed by RAGAnything's doc_parser.
-
-    Checks both file extension and content-type to handle inline images
-    that may not have a proper filename with extension.
-
-    Args:
-        content_type: MIME content type (e.g., "image/png").
-        filename: Filename of the attachment.
-
-    Returns:
-        True if the file can be parsed by RAGAnything.
-    """
-    # First check file extension
-    ext = get_file_extension(filename)
-    if ext in RAGANYTHING_SUPPORTED_EXTENSIONS:
-        return True
-
-    # Fallback: check content-type (important for inline images without extensions)
-    ext_from_type = get_extension_from_content_type(content_type)
-    if ext_from_type in RAGANYTHING_SUPPORTED_EXTENSIONS:
-        return True
-
-    return False
-
-
-class EmailIngestionServiceRAGAnything:
-    """
-    Handles email ingestion with full multimodal support using RAGAnything.
-
-    This service uses RAGAnything's doc_parser to parse document attachments
-    (PDF, DOCX, PPTX, images, etc.) and insert_content_list() for ingestion,
-    preserving Bundle-ID associations across all content.
-    """
-
-    def __init__(self, rag_anything_instance: Any, vision_model_func: Optional[Any] = None):
-        """
-        Initialize the RAGAnything email ingestion service.
-
-        Args:
-            rag_anything_instance: The RAGAnything instance with doc_parser.
-            vision_model_func: Optional vision model for detailed image description.
-        """
-        self.rag_anything = rag_anything_instance
-        self.doc_parser = getattr(rag_anything_instance, "doc_parser", None)
-        self.vision_model_func = vision_model_func
-        self._temp_files: List[str] = []  # Track temp files for cleanup
-
-    async def ingest_email(self, parsed_email: ParsedEmail) -> Dict[str, Any]:
-        """
-        Ingest an email with full multimodal processing.
-
-        Strategy:
-        1. Build a content list starting with email metadata + body as text
-        2. For each attachment:
-           - If parseable by RAGAnything (PDF, DOCX, images, etc.):
-             Save to temp file, parse with doc_parser, merge results with context
-           - If simple text: Add as text content
-        3. Call insert_content_list() with the complete content list
-        4. Clean up temp files
-
-        Args:
-            parsed_email: The parsed email with all components.
-
-        Returns:
-            Dict with ingestion results.
-        """
-        bundle_id = self._generate_bundle_id(parsed_email.message_id)
-        content_list: List[Dict[str, Any]] = []
-        page_idx = 0
-
-        try:
-            # 1. Add email header/body as the first text content
-            email_header_content = self._build_email_header_content(parsed_email, bundle_id)
-            content_list.append({
-                "type": "text",
-                "text": email_header_content,
-                "page_idx": page_idx,
-            })
-            page_idx += 1
-
-            # 2. Process inline images
-            inline_processed = 0
-            for idx, inline_img in enumerate(parsed_email.inline_images):
-                try:
-                    items, new_page_idx = await self._process_attachment_multimodal(
-                        inline_img, bundle_id, parsed_email, idx, page_idx, is_inline=True
-                    )
-                    content_list.extend(items)
-                    page_idx = new_page_idx
-                    inline_processed += 1
-                except Exception as e:
-                    logger.warning(f"Failed to process inline image {inline_img.filename}: {e}")
-                    # Add fallback text entry
-                    content_list.append({
-                        "type": "text",
-                        "text": self._build_attachment_fallback_text(
-                            inline_img, bundle_id, parsed_email, idx, str(e), is_inline=True
-                        ),
-                        "page_idx": page_idx,
-                    })
-                    page_idx += 1
-
-            # 3. Process attachments
-            attachments_processed = 0
-            for idx, attachment in enumerate(parsed_email.attachments):
-                try:
-                    items, new_page_idx = await self._process_attachment_multimodal(
-                        attachment, bundle_id, parsed_email, idx, page_idx, is_inline=False
-                    )
-                    content_list.extend(items)
-                    page_idx = new_page_idx
-                    attachments_processed += 1
-                except Exception as e:
-                    logger.warning(f"Failed to process attachment {attachment.filename}: {e}")
-                    # Add fallback text entry
-                    content_list.append({
-                        "type": "text",
-                        "text": self._build_attachment_fallback_text(
-                            attachment, bundle_id, parsed_email, idx, str(e), is_inline=False
-                        ),
-                        "page_idx": page_idx,
-                    })
-                    page_idx += 1
-
-            # 4. Insert all content using RAGAnything's insert_content_list
-            if content_list:
-                await self.rag_anything.insert_content_list(
-                    content_list=content_list,
-                    file_path=f"email_{bundle_id}",
-                    doc_id=bundle_id,
-                )
-
-            return {
-                "bundle_id": bundle_id,
-                "documents_created": len(content_list),
-                "email_subject": parsed_email.subject,
-                "attachments_processed": attachments_processed,
-                "inline_images_processed": inline_processed,
-            }
-
-        finally:
-            # Clean up all temp files
-            self._cleanup_temp_files()
-
-    def _generate_bundle_id(self, message_id: str) -> str:
-        """Generate a unique bundle ID from the message ID."""
-        hash_obj = hashlib.sha256(message_id.encode())
-        short_hash = hash_obj.hexdigest()[:12]
-        return f"email_{short_hash}"
-
-    def _build_email_header_content(self, email: ParsedEmail, bundle_id: str) -> str:
-        """Build the email header and body as text content."""
-        date_str = email.date.isoformat() if email.date else "Unknown"
-
-        all_attachments = email.attachments + email.inline_images
-        if all_attachments:
-            attachment_list = "\n".join([
-                f"  - {att.filename} ({att.content_type}, {'inline' if att.is_inline else 'attachment'})"
-                for att in all_attachments
-            ])
-        else:
-            attachment_list = "  (No attachments)"
-
-        to_list = ", ".join(email.to_addresses) if email.to_addresses else "(none)"
-        cc_list = ", ".join(email.cc_addresses) if email.cc_addresses else "(none)"
-
-        return f"""Email: {email.subject}
-Bundle-ID: {bundle_id}
-Message-ID: {email.message_id}
-Thread-ID: {email.thread_id or 'N/A'}
-
-From: {email.from_address}
-To: {to_list}
-Cc: {cc_list}
-Subject: {email.subject}
-Date: {date_str}
-
-Content:
-{email.body_text.strip() if email.body_text else '(No text content)'}
-
-Attachments ({len(all_attachments)} files):
-{attachment_list}
-"""
-
-    async def _process_attachment_multimodal(
-        self,
-        attachment: ParsedAttachment,
-        bundle_id: str,
-        email: ParsedEmail,
-        index: int,
-        start_page_idx: int,
-        is_inline: bool = False,
-    ) -> Tuple[List[Dict[str, Any]], int]:
-        """
-        Process an attachment using RAGAnything's multimodal capabilities.
-
-        Returns:
-            Tuple of (list of content items, next page_idx)
-        """
-        content_items: List[Dict[str, Any]] = []
-        page_idx = start_page_idx
-
-        content_type = attachment.content_type.lower()
-        ext = get_file_extension(attachment.filename)
-
-        # Build context header that will be prepended to parsed content
-        context_header = self._build_attachment_context_header(
-            attachment, bundle_id, email, index, is_inline
-        )
-
-        # Save attachment to temp file
-        temp_path = self._save_attachment_to_temp(attachment)
-
-        # Handle images directly - docling parser doesn't support image files
-        # Let RAGAnything's multimodal processing handle image analysis
-        if content_type.startswith("image/"):
-            # Add context header as text item
-            content_items.append({
-                "type": "text",
-                "text": context_header,
-                "page_idx": page_idx,
-            })
-            page_idx += 1
-
-            # Add image content item for RAGAnything multimodal processing
-            content_items.append({
-                "type": "image",
-                "img_path": temp_path,
-                "image_caption": [f"Image from email: {email.subject}"],
-                "image_footnote": [f"Content-ID: {attachment.content_id or 'N/A'}"],
-                "page_idx": page_idx,
-            })
-            page_idx += 1
-
-            logger.info(f"Added image {attachment.filename} for multimodal processing")
-            return content_items, page_idx
-
-        # Use doc_parser for documents (PDF, DOCX, etc.) - not images
-        if self.doc_parser and is_raganything_parseable(content_type, attachment.filename):
-            try:
-                # Parse using RAGAnything's doc_parser
-                loop = asyncio.get_event_loop()
-                parsed_content = await loop.run_in_executor(
-                    _parsing_executor,
-                    lambda: self.doc_parser.parse_document(temp_path)
-                )
-
-                if parsed_content:
-                    # Add context header as first item
-                    content_items.append({
-                        "type": "text",
-                        "text": context_header,
-                        "page_idx": page_idx,
-                    })
-                    page_idx += 1
-
-                    # Add all parsed content items with updated page indices
-                    for item in parsed_content:
-                        # Update page_idx relative to our email document
-                        item_copy = item.copy()
-                        item_copy["page_idx"] = page_idx
-
-                        # For images extracted from documents, ensure path is absolute
-                        if item_copy.get("type") == "image" and "img_path" in item_copy:
-                            img_path = item_copy["img_path"]
-                            if not os.path.isabs(img_path):
-                                # Make it absolute relative to temp file location
-                                item_copy["img_path"] = os.path.join(
-                                    os.path.dirname(temp_path), img_path
-                                )
-
-                        content_items.append(item_copy)
-                        page_idx += 1
-
-                    return content_items, page_idx
-
-            except Exception as e:
-                logger.warning(f"RAGAnything parser failed for {attachment.filename}: {e}")
-                # Fall through to text-based handling
-
-        # Fallback: Handle as text content
-        text_content = await self._extract_attachment_as_text(attachment, content_type)
-
-        content_items.append({
-            "type": "text",
-            "text": f"{context_header}\n\n{text_content}",
-            "page_idx": page_idx,
-        })
-        page_idx += 1
-
-        return content_items, page_idx
-
-    def _build_attachment_context_header(
-        self,
-        attachment: ParsedAttachment,
-        bundle_id: str,
-        email: ParsedEmail,
-        index: int,
-        is_inline: bool,
-    ) -> str:
-        """Build context header for an attachment."""
-        date_str = email.date.isoformat() if email.date else "Unknown"
-        attachment_type = "INLINE IMAGE" if is_inline else "ATTACHMENT"
-        total = len(email.inline_images) if is_inline else len(email.attachments)
-
-        return f"""EMAIL {attachment_type}
-Bundle-ID: {bundle_id}
-{attachment_type.title()} {index + 1} of {total}: {attachment.filename}
-Content-Type: {attachment.content_type}
-Size: {len(attachment.content)} bytes
-
-Parent Email: {email.subject}
-From: {email.from_address}
-Date: {date_str}
-
-Content:
-"""
-
-    def _build_attachment_fallback_text(
-        self,
-        attachment: ParsedAttachment,
-        bundle_id: str,
-        email: ParsedEmail,
-        index: int,
-        error_msg: str,
-        is_inline: bool,
-    ) -> str:
-        """Build fallback text when attachment processing fails."""
-        context = self._build_attachment_context_header(
-            attachment, bundle_id, email, index, is_inline
-        )
-        return f"""{context}
-[Processing failed: {error_msg}]
-[File: {attachment.filename} - {attachment.content_type}, {len(attachment.content)} bytes]
-"""
-
-    def _save_attachment_to_temp(self, attachment: ParsedAttachment) -> str:
-        """Save attachment to a temporary file and return the path."""
-        ext = get_file_extension(attachment.filename)
-        # Fallback to content-type if filename has no extension
-        if not ext:
-            ext = get_extension_from_content_type(attachment.content_type) or ".bin"
-        fd, temp_path = tempfile.mkstemp(suffix=ext, prefix="email_attach_")
-
-        try:
-            os.write(fd, attachment.content)
-        finally:
-            os.close(fd)
-
-        self._temp_files.append(temp_path)
-        logger.debug(f"Saved attachment to temp file: {temp_path}")
-        return temp_path
-
-    async def _describe_image_with_vision(self, image: ParsedAttachment) -> str:
-        """
-        Generate a detailed description for an image using vision model.
-
-        This extracts text, names, and other important information from images
-        that would otherwise be missed by general image processing.
-
-        Args:
-            image: The parsed attachment containing the image.
-
-        Returns:
-            Detailed description of the image content.
-        """
-        if self.vision_model_func is None:
-            return f"[Image: {image.filename} - {image.content_type}, {len(image.content)} bytes. No vision model available for detailed description.]"
-
-        try:
-            # Encode image as base64
-            image_b64 = base64.b64encode(image.content).decode("utf-8")
-
-            # Call vision model with detailed extraction prompt
-            prompt = (
-                "Analyze this image thoroughly and extract ALL information:\n"
-                "1. List ALL names of people shown or mentioned in the image\n"
-                "2. Extract ALL text visible in the image (titles, labels, captions)\n"
-                "3. Describe any photos of people (position, role if indicated)\n"
-                "4. Note any dates, numbers, or important data\n"
-                "5. Describe charts, tables, or organizational information\n"
-                "6. Include any contact information or identifiers\n\n"
-                "Be comprehensive - extract every piece of text and name visible."
-            )
-
-            response = await self.vision_model_func(
-                prompt,
-                image_data=image_b64
-            )
-
-            return response if response else f"[Image: {image.filename} - No description generated]"
-
-        except Exception as e:
-            logger.warning(f"Vision model failed for {image.filename}: {e}")
-            return f"[Image: {image.filename} - {image.content_type}, {len(image.content)} bytes. Vision processing failed: {e}]"
-
-    async def _extract_attachment_as_text(
-        self, attachment: ParsedAttachment, content_type: str
-    ) -> str:
-        """Extract text content from an attachment (fallback method)."""
-        # Handle text-based files
-        if content_type in ("text/plain", "text/csv", "text/markdown", "application/json"):
-            try:
-                return attachment.content.decode("utf-8", errors="replace")
-            except Exception:
-                return f"[Text file: {attachment.filename} - Could not decode content]"
-
-        # For other types, return a placeholder
-        return f"[Attachment: {attachment.filename} - {content_type}, {len(attachment.content)} bytes]"
-
-    def _cleanup_temp_files(self) -> None:
-        """Clean up all temporary files created during processing."""
-        for temp_path in self._temp_files:
-            try:
-                if os.path.exists(temp_path):
-                    os.unlink(temp_path)
-                    logger.debug(f"Cleaned up temp file: {temp_path}")
-            except Exception as e:
-                logger.warning(f"Failed to clean up temp file {temp_path}: {e}")
-        self._temp_files.clear()
-
-
 # ============================================================================
 # Helper Functions
 # ============================================================================
@@ -1251,36 +811,19 @@ async def get_lightrag_for_request(request: Request, rag_instance=None):
         return rag_instance
 
 
-async def get_raganything_for_request(request: Request, rag_anything_instance=None):
-    """
-    Get the RAGAnything instance for the request.
-
-    In single-instance mode, returns the passed rag_anything_instance.
-    In multi-tenant mode, resolves the workspace and gets the RAGAnything instance.
-    """
-    workspace_manager = getattr(request.app.state, "workspace_manager", None)
-
-    if workspace_manager is not None:
-        # Multi-tenant mode - get workspace-specific RAGAnything instance
-        workspace = await resolve_workspace_from_request(request)
-        return await workspace_manager.get_raganything_instance(workspace)
-    else:
-        # Single-instance mode - use the provided rag_anything instance
-        return rag_anything_instance
-
-
 # ============================================================================
 # Route Factory
 # ============================================================================
 
 
-def create_email_routes(rag, rag_anything=None, api_key: Optional[str] = None):
+def create_email_routes(rag, vision_model_func=None, api_key: Optional[str] = None):
     """
     Create email ingestion routes.
 
     Args:
         rag: The default LightRAG instance (for single-instance mode).
-        rag_anything: The default RAGAnything instance (for single-instance mode, optional).
+        vision_model_func: Optional native vision function for inline-image
+            description; called as ``vision_model_func(prompt, image_data=<base64>)``.
         api_key: Optional API key for authentication.
 
     Returns:
@@ -1288,7 +831,7 @@ def create_email_routes(rag, rag_anything=None, api_key: Optional[str] = None):
     """
     combined_auth = get_combined_auth_dependency(api_key)
     _default_rag = rag
-    _default_rag_anything = rag_anything
+    _vision_model_func = vision_model_func
 
     @router.post(
         "/email",
@@ -1356,25 +899,9 @@ relationships in the knowledge graph. This enables queries like:
 
 **File size limit:** 100MB for .eml files (streamed to avoid memory issues)
 
----
-
-## Scheme Selection (Unified Parameter)
-
-The `scheme` parameter accepts either:
-
-1. **Numeric scheme ID** (e.g., `scheme=1`): Loads configuration from schemes.json
-   - Used by WebUI for pre-configured processing schemes
-
-2. **Framework name** (e.g., `scheme=lightrag` or `scheme=raganything`):
-   - `lightrag`: Text-only processing (faster, basic image description)
-   - `raganything`: Multimodal processing (enhanced image/attachment handling)
-
-3. **Not specified**: Uses server's default (raganything if configured, else lightrag)
-
-## Backward Compatibility
-
-The `framework` parameter is deprecated but still supported.
-Priority order: `scheme` > `framework`
+Inline images are described by the native vision model (when configured);
+document attachments have their text extracted. All content is inserted into
+the LightRAG knowledge graph under the shared Bundle ID.
         """,
     )
     async def ingest_email(
@@ -1400,17 +927,6 @@ Priority order: `scheme` > `framework`
             default=[],
             description="Inline image files (for structured input mode)",
         ),
-        scheme: Optional[str] = Form(
-            None,
-            description="Processing scheme: either a numeric scheme ID (e.g., '1') "
-            "or a framework name ('lightrag' or 'raganything'). "
-            "If not specified, uses server default (raganything if available, else lightrag).",
-        ),
-        # Backward compatibility alias (deprecated)
-        framework: Optional[str] = Form(
-            None,
-            description="[Deprecated] Alias for 'scheme'. Use 'scheme' parameter instead.",
-        ),
     ):
         """
         Ingest an email with attachments as a related document bundle.
@@ -1419,71 +935,11 @@ Priority order: `scheme` > `framework`
         metadata that preserves their relationships in the knowledge graph.
         """
         try:
-            # Resolve scheme with backward compatibility
-            # Priority: scheme > framework
-            effective_scheme = scheme or framework
-
-            resolved = resolve_scheme(
-                scheme=effective_scheme,
-                request=http_request,
-                rag_anything_instance=_default_rag_anything,
-            )
-
-            # Validate framework availability
-            validate_framework_availability(
-                resolved.framework, http_request, _default_rag_anything
-            )
-
-            if resolved.scheme_name:
-                logger.info(
-                    f"Email ingestion using scheme '{resolved.scheme_name}' with framework: {resolved.framework}"
-                )
-            else:
-                logger.info(f"Email ingestion using framework: {resolved.framework}")
-
-            # Create appropriate ingestion service based on framework
-            use_raganything = resolved.framework == "raganything"
-
-            if use_raganything:
-                # Use RAGAnything for full multimodal processing
-                rag_anything_instance = await get_raganything_for_request(
-                    http_request, _default_rag_anything
-                )
-
-                # Get vision model for detailed image description
-                vision_model_func = None
-                workspace_manager = getattr(http_request.app.state, "workspace_manager", None)
-                if workspace_manager:
-                    shared = getattr(workspace_manager, "_shared", None)
-                    if shared:
-                        vision_model_func = getattr(shared, "vision_model_func", None)
-                elif rag_anything_instance is not None:
-                    # Single-instance mode - get vision_model_func from RAGAnything
-                    vision_model_func = getattr(
-                        rag_anything_instance, "vision_model_func", None
-                    )
-
-                service = EmailIngestionServiceRAGAnything(rag_anything_instance, vision_model_func)
-                logger.info("Using RAGAnything multimodal email ingestion service")
-            else:
-                # Use LightRAG with optional vision model for basic processing
-                rag_instance = await get_lightrag_for_request(http_request, _default_rag)
-
-                # Get vision model if available (for image description)
-                vision_model_func = None
-                workspace_manager = getattr(http_request.app.state, "workspace_manager", None)
-                if workspace_manager:
-                    shared = getattr(workspace_manager, "_shared", None)
-                    if shared:
-                        vision_model_func = getattr(shared, "vision_model_func", None)
-                elif _default_rag_anything is not None:
-                    # Single-instance mode - get vision_model_func from RAGAnything
-                    vision_model_func = getattr(
-                        _default_rag_anything, "vision_model_func", None
-                    )
-
-                service = EmailIngestionService(rag_instance, vision_model_func)
-                logger.info("Using LightRAG email ingestion service")
+            # Resolve the per-workspace LightRAG instance and run the email
+            # ingestion service with native inline-image vision description.
+            rag_instance = await get_lightrag_for_request(http_request, _default_rag)
+            service = EmailIngestionService(rag_instance, _vision_model_func)
+            logger.info("Using LightRAG email ingestion service")
 
             # Parse email based on input mode
             temp_file_path = None
