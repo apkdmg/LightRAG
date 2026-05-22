@@ -14,7 +14,7 @@ import json
 import logging
 import os
 import secrets
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -172,7 +172,10 @@ def verify_api_key_hash(workspace_id: str, api_key: str) -> Optional[Dict]:
             # Check expiration
             expires_at = key_data.get("expires_at")
             if expires_at:
-                if datetime.fromisoformat(expires_at) < datetime.utcnow():
+                expires_dt = datetime.fromisoformat(expires_at)
+                if expires_dt.tzinfo is None:
+                    expires_dt = expires_dt.replace(tzinfo=timezone.utc)
+                if expires_dt < datetime.now(timezone.utc):
                     logger.warning(f"API key expired for workspace {workspace_id}")
                     return None
             return key_data
@@ -187,7 +190,7 @@ def update_key_last_used(workspace_id: str, api_key: str) -> None:
 
     for key_data in data.get("keys", []):
         if key_data.get("key_hash") == key_hash:
-            key_data["last_used_at"] = datetime.utcnow().isoformat()
+            key_data["last_used_at"] = datetime.now(timezone.utc).isoformat()
             _save_api_keys(workspace_id, data)
             return
 
@@ -240,6 +243,15 @@ def validate_user_api_key(api_key: str) -> Optional[Dict]:
     }
 
 
+def _reject_service_accounts(user: UserInfo) -> None:
+    """Per-user API keys are an end-user feature — service accounts may not manage them."""
+    if user.metadata.get("auth_mode", "") in ("api_key", "client_credentials"):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Service accounts cannot manage per-user API keys",
+        )
+
+
 def create_apikey_routes(api_key: Optional[str] = None) -> APIRouter:
     """
     Create API key management routes.
@@ -270,28 +282,19 @@ def create_apikey_routes(api_key: Optional[str] = None) -> APIRouter:
         The API key is only returned once - it cannot be retrieved later.
         Store it securely.
         """
+        _reject_service_accounts(user)
         workspace_id = user.workspace_id
-
-        # Check if user is a service account (they shouldn't create keys)
-        auth_mode = user.metadata.get("auth_mode", "")
-        if auth_mode in ("api_key", "client_credentials"):
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Service accounts cannot create per-user API keys",
-            )
 
         # Generate the key
         new_key = generate_api_key(workspace_id)
         key_id = f"key_{secrets.token_hex(8)}"
-        created_at = datetime.utcnow().isoformat()
+        created_at = datetime.now(timezone.utc).isoformat()
 
         # Calculate expiration if specified
         expires_at = None
         if request.expires_in_days:
-            from datetime import timedelta
-
             expires_at = (
-                datetime.utcnow() + timedelta(days=request.expires_in_days)
+                datetime.now(timezone.utc) + timedelta(days=request.expires_in_days)
             ).isoformat()
 
         # Load existing keys
@@ -338,6 +341,7 @@ def create_apikey_routes(api_key: Optional[str] = None) -> APIRouter:
 
         Note: The actual keys are not returned, only metadata.
         """
+        _reject_service_accounts(user)
         workspace_id = user.workspace_id
         data = _load_api_keys(workspace_id)
 
@@ -369,6 +373,7 @@ def create_apikey_routes(api_key: Optional[str] = None) -> APIRouter:
 
         Once revoked, the key can no longer be used for authentication.
         """
+        _reject_service_accounts(user)
         workspace_id = user.workspace_id
         data = _load_api_keys(workspace_id)
 

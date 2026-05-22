@@ -66,8 +66,6 @@ The Pydantic models live in `lightrag/api/routers/openai_api.py`.
 class ChatCompletionRequest(BaseModel):
     model: str
     messages: List[ChatMessage]
-    temperature: Optional[float] = 0.7
-    max_tokens: Optional[int] = None
     stream: Optional[bool] = False
     top_k: Optional[int] = None
 ```
@@ -76,14 +74,12 @@ class ChatCompletionRequest(BaseModel):
 |---|---|---|---|---|
 | `model` | `string` | — (required) | **Yes** — for mode selection | Selects the query mode (see below). Not an LLM model name; the actual LLM is whatever the server is configured with. |
 | `messages` | `array<ChatMessage>` | — (required) | **Yes** | Must be non-empty. The **last message** is used as the query; all earlier messages become `conversation_history`. An empty array returns **400**. |
-| `temperature` | `float` | `0.7` | **Ignored** | Accepted for OpenAI-client compatibility but **not** passed to the LLM. The server uses its own configured LLM kwargs. |
-| `max_tokens` | `int` | `null` | **Ignored** | Accepted but not forwarded to the LLM. |
 | `stream` | `bool` | `false` | **Yes** | When `true`, the response is Server-Sent Events. |
 | `top_k` | `int` | `null` | **Yes** — LightRAG extension | **Non-standard extension.** Number of top results to retrieve. Falls back to the server's configured `top_k` (default `60`) when omitted. |
 
 `ChatMessage` has two fields, both required: `role` (`"system"` / `"user"` / `"assistant"`) and `content` (`string`).
 
-**Other standard OpenAI fields** (`n`, `stop`, `presence_penalty`, `frequency_penalty`, `logit_bias`, `tools`, `response_format`, `seed`, etc.) are **not declared on the model and are silently ignored** — Pydantic drops unknown keys, so sending them does not error.
+**Standard OpenAI sampling and control fields** (`temperature`, `max_tokens`, `n`, `stop`, `presence_penalty`, `frequency_penalty`, `logit_bias`, `tools`, `response_format`, `seed`, etc.) are **not declared on the model and are silently ignored** — LightRAG applies LLM sampling at the server level, not per request, and Pydantic drops unknown keys, so sending them does not error.
 
 ### Model names and query-mode selection
 

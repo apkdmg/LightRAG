@@ -16,7 +16,7 @@ import json
 import time
 import uuid
 import asyncio
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Optional
 
 from fastapi import APIRouter, HTTPException, Request, Depends
 from fastapi.responses import StreamingResponse
@@ -38,35 +38,19 @@ class ChatMessage(BaseModel):
 
 
 class ChatCompletionRequest(BaseModel):
-    """OpenAI-compatible chat completion request."""
+    """OpenAI-compatible chat completion request.
+
+    Standard OpenAI sampling parameters (``temperature``, ``max_tokens``, …)
+    are intentionally not part of this schema: LightRAG applies LLM sampling
+    settings at the server level, not per request. If a client sends such
+    fields they are simply ignored.
+    """
 
     model: str
     messages: List[ChatMessage]
-    temperature: Optional[float] = 0.7
-    max_tokens: Optional[int] = None
     stream: Optional[bool] = False
-    # LightRAG-specific extensions (optional)
+    # LightRAG-specific extension (optional)
     top_k: Optional[int] = None
-
-
-class ChatChoice(BaseModel):
-    """A single choice in a chat completion response."""
-
-    index: int
-    message: Optional[Dict[str, str]] = None
-    delta: Optional[Dict[str, str]] = None
-    finish_reason: Optional[str] = None
-
-
-class ChatCompletionResponse(BaseModel):
-    """OpenAI-compatible chat completion response."""
-
-    id: str
-    object: str = "chat.completion"
-    created: int
-    model: str
-    choices: List[Dict[str, Any]]
-    usage: Dict[str, int]
 
 
 class ModelInfo(BaseModel):
@@ -157,7 +141,7 @@ class OpenAIAPI:
 
             Returns a list of model IDs that can be used with chat completions.
             The model ID can be used to specify query mode:
-            - lightrag: Default (hybrid mode)
+            - lightrag: Default (mix mode)
             - lightrag-local: Local search mode
             - lightrag-global: Global search mode
             - lightrag-hybrid: Hybrid search mode

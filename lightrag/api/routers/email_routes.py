@@ -92,7 +92,7 @@ class EmailIngestionResponse(BaseModel):
     track_id: str = Field(
         default="",
         description="Track ID for monitoring background processing status. "
-        "Use GET /documents/status/{track_id} to check progress.",
+        "Use GET /documents/track_status/{track_id} to check progress.",
     )
     documents_created: int = Field(
         default=0,
@@ -107,21 +107,6 @@ class EmailIngestionResponse(BaseModel):
         default=0,
         description="Number of inline images processed (0 when processing in background).",
     )
-
-
-class EmailAttachmentInfo(BaseModel):
-    """Information about a processed attachment."""
-
-    filename: str
-    content_type: str
-    size_bytes: int
-    is_inline: bool
-
-
-class EmailIngestionDetailedResponse(EmailIngestionResponse):
-    """Detailed response including attachment info."""
-
-    attachments: List[EmailAttachmentInfo] = Field(default_factory=list)
 
 
 # ============================================================================
@@ -854,7 +839,7 @@ curl -X POST "http://localhost:9621/documents/email" \\
 ```
 
 **How to get .eml files:**
-- **Outlook**: Open email → File → Save As → Select "Outlook Message Format - Unicode (*.msg)" or drag to folder
+- **Outlook**: drag the email from the message list onto a folder or the desktop — this saves a `.eml` file. (Outlook's *File → Save As* produces `.msg`, which is **not** supported — only `.eml` can be ingested.)
 - **Gmail**: Open email → Three dots menu → "Download message" (or "Show original" → "Download Original")
 - **Thunderbird**: Right-click email → Save As → .eml file
 - **Apple Mail**: Drag email to Finder, or File → Save As
