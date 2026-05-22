@@ -146,6 +146,32 @@ make env-base  # 或: cp env.example .env 后手动修改
 lightrag-server
 ```
 
+* 运行预构建的 Docker 镜像（最快）
+
+从 GitHub Container Registry 拉取已发布的多架构镜像（`linux/amd64` + `linux/arm64`）—— 无需构建：
+
+```bash
+# 1. 拉取镜像
+docker pull ghcr.io/apkdmg/lightrag:latest
+
+# 2. 获取配置文件，并填入你的 LLM / Embedding 设置
+curl -fsSL https://raw.githubusercontent.com/apkdmg/LightRAG/main/env.example -o .env
+#    编辑 .env ...
+
+# 3. 创建数据目录
+mkdir -p data/rag_storage data/inputs data/prompts
+
+# 4. 启动服务 —— http://localhost:9621
+docker run -d --name lightrag -p 9621:9621 \
+  -v "$(pwd)/.env:/app/.env" \
+  -v "$(pwd)/data/rag_storage:/app/data/rag_storage" \
+  -v "$(pwd)/data/inputs:/app/data/inputs" \
+  -v "$(pwd)/data/prompts:/app/data/prompts" \
+  ghcr.io/apkdmg/lightrag:latest
+```
+
+如需固定到某个具体版本而非 `latest`，请使用版本标签，例如 `ghcr.io/apkdmg/lightrag:v1.5.0.1`。
+
 * 使用 Docker Compose 启动 LightRAG 服务器
 
 ```bash

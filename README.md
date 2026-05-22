@@ -146,6 +146,32 @@ make env-base  # Or: cp env.example .env and update it manually
 lightrag-server
 ```
 
+* Run the pre-built Docker image (fastest)
+
+Pull the published multi-arch image (`linux/amd64` + `linux/arm64`) from GitHub Container Registry — no build required:
+
+```bash
+# 1. Pull the image
+docker pull ghcr.io/apkdmg/lightrag:latest
+
+# 2. Get a config file and edit it with your LLM / embedding settings
+curl -fsSL https://raw.githubusercontent.com/apkdmg/LightRAG/main/env.example -o .env
+#    edit .env ...
+
+# 3. Create data directories
+mkdir -p data/rag_storage data/inputs data/prompts
+
+# 4. Run the server — http://localhost:9621
+docker run -d --name lightrag -p 9621:9621 \
+  -v "$(pwd)/.env:/app/.env" \
+  -v "$(pwd)/data/rag_storage:/app/data/rag_storage" \
+  -v "$(pwd)/data/inputs:/app/data/inputs" \
+  -v "$(pwd)/data/prompts:/app/data/prompts" \
+  ghcr.io/apkdmg/lightrag:latest
+```
+
+To pin a specific release instead of `latest`, use a version tag, e.g. `ghcr.io/apkdmg/lightrag:v1.5.0.1`.
+
 * Launching the LightRAG Server with Docker Compose
 
 ```bash

@@ -112,7 +112,7 @@ LIGHTRAG_API_KEY=site02-secret
 ```yaml
 services:
   site01:
-    image: ghcr.io/hkuds/lightrag:latest
+    image: ghcr.io/apkdmg/lightrag:latest
     env_file: site01.env
     volumes:
       - ./data/site01:/data/site01
@@ -120,7 +120,7 @@ services:
       - "127.0.0.1:9621:9621"
 
   site02:
-    image: ghcr.io/hkuds/lightrag:latest
+    image: ghcr.io/apkdmg/lightrag:latest
     env_file: site02.env
     volumes:
       - ./data/site02:/data/site02

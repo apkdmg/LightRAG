@@ -3,12 +3,12 @@
 # You can customize your setup using the Setup Wizard; for detailed instructions, please refer to docs/InteractiveSetup.md
 services:
   lightrag:
-    image: ghcr.io/hkuds/lightrag:latest
+    image: ghcr.io/apkdmg/lightrag:latest
     build:
       context: .
       dockerfile: Dockerfile
       tags:
-        - ghcr.io/hkuds/lightrag:latest
+        - ghcr.io/apkdmg/lightrag:latest
     ports:
       - "${HOST:-0.0.0.0}:${PORT:-9621}:9621"
     volumes:
