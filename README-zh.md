@@ -7,34 +7,22 @@
 # 🚀 LightRAG: 简单且快速的检索增强生成（RAG）框架
 
 <div align="center">
-    <a href="https://trendshift.io/repositories/13043" target="_blank"><img src="https://trendshift.io/api/badge/repositories/13043" alt="HKUDS%2FLightRAG | Trendshift" style="width: 250px; height: 55px;" width="250" height="55"/></a>
-</div>
-
-<div align="center">
   <div style="width: 100%; height: 2px; margin: 20px 0; background: linear-gradient(90deg, transparent, #00d9ff, transparent);"></div>
 </div>
 
 <div align="center">
   <div style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); border-radius: 15px; padding: 25px; text-align: center;">
     <p>
-      <a href='https://github.com/HKUDS/LightRAG'><img src='https://img.shields.io/badge/🔥项目-主页-00d9ff?style=for-the-badge&logo=github&logoColor=white&labelColor=1a1a2e'></a>
+      <a href='https://github.com/apkdmg/LightRAG'><img src='https://img.shields.io/badge/🔥项目-主页-00d9ff?style=for-the-badge&logo=github&logoColor=white&labelColor=1a1a2e'></a>
       <a href='https://arxiv.org/abs/2410.05779'><img src='https://img.shields.io/badge/📄arXiv-2410.05779-ff6b6b?style=for-the-badge&logo=arxiv&logoColor=white&labelColor=1a1a2e'></a>
-      <a href="https://github.com/HKUDS/LightRAG/stargazers"><img src='https://img.shields.io/github/stars/HKUDS/LightRAG?color=00d9ff&style=for-the-badge&logo=star&logoColor=white&labelColor=1a1a2e' /></a>
+      <a href="https://github.com/apkdmg/LightRAG/stargazers"><img src='https://img.shields.io/github/stars/apkdmg/LightRAG?color=00d9ff&style=for-the-badge&logo=star&logoColor=white&labelColor=1a1a2e' /></a>
     </p>
     <p>
       <img src="https://img.shields.io/badge/🐍Python-3.10-4ecdc4?style=for-the-badge&logo=python&logoColor=white&labelColor=1a1a2e">
-      <a href="https://pypi.org/project/lightrag-hku/"><img src="https://img.shields.io/pypi/v/lightrag-hku.svg?style=for-the-badge&logo=pypi&logoColor=white&labelColor=1a1a2e&color=ff6b6b"></a>
-    </p>
-    <p>
-      <a href="https://discord.gg/yF2MmDJyGJ"><img src="https://img.shields.io/badge/💬Discord-社区-7289da?style=for-the-badge&logo=discord&logoColor=white&labelColor=1a1a2e"></a>
-      <a href="https://github.com/HKUDS/LightRAG/issues/285"><img src="https://img.shields.io/badge/💬微信群-交流-07c160?style=for-the-badge&logo=wechat&logoColor=white&labelColor=1a1a2e"></a>
     </p>
     <p>
       <a href="README-zh.md"><img src="https://img.shields.io/badge/🇨🇳中文版-1a1a2e?style=for-the-badge"></a>
       <a href="README.md"><img src="https://img.shields.io/badge/🇺🇸English-1a1a2e?style=for-the-badge"></a>
-    </p>
-    <p>
-      <a href="https://pepy.tech/projects/lightrag-hku"><img src="https://static.pepy.tech/personalized-badge/lightrag-hku?period=total&units=INTERNATIONAL_SYSTEM&left_color=BLACK&right_color=GREEN&left_text=downloads"></a>
     </p>
   </div>
 </div>
@@ -84,7 +72,7 @@
 - [2025.08]🎯[新功能]: 现已支持 **Reranker**，显著提升混合查询性能（已设为默认查询模式）。
 - [2025.08]🎯[新功能]: 添加了**文档删除**功能，并支持自动重新生成知识图谱，以确保最佳查询性能。
 - [2025.06]🎯[新发布]: 我们的团队发布了 [RAG-Anything](https://github.com/HKUDS/RAG-Anything) —— 一个用于无缝处理文本、图像、表格和方程式的**全功能多模态 RAG** 系统。
-- [2025.06]🎯[新功能]: LightRAG 现已集成 [RAG-Anything](https://github.com/HKUDS/RAG-Anything)，支持全面的多模态数据处理，实现对 PDF、图像、Office 文档、表格和公式等多种格式的无缝文档解析和 RAG 能力。详见[多模态文档处理部分](https://github.com/HKUDS/LightRAG/?tab=readme-ov-file#multimodal-document-processing-rag-anything-integration)。
+- [2025.06]🎯[新功能]: LightRAG 现已集成 [RAG-Anything](https://github.com/HKUDS/RAG-Anything)，支持全面的多模态数据处理，实现对 PDF、图像、Office 文档、表格和公式等多种格式的无缝文档解析和 RAG 能力。详见[多模态文档处理部分](#多模态文档处理)。
 - [2025.03]🎯[新功能]: LightRAG 现已支持引用功能，实现了准确的源归因和增强的文档可追溯性。
 - [2025.02]🎯[新功能]: 现在您可以使用 MongoDB 作为一体化存储解决方案，实现统一的数据管理。
 - [2025.02]🎯[新发布]: 我们的团队发布了 [VideoRAG](https://github.com/HKUDS/VideoRAG) —— 一个用于理解超长上下文视频的 RAG 系统。
@@ -92,7 +80,7 @@
 - [2025.01]🎯现在您可以使用 PostgreSQL 作为一体化存储解决方案进行数据管理。
 - [2024.11]🎯[新资源]: LightRAG 的综合指南现已在 [LearnOpenCV](https://learnopencv.com/lightrag) 上发布 —— 探索深入的教程和最佳实践。非常感谢博客作者的杰出贡献！
 - [2024.11]🎯[新功能]: 推出 LightRAG WebUI —— 一个允许您通过直观的 Web 界面插入、查询和可视化 LightRAG 知识的仪表板。
-- [2024.11]🎯[新功能]: 现在您可以[使用 Neo4J 进行存储](https://github.com/HKUDS/LightRAG?tab=readme-ov-file#using-neo4j-for-storage) —— 开启图数据库支持。
+- [2024.11]🎯[新功能]: 现在您可以使用 Neo4J 进行存储 —— 开启图数据库支持。
 - [2024.10]🎯[新功能]: 我们添加了 [LightRAG 介绍视频](https://youtu.be/oageL-1I0GE) 的链接 —— 演示 LightRAG 的各项功能。感谢作者的杰出贡献！
 - [2024.10]🎯[新频道]: 我们创建了一个 [Discord 频道](https://discord.gg/yF2MmDJyGJ)！💬 欢迎加入我们的社区进行分享、讨论和协作！ 🎉🎉
 
@@ -120,36 +108,12 @@
 
 LightRAG服务器旨在提供Web UI和API支持。Web UI便于文档索引、知识图谱探索和简单的RAG查询界面。LightRAG服务器还提供兼容Ollama的接口，旨在将LightRAG模拟为Ollama聊天模型。这使得AI聊天机器人（如Open WebUI）可以轻松访问LightRAG。
 
-* 从PyPI安装
-
-```bash
-### 使用 uv 安装 LightRAG 服务器（作为工具，推荐)
-uv tool install "lightrag-hku[api]"
-
-### 或使用 pip
-# python -m venv .venv
-# source .venv/bin/activate  # Windows: .venv\Scripts\activate
-# pip install "lightrag-hku[api]"
-
-### 构建前端代码
-cd lightrag_webui
-bun install --frozen-lockfile
-bun run build
-cd ..
-
-# 配置 env 文件
-# 从 GitHub 仓库的根目录上下载 env.example 文件
-# 或从本地检出的源代码中获取 env.example 文件
-cp env.example .env  # 使用你的LLM和Embedding模型访问参数更新.env文件
-# 启动API-WebUI服务
-lightrag-server
-```
-
 * 从源代码安装
 
 ```bash
-git clone https://github.com/HKUDS/LightRAG.git
+git clone https://github.com/apkdmg/LightRAG.git
 cd LightRAG
+git checkout enterprise-1.5.0   # 包含企业功能的分支
 
 # 一键初始化开发环境（推荐）
 make dev
@@ -186,16 +150,13 @@ lightrag-server
 * 使用 Docker Compose 启动 LightRAG 服务器
 
 ```bash
-git clone https://github.com/HKUDS/LightRAG.git
+git clone https://github.com/apkdmg/LightRAG.git
 cd LightRAG
+git checkout enterprise-1.5.0   # 包含企业功能的分支
 cp env.example .env  # 使用你的LLM和Embedding模型访问参数更新.env文件
 # modify LLM and Embedding settings in .env
 docker compose up
 ```
-
-> 在此获取LightRAG docker镜像历史版本: [LightRAG Docker Images]( https://github.com/HKUDS/LightRAG/pkgs/container/lightrag)
->
-> 由 GitHub Actions 发布到 GHCR 的官方镜像已使用 GitHub OIDC 和 Sigstore Cosign 进行签名。校验方式请参阅 [docs/DockerDeployment.md](./docs/DockerDeployment.md#verify-official-ghcr-images-with-cosign)。
 
 ### 使用 Setup 工具创建 .env 文件
 
@@ -228,13 +189,6 @@ source .venv/bin/activate  # 激活虚拟环境 (Linux/macOS)
 # Windows 系统: .venv\Scripts\activate
 
 # 或: pip install -e .
-```
-
-* 从PyPI安装
-
-```bash
-uv pip install lightrag-hku
-# 或: pip install lightrag-hku
 ```
 
 ## 快速开始
@@ -371,7 +325,7 @@ LightRAG 在农业、计算机科学、法律和混合等领域均显著优于 N
 
 ## ⭐ Star 历史
 
-[![Star History Chart](https://api.star-history.com/svg?repos=HKUDS/LightRAG&type=Date)](https://star-history.com/#HKUDS/LightRAG&Date)
+[![Star History Chart](https://api.star-history.com/svg?repos=apkdmg/LightRAG&type=Date)](https://star-history.com/#apkdmg/LightRAG&Date)
 
 ## 🤝 贡献
 
@@ -387,8 +341,8 @@ LightRAG 在农业、计算机科学、法律和混合等领域均显著优于 N
 </div>
 
 <div align="center">
-  <a href="https://github.com/HKUDS/LightRAG/graphs/contributors">
-    <img src="https://contrib.rocks/image?repo=HKUDS/LightRAG" style="border-radius: 15px; box-shadow: 0 0 20px rgba(0, 217, 255, 0.3);" />
+  <a href="https://github.com/apkdmg/LightRAG/graphs/contributors">
+    <img src="https://contrib.rocks/image?repo=apkdmg/LightRAG" style="border-radius: 15px; box-shadow: 0 0 20px rgba(0, 217, 255, 0.3);" />
   </a>
 </div>
 
@@ -413,13 +367,13 @@ primaryClass={cs.IR}
     <img src="https://user-images.githubusercontent.com/74038190/212284100-561aa473-3905-4a80-b561-0d28506553ee.gif" width="500">
   </div>
   <div style="margin-top: 20px;">
-    <a href="https://github.com/HKUDS/LightRAG" style="text-decoration: none;">
+    <a href="https://github.com/apkdmg/LightRAG" style="text-decoration: none;">
       <img src="https://img.shields.io/badge/⭐%20在%20GitHub%20上点亮星星-1a1a2e?style=for-the-badge&logo=github&logoColor=white">
     </a>
-    <a href="https://github.com/HKUDS/LightRAG/issues" style="text-decoration: none;">
+    <a href="https://github.com/apkdmg/LightRAG/issues" style="text-decoration: none;">
       <img src="https://img.shields.io/badge/🐛%20报告问题-ff6b6b?style=for-the-badge&logo=github&logoColor=white">
     </a>
-    <a href="https://github.com/HKUDS/LightRAG/discussions" style="text-decoration: none;">
+    <a href="https://github.com/apkdmg/LightRAG/discussions" style="text-decoration: none;">
       <img src="https://img.shields.io/badge/💬%20讨论-4ecdc4?style=for-the-badge&logo=github&logoColor=white">
     </a>
   </div>
