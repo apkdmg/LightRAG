@@ -8,9 +8,9 @@ An interactive 3D graph visualization tool included in the LightRAG package for 
 
 ### Quick Install
 ```bash
-pip install lightrag-hku[tools]  # Install with visualization tool only
+pip install lightrag-enterprise[tools]  # Install with visualization tool only
 # or
-pip install lightrag-hku[api,tools]  # Install with both API and visualization tools
+pip install lightrag-enterprise[api,tools]  # Install with both API and visualization tools
 ```
 
 ## Launch the Viewer
@@ -92,10 +92,10 @@ Adjustable via UI control panel:
 1. **Command Not Found**
    ```bash
    # Make sure you installed with the 'tools' option
-   pip install lightrag-hku[tools]
+   pip install lightrag-enterprise[tools]
 
    # Verify installation
-   pip list | grep lightrag-hku
+   pip list | grep lightrag-enterprise
    ```
 
 2. **ModernGL Initialization Failed**
@@ -126,7 +126,7 @@ The viewer is particularly useful for:
 
 ## Support
 
-- GitHub Issues: [LightRAG Repository](https://github.com/HKUDS/LightRAG)
+- GitHub Issues: [LightRAG Repository](https://github.com/apkdmg/LightRAG)
 - Documentation: [LightRAG Docs](https://URL-to-docs)
 
 ## License

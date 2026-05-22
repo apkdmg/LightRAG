@@ -71,7 +71,6 @@ dependencies = [
     { name = "aiohappyeyeballs" },
     { name = "aiosignal" },
     { name = "async-timeout", version = "4.0.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
-    { name = "async-timeout", version = "5.0.1", source = { registry = "https://pypi.org/simple" }, marker = "python_version < '0'" },
     { name = "attrs" },
     { name = "frozenlist" },
     { name = "multidict" },
@@ -1996,7 +1995,7 @@ wheels = [
 ]
 
 [[package]]
-name = "lightrag-hku"
+name = "lightrag-enterprise"
 source = { editable = "." }
 dependencies = [
     { name = "aiohttp" },
@@ -2291,9 +2290,9 @@ requires-dist = [
     { name = "langchain-experimental", marker = "extra == 'api'", specifier = ">=0.3,<1" },
     { name = "langchain-text-splitters", marker = "extra == 'api'", specifier = ">=0.3,<2" },
     { name = "langfuse", marker = "extra == 'observability'", specifier = ">=3.8.1" },
-    { name = "lightrag-hku", extras = ["api"], marker = "extra == 'evaluation'" },
-    { name = "lightrag-hku", extras = ["api"], marker = "extra == 'test'" },
-    { name = "lightrag-hku", extras = ["api", "offline-llm", "offline-storage"], marker = "extra == 'offline'" },
+    { name = "lightrag-enterprise", extras = ["api"], marker = "extra == 'evaluation'" },
+    { name = "lightrag-enterprise", extras = ["api"], marker = "extra == 'test'" },
+    { name = "lightrag-enterprise", extras = ["api", "offline-llm", "offline-storage"], marker = "extra == 'offline'" },
     { name = "llama-index", marker = "extra == 'offline-llm'", specifier = ">=0.14.0,<1.0.0" },
     { name = "llama-index-llms-openai", marker = "extra == 'offline-llm'", specifier = ">=0.6.12" },
     { name = "nano-vectordb" },

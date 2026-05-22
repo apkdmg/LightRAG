@@ -311,5 +311,5 @@ Comments, backend code, and log messages in English. Frontend uses i18next for m
 
 ## Commit and Pull Request Guidance
 
-- This repo is a fork of `HKUDS/LightRAG`. Target to `HKUDS/LightRAG` when creating PRs, not the fork's own repo.
+- This repo is a fork of `HKUDS/LightRAG`. Create pull requests against this fork's own `main` branch — not the upstream `HKUDS/LightRAG` repo.
 - PR descriptions should include: summary, motivation, linked issues if applyed, what's changed, what's broken and how it works.

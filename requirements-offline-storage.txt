@@ -4,7 +4,7 @@
 #   pip download -r requirements-offline-storage.txt -d ./packages
 #   pip install --no-index --find-links=./packages -r requirements-offline-storage.txt
 #
-# Recommended: Use pip install lightrag-hku[offline-storage] for the same effect
+# Recommended: Use pip install lightrag-enterprise[offline-storage] for the same effect
 # Or use constraints: pip install --constraint constraints-offline.txt -r requirements-offline-storage.txt
 
 # Storage backend dependencies (with version constraints matching pyproject.toml)

@@ -198,7 +198,7 @@ Langfuse provides a drop-in replacement for the OpenAI client that automatically
 ### Installation
 
 ```bash
-pip install lightrag-hku[observability]
+pip install lightrag-enterprise[observability]
 # Or from source:
 pip install -e ".[observability]"
 ```

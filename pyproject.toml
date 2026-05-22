@@ -3,7 +3,7 @@ requires = ["setuptools>=64", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "lightrag-hku"
+name = "lightrag-enterprise"
 dynamic = ["version"]
 authors = [
     {name = "Zirui Guo"}
@@ -129,11 +129,11 @@ offline-llm = [
 
 offline = [
     # Complete offline package (includes api for document processing, plus storage and LLM)
-    "lightrag-hku[api,offline-storage,offline-llm]",
+    "lightrag-enterprise[api,offline-storage,offline-llm]",
 ]
 
 test = [
-    "lightrag-hku[api]",
+    "lightrag-enterprise[api]",
     "pytest>=8.4.2",
     "pytest-asyncio>=1.2.0",
     "pre-commit",
@@ -141,7 +141,7 @@ test = [
 ]
 
 evaluation = [
-    "lightrag-hku[api]",
+    "lightrag-enterprise[api]",
     "ragas>=0.3.7",
     "datasets>=4.3.0",
 ]
@@ -159,10 +159,10 @@ lightrag-download-cache = "lightrag.tools.download_cache:main"
 lightrag-clean-llmqc = "lightrag.tools.clean_llm_query_cache:main"
 
 [project.urls]
-Homepage = "https://github.com/HKUDS/LightRAG"
-Documentation = "https://github.com/HKUDS/LightRAG"
-Repository = "https://github.com/HKUDS/LightRAG"
-"Bug Tracker" = "https://github.com/HKUDS/LightRAG/issues"
+Homepage = "https://github.com/apkdmg/LightRAG"
+Documentation = "https://github.com/apkdmg/LightRAG"
+Repository = "https://github.com/apkdmg/LightRAG"
+"Bug Tracker" = "https://github.com/apkdmg/LightRAG/issues"
 
 [tool.setuptools.packages.find]
 include = ["lightrag*"]

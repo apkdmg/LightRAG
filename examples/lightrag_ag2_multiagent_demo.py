@@ -11,7 +11,7 @@ Architecture:
     - Writer: synthesizes findings into a final answer
 
 Requires:
-    pip install lightrag-hku "ag2[openai]>=0.11.4,<1.0"
+    pip install lightrag-enterprise "ag2[openai]>=0.11.4,<1.0"
     export OPENAI_API_KEY="..."
 
 Usage:

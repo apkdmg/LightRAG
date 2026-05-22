@@ -35,13 +35,13 @@ LightRAG dynamically installs packages for:
 
 ```bash
 # Online environment: Install all offline dependencies
-pip install lightrag-hku[offline]
+pip install lightrag-enterprise[offline]
 
 # Download tiktoken cache
 lightrag-download-cache
 
 # Create offline package
-pip download lightrag-hku[offline] -d ./offline-packages
+pip download lightrag-enterprise[offline] -d ./offline-packages
 tar -czf lightrag-offline.tar.gz ./offline-packages ~/.tiktoken_cache
 
 # Transfer to offline server
@@ -49,7 +49,7 @@ scp lightrag-offline.tar.gz user@offline-server:/path/to/
 
 # Offline environment: Install
 tar -xzf lightrag-offline.tar.gz
-pip install --no-index --find-links=./offline-packages lightrag-hku[offline]
+pip install --no-index --find-links=./offline-packages lightrag-enterprise[offline]
 export TIKTOKEN_CACHE_DIR=~/.tiktoken_cache
 ```
 
@@ -89,13 +89,13 @@ LightRAG provides flexible dependency groups for different use cases:
 
 ```bash
 # Install API with document processing
-pip install lightrag-hku[api]
+pip install lightrag-enterprise[api]
 
 # Install API and storage backends
-pip install lightrag-hku[api,offline-storage]
+pip install lightrag-enterprise[api,offline-storage]
 
 # Install all offline dependencies (recommended for offline deployment)
-pip install lightrag-hku[offline]
+pip install lightrag-enterprise[offline]
 ```
 
 ### Using Individual Requirements Files
@@ -160,13 +160,13 @@ cp -r /path/to/tiktoken_cache ~/.tiktoken_cache/
 
 ```bash
 # 1. Install LightRAG with offline dependencies
-pip install lightrag-hku[offline]
+pip install lightrag-enterprise[offline]
 
 # 2. Download tiktoken cache
 lightrag-download-cache --cache-dir ./offline_cache/tiktoken
 
 # 3. Download all Python packages
-pip download lightrag-hku[offline] -d ./offline_cache/packages
+pip download lightrag-enterprise[offline] -d ./offline_cache/packages
 
 # 4. Create archive for transfer
 tar -czf lightrag-offline-complete.tar.gz ./offline_cache
@@ -195,7 +195,7 @@ tar -xzf lightrag-offline-complete.tar.gz
 # 2. Install Python packages
 pip install --no-index \
     --find-links=/tmp/offline_cache/packages \
-    lightrag-hku[offline]
+    lightrag-enterprise[offline]
 
 # 3. Set up tiktoken cache
 mkdir -p ~/.tiktoken_cache
@@ -244,13 +244,13 @@ ls -la ~/.tiktoken_cache/
 ```bash
 # Pre-install the specific package you need
 # For API with document processing:
-pip install lightrag-hku[api]
+pip install lightrag-enterprise[api]
 
 # For storage backends:
-pip install lightrag-hku[offline-storage]
+pip install lightrag-enterprise[offline-storage]
 
 # For LLM providers:
-pip install lightrag-hku[offline-llm]
+pip install lightrag-enterprise[offline-llm]
 ```
 
 ### Issue: Missing dependencies at runtime
@@ -263,7 +263,7 @@ pip install lightrag-hku[offline-llm]
 pip list | grep -i xxx
 
 # Install missing component
-pip install lightrag-hku[offline]  # Install all offline deps
+pip install lightrag-enterprise[offline]  # Install all offline deps
 ```
 
 ### Issue: Permission denied on tiktoken cache
@@ -297,13 +297,13 @@ mkdir -p ~/my_tiktoken_cache
 5. **Minimal Installation**: Only install what you need:
    ```bash
    # If you only need API with document processing
-   pip install lightrag-hku[api]
+   pip install lightrag-enterprise[api]
    # Then manually add specific LLM: pip install openai
    ```
 
 ## Additional Resources
 
-- [LightRAG GitHub Repository](https://github.com/HKUDS/LightRAG)
+- [LightRAG GitHub Repository](https://github.com/apkdmg/LightRAG)
 - [Docker Deployment Guide](./DockerDeployment.md)
 - [API Server Documentation](./LightRAG-API-Server.md)
 
@@ -311,6 +311,6 @@ mkdir -p ~/my_tiktoken_cache
 
 If you encounter issues not covered in this guide:
 
-1. Check the [GitHub Issues](https://github.com/HKUDS/LightRAG/issues)
+1. Check the [GitHub Issues](https://github.com/apkdmg/LightRAG/issues)
 2. Review the [project documentation](../README.md)
 3. Create a new issue with your offline deployment details

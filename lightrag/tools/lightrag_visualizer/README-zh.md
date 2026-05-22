@@ -38,7 +38,7 @@
 
 1. **启动程序**:
    ```bash
-   pip install lightrag-hku[tools]
+   pip install lightrag-enterprise[tools]
    lightrag-viewer
    ```
 

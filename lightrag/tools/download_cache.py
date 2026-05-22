@@ -137,7 +137,7 @@ Examples:
   # Download specific models only
   lightrag-download-cache --models gpt-4o-mini gpt-4
 
-For more information, visit: https://github.com/HKUDS/LightRAG
+For more information, visit: https://github.com/apkdmg/LightRAG
         """,
     )
 

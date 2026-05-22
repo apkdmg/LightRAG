@@ -16,7 +16,7 @@ The LightRAG project includes a React-based WebUI frontend. This guide explains 
 
 **Command:**
 ```bash
-pip install lightrag-hku[api]
+pip install lightrag-enterprise[api]
 ```
 
 **What happens:**
@@ -31,7 +31,7 @@ pip install lightrag-hku[api]
 **Command:**
 ```bash
 # Clone the repository
-git clone https://github.com/HKUDS/LightRAG.git
+git clone https://github.com/apkdmg/LightRAG.git
 cd LightRAG
 
 # Install in editable mode (no frontend build required yet)
@@ -61,7 +61,7 @@ cd ..
 **Command:**
 ```bash
 # Clone the repository
-git clone https://github.com/HKUDS/LightRAG.git
+git clone https://github.com/apkdmg/LightRAG.git
 cd LightRAG
 
 # ⚠️ MUST build frontend FIRST
@@ -126,7 +126,7 @@ When creating a release on GitHub:
 
 | Scenario | Command | Frontend Required | Can Build After |
 |----------|---------|-------------------|-----------------|
-| From PyPI | `pip install lightrag-hku[api]` | Included | No (already installed) |
+| From PyPI | `pip install lightrag-enterprise[api]` | Included | No (already installed) |
 | Development | `pip install -e ".[api]"` | No | ✅ Yes (anytime) |
 | Normal Install | `pip install ".[api]"` | ✅ Yes (before) | No (must reinstall) |
 | Create Package | `python -m build` | ✅ Yes (before) | N/A |
@@ -185,7 +185,7 @@ cd lightrag_webui && bun run build
 
 **A:** You probably used `pip install .` after building. Either:
 - Use `pip install -e ".[api]"` for development
-- Or reinstall: `pip uninstall lightrag-hku && pip install ".[api]"`
+- Or reinstall: `pip uninstall lightrag-enterprise && pip install ".[api]"`
 
 ### Q: Where are the built frontend files?
 

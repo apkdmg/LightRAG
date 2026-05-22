@@ -16,19 +16,19 @@ LightRAG 服务器旨在提供 Web 界面和 API 支持。Web 界面便于文档
 
 ```bash
 ### 使用 uv 安装 LightRAG 服务器（作为工具，推荐)
-uv tool install "lightrag-hku[api]"
+uv tool install "lightrag-enterprise[api]"
 
 ### 或使用 pip
 # python -m venv .venv
 # source .venv/bin/activate  # Windows: .venv\Scripts\activate
-# pip install "lightrag-hku[api]"
+# pip install "lightrag-enterprise[api]"
 ```
 
 * 从源代码安装
 
 ```bash
 # 克隆仓库
-git clone https://github.com/HKUDS/lightrag.git
+git clone https://github.com/apkdmg/LightRAG.git
 
 # 进入仓库目录
 cd lightrag
@@ -180,7 +180,7 @@ docker compose up
 # 如果希望启动后让程序退到后台运行，需要在命令的最后添加 -d 参数
 ```
 
-> 可以通过以下链接获取官方的docker compose文件：[docker-compose.yml]( https://raw.githubusercontent.com/HKUDS/LightRAG/refs/heads/main/docker-compose.yml) 。如需获取LightRAG的历史版本镜像，可以访问以下链接: [LightRAG Docker Images]( https://github.com/HKUDS/LightRAG/pkgs/container/lightrag). 如需获取更多关于docker部署的信息，请参阅 [DockerDeployment.md](./DockerDeployment.md).
+> 可以通过以下链接获取官方的docker compose文件：[docker-compose.yml]( https://raw.githubusercontent.com/apkdmg/LightRAG/refs/heads/main/docker-compose.yml) 。如需获取LightRAG的历史版本镜像，可以访问以下链接: [LightRAG Docker Images]( https://github.com/apkdmg/LightRAG/pkgs/container/lightrag). 如需获取更多关于docker部署的信息，请参阅 [DockerDeployment.md](./DockerDeployment.md).
 
 ### Nginx 反向代理配置
 

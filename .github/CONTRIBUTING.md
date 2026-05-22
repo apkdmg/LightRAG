@@ -16,8 +16,8 @@ Thank you for your interest in contributing! This guide covers everything you ne
 
 ## Ways to Contribute
 
-- **Bug reports** — open an [issue](https://github.com/HKUDS/LightRAG/issues) using the Bug Report template
-- **Feature requests** — open an [issue](https://github.com/HKUDS/LightRAG/issues) using the Feature Request template
+- **Bug reports** — open an [issue](https://github.com/apkdmg/LightRAG/issues) using the Bug Report template
+- **Feature requests** — open an [issue](https://github.com/apkdmg/LightRAG/issues) using the Feature Request template
 - **Documentation** — fix typos, clarify explanations, or add examples
 - **Code** — fix bugs, implement features, or add storage/LLM backends
 - **Testing** — add test coverage for untested code paths
@@ -28,7 +28,7 @@ Thank you for your interest in contributing! This guide covers everything you ne
 
 ```bash
 # Clone the repository
-git clone https://github.com/HKUDS/LightRAG.git
+git clone https://github.com/apkdmg/LightRAG.git
 cd LightRAG
 
 # Install in development mode (requires uv)
@@ -139,7 +139,7 @@ Set `LIGHTRAG_RUN_INTEGRATION=true` as an environment variable as an alternative
 
 ## Reporting Bugs
 
-Please use the [Bug Report issue template](https://github.com/HKUDS/LightRAG/issues/new?template=bug_report.yml). Include:
+Please use the [Bug Report issue template](https://github.com/apkdmg/LightRAG/issues/new?template=bug_report.yml). Include:
 
 - LightRAG version and Python version
 - Storage backend and LLM provider being used
@@ -150,7 +150,7 @@ Please use the [Bug Report issue template](https://github.com/HKUDS/LightRAG/iss
 
 ## Requesting Features
 
-Please use the [Feature Request issue template](https://github.com/HKUDS/LightRAG/issues/new?template=feature_request.yml). Describe:
+Please use the [Feature Request issue template](https://github.com/apkdmg/LightRAG/issues/new?template=feature_request.yml). Describe:
 
 - The problem you're trying to solve
 - Your proposed solution
@@ -160,4 +160,4 @@ Please use the [Feature Request issue template](https://github.com/HKUDS/LightRA
 
 ## Questions
 
-For usage questions, check the [Discussions](https://github.com/HKUDS/LightRAG/discussions) tab or open a [Question issue](https://github.com/HKUDS/LightRAG/issues/new?template=question.yml).
+For usage questions, check the [Discussions](https://github.com/apkdmg/LightRAG/discussions) tab or open a [Question issue](https://github.com/apkdmg/LightRAG/issues/new?template=question.yml).
