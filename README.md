@@ -148,7 +148,7 @@ lightrag-server
 
 * Run the pre-built Docker image (fastest)
 
-Pull the published multi-arch image (`linux/amd64` + `linux/arm64`) from GitHub Container Registry — no build required:
+The image is **public** on GitHub Container Registry — pull the multi-arch build (`linux/amd64` + `linux/arm64`) directly, with no GitHub login and no build required:
 
 ```bash
 # 1. Pull the image

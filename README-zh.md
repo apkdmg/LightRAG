@@ -148,7 +148,7 @@ lightrag-server
 
 * 运行预构建的 Docker 镜像（最快）
 
-从 GitHub Container Registry 拉取已发布的多架构镜像（`linux/amd64` + `linux/arm64`）—— 无需构建：
+该镜像在 GitHub Container Registry 上**公开开放** —— 可直接拉取多架构构建（`linux/amd64` + `linux/arm64`），无需 GitHub 登录、无需构建：
 
 ```bash
 # 1. 拉取镜像
