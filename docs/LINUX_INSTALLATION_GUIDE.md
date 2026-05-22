@@ -1,7 +1,7 @@
 # LightRAG Linux Server Installation Guide
 
 A step-by-step guide to install and configure the LightRAG enterprise server
-(LightRAG 1.5.0, branch `enterprise-1.5.0`) on a Linux server. Multimodal
+(LightRAG 1.5.0, branch `main`) on a Linux server. Multimodal
 document processing is built in natively; OAuth2/Keycloak SSO and multi-tenant
 workspace isolation are enabled by default.
 
@@ -102,7 +102,6 @@ sudo usermod -aG docker $USER
 ```bash
 git clone https://github.com/apkdmg/LightRAG.git
 cd LightRAG
-git checkout enterprise-1.5.0
 ```
 
 #### Step 3: Configure Environment
@@ -154,7 +153,7 @@ OAUTH2_CLIENT_SECRET=your-keycloak-client-secret
 #### Step 4: Create Data Directories
 
 ```bash
-mkdir -p data/rag_storage data/inputs data/tiktoken
+mkdir -p data/rag_storage data/inputs data/prompts
 chmod -R 755 data/
 ```
 
@@ -216,7 +215,6 @@ sudo dnf install -y \
 ```bash
 git clone https://github.com/apkdmg/LightRAG.git
 cd LightRAG
-git checkout enterprise-1.5.0
 ```
 
 #### Step 3: Create Virtual Environment
@@ -267,7 +265,7 @@ nano .env
 #### Step 6: Create Data Directories
 
 ```bash
-mkdir -p data/rag_storage data/inputs
+mkdir -p data/rag_storage data/inputs data/prompts
 ```
 
 #### Step 7: Start the Server
@@ -323,7 +321,10 @@ EOF
 
 #### Configure LightRAG for PostgreSQL
 
-Create `config.ini`:
+LightRAG reads database connection details from a `config.ini` file in the
+directory you start the server from. The `.env` file selects *which* storage
+backend is active (the `*_STORAGE` variables below); `config.ini` holds the
+*connection credentials* for it. Create `config.ini`:
 
 ```ini
 [postgres]

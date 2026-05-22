@@ -2,13 +2,13 @@
 
 How to integrate external applications, services, and tools — workflow
 automation (n8n), backend services, scripts, and chat clients — with the
-LightRAG enterprise server (LightRAG 1.5.0, branch `enterprise-1.5.0`).
+LightRAG enterprise server (LightRAG 1.5.0, branch `main`).
 
 Covers authentication, multi-tenancy, the REST API, the OpenAI- and
 Ollama-compatible APIs, end-to-end integration patterns, security, and error
 handling. Examples assume the server at `http://localhost:9621` (default; `PORT`
 is configurable). Every endpoint, header, and behaviour here is grounded in the
-`enterprise-1.5.0` code.
+`main`-branch code.
 
 ## Contents
 
@@ -65,7 +65,7 @@ missing, all callers share one data set.
 | Multi-tenancy on, but **auth not configured** (`AUTH_ACCOUNTS` unset *and* OAuth2 unconfigured) | Every caller is the `guest` user → `guest` workspace | **None** |
 | `ENABLE_MULTI_TENANCY=true` **and** auth configured | Per-identity workspace, resolved by the server | **Full** |
 
-On `enterprise-1.5.0` `ENABLE_MULTI_TENANCY` and `OAUTH2_ENABLED` both default
+On `main`, `ENABLE_MULTI_TENANCY` and `OAUTH2_ENABLED` both default
 to **`true`** — so isolation is active once you supply real Keycloak
 credentials (or set `AUTH_ACCOUNTS`). See §11.
 

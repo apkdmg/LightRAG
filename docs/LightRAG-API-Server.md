@@ -12,18 +12,6 @@ The LightRAG Server is designed to provide a Web UI and API support. The Web UI 
 
 ### Installation
 
-* Install from PyPI
-
-```bash
-### Install LightRAG Server as tool using uv (recommended)
-uv tool install "lightrag-enterprise[api]"
-
-### Or using pip
-# python -m venv .venv
-# source .venv/bin/activate  # Windows: .venv\Scripts\activate
-# pip install "lightrag-enterprise[api]"
-```
-
 * Installation from Source
 
 ```bash
@@ -31,7 +19,7 @@ uv tool install "lightrag-enterprise[api]"
 git clone https://github.com/apkdmg/LightRAG.git
 
 # Change to the repository directory
-cd lightrag
+cd LightRAG
 
 # Bootstrap the development environment (recommended)
 make dev

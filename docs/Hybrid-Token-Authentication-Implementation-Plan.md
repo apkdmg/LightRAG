@@ -1,5 +1,12 @@
 # Hybrid Token Validation & Streamlined On-Behalf Access Plan
 
+> **Historical record.** This was the implementation *plan* for hybrid token
+> validation and streamlined on-behalf access. Those features are now
+> implemented and shipped — for current documentation see
+> [OAuth2-SSO-Authentication.md](./OAuth2-SSO-Authentication.md) and the
+> [Integration Guide](./INTEGRATION_GUIDE.md). This page is retained for
+> historical context only.
+
 ## Overview
 
 This plan implements:

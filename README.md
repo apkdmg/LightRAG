@@ -96,6 +96,54 @@
 
 </details>
 
+## ⚡ Try It in 2 Minutes
+
+Run a single-user instance from the public Docker image — no SSO, no database, OpenAI backend:
+
+```bash
+# 1. Pull the image (multi-arch, public — no login needed)
+docker pull ghcr.io/apkdmg/lightrag:latest
+
+# 2. Minimal single-user config
+cat > .env <<'EOF'
+TOKEN_SECRET=replace-with-a-random-32+-char-string
+OAUTH2_ENABLED=false
+ENABLE_MULTI_TENANCY=false
+LLM_BINDING=openai
+LLM_MODEL=gpt-4o
+LLM_BINDING_API_KEY=sk-your-openai-key
+EMBEDDING_BINDING=openai
+EMBEDDING_MODEL=text-embedding-3-large
+EMBEDDING_DIM=3072
+EMBEDDING_BINDING_API_KEY=sk-your-openai-key
+EOF
+
+# 3. Run
+mkdir -p data/rag_storage data/inputs data/prompts
+docker run -d --name lightrag -p 9621:9621 \
+  -v "$(pwd)/.env:/app/.env" \
+  -v "$(pwd)/data/rag_storage:/app/data/rag_storage" \
+  -v "$(pwd)/data/inputs:/app/data/inputs" \
+  -v "$(pwd)/data/prompts:/app/data/prompts" \
+  ghcr.io/apkdmg/lightrag:latest
+```
+
+Open **http://localhost:9621** and follow the [WebUI Walkthrough](./docs/WEBUI_WALKTHROUGH.md) to upload a document and run your first query.
+
+For production installs — SSO, multi-tenancy, databases — see [Installation](#installation) below and the [full documentation](./docs/README.md).
+
+## 📚 Documentation
+
+Complete documentation lives in [**`docs/`**](./docs/README.md). Quick links:
+
+| Topic | Guides |
+|-------|--------|
+| **Install** | [Linux](./docs/LINUX_INSTALLATION_GUIDE.md) · [Docker](./docs/DOCKER_INSTALLATION_GUIDE.md) · [Offline](./docs/OfflineDeployment.md) |
+| **First use** | [WebUI Walkthrough](./docs/WEBUI_WALKTHROUGH.md) |
+| **Integrate** | [Integration Guide](./docs/INTEGRATION_GUIDE.md) · [API Server Reference](./docs/LightRAG-API-Server.md) |
+| **Enterprise** | [Keycloak SSO](./docs/KEYCLOAK_SSO_SETUP.md) · [Per-User API Keys](./docs/PER_USER_API_KEYS.md) · [OpenAI-Compatible API](./docs/OPENAI_COMPATIBLE_API.md) · [Email Ingestion](./docs/EMAIL_INGESTION.md) |
+| **All docs** | [Documentation index](./docs/README.md) |
+
 ## Installation
 
 **💡 Using uv for Package Management**: This project uses [uv](https://docs.astral.sh/uv/) for fast and reliable Python package management. Install uv first: `curl -LsSf https://astral.sh/uv/install.sh | sh` (Unix/macOS) or `powershell -c "irm https://astral.sh/uv/install.ps1 | iex"` (Windows)
@@ -310,7 +358,7 @@ knowledge graph, embeddings, and documents are kept separate.
 - Authorization-Code flow (with PKCE) for interactive users.
 - Client-Credentials flow for service accounts and automation.
 - Hybrid token validation — LightRAG JWTs and Keycloak tokens both accepted.
-- SSO logout.
+- Logout — clears the local LightRAG session (full Keycloak Single Logout is not yet implemented).
 
 LightRAG does **not** perform OIDC discovery — the realm endpoints below do not
 auto-derive from `OAUTH2_ISSUER`. Set all of them (the defaults point at the

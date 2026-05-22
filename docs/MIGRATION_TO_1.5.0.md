@@ -1,5 +1,13 @@
 # Migration: enterprise fork → LightRAG 1.5.0
 
+> **Historical record.** This document captures the one-time migration that
+> re-ported the fork's enterprise features onto upstream LightRAG 1.5.0. The
+> migration is complete — the work shipped on the **`main`** branch (the
+> `enterprise-1.5.0` branch referenced below was merged into `main` and then
+> deleted). This page is kept for historical context; it is **not** needed to
+> install or use LightRAG. For current documentation, see the
+> [documentation index](./README.md).
+
 Re-port the fork's enterprise features onto upstream **LightRAG 1.5.0** (targeting tag
 `v1.5.0rc2`). The legacy `RAGAnything`-package integration is **dropped** — LightRAG 1.5.0
 ships native multimodal processing that replaces it.
