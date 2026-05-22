@@ -113,7 +113,6 @@ LightRAG服务器旨在提供Web UI和API支持。Web UI便于文档索引、知
 ```bash
 git clone https://github.com/apkdmg/LightRAG.git
 cd LightRAG
-git checkout enterprise-1.5.0   # 包含企业功能的分支
 
 # 一键初始化开发环境（推荐）
 make dev
@@ -152,7 +151,6 @@ lightrag-server
 ```bash
 git clone https://github.com/apkdmg/LightRAG.git
 cd LightRAG
-git checkout enterprise-1.5.0   # 包含企业功能的分支
 cp env.example .env  # 使用你的LLM和Embedding模型访问参数更新.env文件
 # modify LLM and Embedding settings in .env
 docker compose up

@@ -113,7 +113,6 @@ The LightRAG Server is designed to provide Web UI and API support. The Web UI fa
 ```bash
 git clone https://github.com/apkdmg/LightRAG.git
 cd LightRAG
-git checkout enterprise-1.5.0   # the branch carrying the enterprise features
 
 # Bootstrap the development environment (recommended)
 make dev
@@ -152,7 +151,6 @@ lightrag-server
 ```bash
 git clone https://github.com/apkdmg/LightRAG.git
 cd LightRAG
-git checkout enterprise-1.5.0   # the branch carrying the enterprise features
 cp env.example .env  # Update the .env with your LLM and embedding configurations
 # modify LLM and Embedding settings in .env
 docker compose up
