@@ -182,6 +182,8 @@ cp env.example .env  # Update the .env with your LLM and embedding configuration
 docker compose up
 ```
 
+> 📖 For a full Docker walkthrough — configuration, data persistence, storage backends, Podman, image verification, and production notes — see the [Docker Installation Guide](./docs/DOCKER_INSTALLATION_GUIDE.md).
+
 ### Create .env File With Setup Tool
 
 Instead of editing `env.example` by hand, use the interactive setup wizard to generate a configured `.env` and, when needed, `docker-compose.final.yml`:

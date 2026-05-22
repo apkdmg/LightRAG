@@ -8,12 +8,12 @@ A lightweight Knowledge Graph Retrieval-Augmented Generation system with multipl
 
 ```bash
 # Linux/MacOS
-git clone https://github.com/HKUDS/LightRAG.git
+git clone https://github.com/apkdmg/LightRAG.git
 cd LightRAG
 ```
 ```powershell
 # Windows PowerShell
-git clone https://github.com/HKUDS/LightRAG.git
+git clone https://github.com/apkdmg/LightRAG.git
 cd LightRAG
 ```
 
@@ -21,12 +21,12 @@ cd LightRAG
 
 ```bash
 # Linux/MacOS
-cp .env.example .env
+cp env.example .env
 # Edit .env with your preferred configuration
 ```
 ```powershell
 # Windows PowerShell
-Copy-Item .env.example .env
+Copy-Item env.example .env
 # Edit .env with your preferred configuration
 ```
 
@@ -300,8 +300,8 @@ Official LightRAG images published to GitHub Container Registry by GitHub Action
 Install `cosign`, then verify the image tag you want to run:
 
 ```bash
-cosign verify ghcr.io/HKUDS/LightRAG:<tag> \
-  --certificate-identity-regexp '^https://github.com/HKUDS/LightRAG/.github/workflows/(docker-publish|docker-build-manual|docker-build-lite)\.yml@refs/.+$' \
+cosign verify ghcr.io/apkdmg/lightrag:<tag> \
+  --certificate-identity-regexp '^https://github.com/apkdmg/LightRAG/.github/workflows/(docker-publish|docker-build-manual|docker-build-lite)\.yml@refs/.+$' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 ```
 
