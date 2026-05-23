@@ -264,26 +264,233 @@ vectors live in those services instead — see [Full stack](#full-stack-with-sto
 
 ## Full stack with storage backends
 
-For production with **PostgreSQL / Neo4j / Milvus**, use the full Compose file
-(`docker-compose-full.yml`). It also bundles local vLLM embedding/rerank services
-and requires an NVIDIA GPU host for Milvus and vLLM:
+The bundled `docker-compose-full.yml` brings up everything LightRAG needs for a
+production-grade graph + vector + reranker stack: PostgreSQL, Neo4j, Milvus
+(with its etcd and MinIO sidecars), and local vLLM embedding + rerank services.
+
+### Services and ports
+
+| Service | Image | Port | Role | GPU? |
+|---------|-------|------|------|------|
+| `lightrag` | `ghcr.io/apkdmg/lightrag:latest` | **9621** (exposed) | API + WebUI | No |
+| `vllm-embed` | `vllm/vllm-openai:latest` | 8001 (exposed) | Embedding model server — `BAAI/bge-m3` | **Yes** |
+| `vllm-rerank` | `vllm/vllm-openai:latest` | 8000 (exposed) | Reranker — `BAAI/bge-reranker-v2-m3` | **Yes** |
+| `postgres` | `pgvector/pgvector:pg18` | 5432 (internal) | KV + vector storage (pgvector) | No |
+| `neo4j` | `neo4j:5-community` | 7474, 7687 (internal) | Graph storage | No |
+| `milvus` | `milvusdb/milvus:v2.6.11-gpu` | 19530 (internal) | Alternative vector storage | **Yes** |
+| `milvus-etcd` | `quay.io/coreos/etcd:v3.5.25` | — | Milvus metadata sidecar | No |
+| `milvus-minio` | `minio/minio` | — | Milvus object-store sidecar | No |
+
+Services communicate over the compose network by hostname (`postgres`,
+`neo4j`, `milvus`, `vllm-embed`, `vllm-rerank`).
+
+### Prerequisites
+
+A GPU host is required for the default stack — Milvus and both vLLM services
+use `runtime: nvidia`. You need:
+
+- An NVIDIA GPU with a recent driver
+- The [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/)
+  installed, with Docker configured to use the `nvidia` runtime
+- ~20 GB+ free disk for model weights and database volumes
+
+If you don't have a GPU, see [CPU-only setup](#cpu-only-setup) below.
+
+### Required environment variables
+
+Compose fails fast if the secrets below are missing. Export them in your shell
+or place them in a top-level `.env` (Compose reads it automatically):
+
+```bash
+# Neo4j authentication
+NEO4J_USERNAME=neo4j
+NEO4J_PASSWORD=your-strong-password
+
+# Milvus object store (MinIO)
+MINIO_ACCESS_KEY_ID=your-minio-key
+MINIO_SECRET_ACCESS_KEY=your-minio-secret
+
+# vLLM API keys (must match the matching *_BINDING_API_KEY in LightRAG's .env)
+VLLM_EMBED_API_KEY=any-shared-token
+VLLM_RERANK_API_KEY=any-shared-token
+```
+
+In LightRAG's `.env`, point storage and bindings at the bundled services:
+
+```bash
+# Storage backends
+KV_STORAGE=PGKVStorage
+VECTOR_STORAGE=PGVectorStorage       # or MilvusVectorStorage to use Milvus
+GRAPH_STORAGE=Neo4JStorage
+DOC_STATUS_STORAGE=PGDocStatusStorage
+
+# Embedding — talks to vllm-embed over the compose network
+EMBEDDING_BINDING=openai
+EMBEDDING_MODEL=BAAI/bge-m3
+EMBEDDING_DIM=1024                   # bge-m3 is 1024-dim
+EMBEDDING_BINDING_API_KEY=any-shared-token   # match VLLM_EMBED_API_KEY
+
+# Reranker — vLLM exposes /v1/rerank, which works with the cohere binding
+RERANK_BINDING=cohere
+RERANK_MODEL=BAAI/bge-reranker-v2-m3
+RERANK_BINDING_API_KEY=any-shared-token      # match VLLM_RERANK_API_KEY
+```
+
+PostgreSQL host/port and the Neo4j/Milvus URIs are already wired into the
+`lightrag` service's `environment` block in the compose file — you only need to
+override them when [using external backends](#using-external-backends).
+
+### Bring it up
 
 ```bash
 docker compose -f docker-compose-full.yml up -d
+docker compose -f docker-compose-full.yml ps          # wait for all services to be "healthy"
+docker compose -f docker-compose-full.yml logs -f lightrag
 ```
 
-To generate a stack tailored to your chosen backends, use the interactive setup
-wizard, which produces a `docker-compose.final.yml`:
+The first start downloads ~5–10 GB of model weights for the vLLM services —
+expect them to take a few minutes to reach `healthy`.
+
+### CPU-only setup
+
+If you don't have a GPU, override the GPU-bound services with a
+`docker-compose.override.yml` next to the full compose file:
+
+```yaml
+services:
+  vllm-embed:
+    image: vllm/vllm-openai-cpu:latest
+    runtime: ~
+    deploy:
+      resources: {}
+    command: >
+      --model BAAI/bge-m3
+      --port 8001
+      --dtype float32
+      --api-key ${VLLM_EMBED_API_KEY}
+
+  vllm-rerank:
+    image: vllm/vllm-openai-cpu:latest
+    runtime: ~
+    deploy:
+      resources: {}
+    command: >
+      --model BAAI/bge-reranker-v2-m3
+      --port 8000
+      --dtype float32
+      --api-key ${VLLM_RERANK_API_KEY}
+```
+
+Milvus does not have a comfortable CPU story. For CPU-only deployments, the
+simplest path is to drop the milvus services and use **`VECTOR_STORAGE=PGVectorStorage`**
+(vectors stored alongside KV in PostgreSQL). See
+[Using external backends](#using-external-backends) for how to exclude services.
+
+### Customizing each backend
+
+#### PostgreSQL
+
+Default image `pgvector/pgvector:pg18` supports `PGKVStorage`, `PGVectorStorage`,
+and `PGDocStatusStorage` — **but not** graph storage. To get pgvector **and**
+Apache AGE in one Postgres (so you can drop Neo4j and use `PGGraphStorage`),
+override the image to the variant used by the interactive setup:
+
+```yaml
+services:
+  postgres:
+    image: gzdaniel/postgres-for-rag:16.6   # pgvector + Apache AGE
+```
+
+Default credentials are `rag` / `rag` / `rag` (user / password / database).
+Override via the `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB` keys on the
+`postgres` service.
+
+> ⚠️ Postgres major-version data files are not compatible across upgrades —
+> pick the major version before you ingest data; don't roll it back later.
+
+#### Neo4j
+
+Authentication is sourced from the `NEO4J_USERNAME` / `NEO4J_PASSWORD`
+environment variables; compose fails to start if either is unset. To expose
+the browser UI for inspection, uncomment the `ports` block on the `neo4j`
+service (`7474:7474`, `7687:7687`) — and only do this on a trusted network.
+
+#### Milvus
+
+The bundled image `milvusdb/milvus:v2.6.11-gpu` requires a GPU host. To use
+Milvus instead of pgvector for the vector store, set
+`VECTOR_STORAGE=MilvusVectorStorage` in `.env`; LightRAG uses
+`MILVUS_URI=http://milvus:19530` from the compose env block. Milvus depends on
+its `milvus-etcd` (metadata) and `milvus-minio` (object store) sidecars — both
+come up automatically.
+
+#### vLLM embedding / rerank
+
+Defaults are `BAAI/bge-m3` for embeddings (1024-dim) and
+`BAAI/bge-reranker-v2-m3` for reranking. Override at startup:
 
 ```bash
-make env-base       # LLM, embedding, reranker
-make env-storage    # storage backends and database services
+VLLM_EMBED_MODEL=Qwen/Qwen3-Embedding-8B \
+VLLM_RERANK_MODEL=BAAI/bge-reranker-v2-m3 \
+docker compose -f docker-compose-full.yml up -d
+```
+
+If you change the embedding model, **also update `EMBEDDING_DIM`** in `.env` to
+match the new model's output dimension, and wipe vector storage before
+re-indexing — the embedding dimension is baked into the vector tables /
+collections, and changing it mid-flight will throw dimension-mismatch errors.
+
+### Using external backends
+
+If you already operate PostgreSQL, Neo4j, or Milvus, don't run the bundled
+ones. Use the basic `docker-compose.yml` (LightRAG only) instead of
+`docker-compose-full.yml`, and point `.env` at your existing services:
+
+```bash
+POSTGRES_HOST=postgres.internal.example.com
+POSTGRES_PORT=5432
+POSTGRES_USER=lightrag
+POSTGRES_PASSWORD=...
+POSTGRES_DATABASE=lightrag
+
+NEO4J_URI=neo4j://neo4j.internal.example.com:7687
+NEO4J_USERNAME=neo4j
+NEO4J_PASSWORD=...
+
+MILVUS_URI=http://milvus.internal.example.com:19530
+```
+
+To keep using the *full* stack but drop just one or two services (e.g. you
+have an external Postgres but still want the bundled vLLM + Milvus), write a
+`docker-compose.override.yml` that disables those services:
+
+```yaml
+services:
+  postgres: !reset { }   # Compose v2.20+ — remove the service from the stack
+```
+
+(Older Compose: copy `docker-compose-full.yml` into a slimmer custom file
+without the services you replace.)
+
+### The interactive setup wizard
+
+For a stack tailored to your chosen backends without hand-editing compose,
+use the wizard — it generates a `docker-compose.final.yml` and a matching
+`.env`:
+
+```bash
+make env-base             # 1. LLM, embedding, reranker (offers local vLLM)
+make env-storage          # 2. storage backends + database services
+make env-server           # 3. server port, auth, SSL
+make env-security-check   # 4. audit the generated .env before going live
+
 docker compose -f docker-compose.final.yml up -d
 ```
 
-See [DockerDeployment.md](./DockerDeployment.md) for storage-backend, vLLM, SSL,
-and PostgreSQL-image details, and [InteractiveSetup.md](./InteractiveSetup.md) for
-the wizard.
+Reruns preserve manual edits inside wizard-managed service blocks; to force
+regeneration from the templates, use `make env-base-rewrite` and
+`make env-storage-rewrite`. See [InteractiveSetup.md](./InteractiveSetup.md)
+for the full target reference.
 
 ---
 
