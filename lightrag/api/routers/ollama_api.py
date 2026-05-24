@@ -393,7 +393,9 @@ class OllamaAPI:
                                     # CodeQL py/stack-trace-exposure: do not include
                                     # str(e) in the client-facing message. Log details
                                     # server-side, return a generic provider error.
-                                    error_msg = "Provider error; see server logs for details."
+                                    error_msg = (
+                                        "Provider error; see server logs for details."
+                                    )
 
                                 logger.error(f"Stream error: {e}", exc_info=True)
 
@@ -633,7 +635,9 @@ class OllamaAPI:
                                     # CodeQL py/stack-trace-exposure: do not include
                                     # str(e) in the client-facing message. Log details
                                     # server-side, return a generic provider error.
-                                    error_msg = "Provider error; see server logs for details."
+                                    error_msg = (
+                                        "Provider error; see server logs for details."
+                                    )
 
                                 logger.error(f"Stream error: {e}", exc_info=True)
 
