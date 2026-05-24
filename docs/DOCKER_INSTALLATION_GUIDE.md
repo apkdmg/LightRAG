@@ -534,13 +534,12 @@ GRAPH_STORAGE=Neo4JStorage
 DOC_STATUS_STORAGE=PGDocStatusStorage
 ```
 
-The reranker uses the Cohere-compatible binding pointed at Jina's hosted
-endpoint:
+The reranker uses the native Jina binding (the binding's default `base_url`
+already targets `https://api.jina.ai/v1/rerank`):
 
 ```bash
-RERANK_BINDING=cohere
+RERANK_BINDING=jina
 RERANK_MODEL=jina-reranker-v2-base-multilingual
-RERANK_BINDING_HOST=https://api.jina.ai/v1/rerank
 RERANK_BINDING_API_KEY=jina_...
 ```
 
