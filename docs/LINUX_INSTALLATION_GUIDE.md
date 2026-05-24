@@ -343,10 +343,10 @@ Update `.env`:
 
 ```bash
 # Storage configuration
-KV_STORAGE=PGKVStorage
-VECTOR_STORAGE=PGVectorStorage
-GRAPH_STORAGE=PGGraphStorage
-DOC_STATUS_STORAGE=PGDocStatusStorage
+LIGHTRAG_KV_STORAGE=PGKVStorage
+LIGHTRAG_VECTOR_STORAGE=PGVectorStorage
+LIGHTRAG_GRAPH_STORAGE=PGGraphStorage
+LIGHTRAG_DOC_STATUS_STORAGE=PGDocStatusStorage
 ```
 
 ### Option C: Neo4j (Best for Graph Operations)
@@ -383,7 +383,7 @@ connection_timeout = 30.0
 Update `.env`:
 
 ```bash
-GRAPH_STORAGE=Neo4JStorage
+LIGHTRAG_GRAPH_STORAGE=Neo4JStorage
 ```
 
 ---
@@ -456,16 +456,16 @@ EMBEDDING_BINDING_API_KEY=sk-your-key
 # STORAGE CONFIGURATION
 # ============================================================================
 # Options: JsonKVStorage, PGKVStorage, RedisKVStorage, MongoKVStorage
-KV_STORAGE=JsonKVStorage
+LIGHTRAG_KV_STORAGE=JsonKVStorage
 
 # Options: NanoVectorDBStorage, PGVectorStorage, MilvusVectorDBStorage, etc.
-VECTOR_STORAGE=NanoVectorDBStorage
+LIGHTRAG_VECTOR_STORAGE=NanoVectorDBStorage
 
 # Options: NetworkXStorage, Neo4JStorage, PGGraphStorage, MemgraphStorage
-GRAPH_STORAGE=NetworkXStorage
+LIGHTRAG_GRAPH_STORAGE=NetworkXStorage
 
 # Options: JsonDocStatusStorage, PGDocStatusStorage, MongoDocStatusStorage
-DOC_STATUS_STORAGE=JsonDocStatusStorage
+LIGHTRAG_DOC_STATUS_STORAGE=JsonDocStatusStorage
 
 # ============================================================================
 # AUTHENTICATION

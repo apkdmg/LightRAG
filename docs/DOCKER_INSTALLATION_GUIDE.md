@@ -321,10 +321,10 @@ In LightRAG's `.env`, point storage and bindings at the bundled services:
 
 ```bash
 # Storage backends
-KV_STORAGE=PGKVStorage
-VECTOR_STORAGE=PGVectorStorage       # or MilvusVectorStorage to use Milvus
-GRAPH_STORAGE=Neo4JStorage
-DOC_STATUS_STORAGE=PGDocStatusStorage
+LIGHTRAG_KV_STORAGE=PGKVStorage
+LIGHTRAG_VECTOR_STORAGE=PGVectorStorage       # or MilvusVectorStorage to use Milvus
+LIGHTRAG_GRAPH_STORAGE=Neo4JStorage
+LIGHTRAG_DOC_STATUS_STORAGE=PGDocStatusStorage
 
 # Embedding — talks to vllm-embed over the compose network
 EMBEDDING_BINDING=openai
@@ -384,7 +384,7 @@ services:
 ```
 
 Milvus does not have a comfortable CPU story. For CPU-only deployments, the
-simplest path is to drop the milvus services and use **`VECTOR_STORAGE=PGVectorStorage`**
+simplest path is to drop the milvus services and use **`LIGHTRAG_VECTOR_STORAGE=PGVectorStorage`**
 (vectors stored alongside KV in PostgreSQL). See
 [Using external backends](#using-external-backends) for how to exclude services.
 
@@ -421,7 +421,7 @@ service (`7474:7474`, `7687:7687`) — and only do this on a trusted network.
 
 The bundled image `milvusdb/milvus:v2.6.11-gpu` requires a GPU host. To use
 Milvus instead of pgvector for the vector store, set
-`VECTOR_STORAGE=MilvusVectorStorage` in `.env`; LightRAG uses
+`LIGHTRAG_VECTOR_STORAGE=MilvusVectorStorage` in `.env`; LightRAG uses
 `MILVUS_URI=http://milvus:19530` from the compose env block. Milvus depends on
 its `milvus-etcd` (metadata) and `milvus-minio` (object store) sidecars — both
 come up automatically.
@@ -528,10 +528,10 @@ cp env.docker-compose-no-gpu .env
 Storage selectors are pre-set in the template:
 
 ```bash
-KV_STORAGE=PGKVStorage
-VECTOR_STORAGE=PGVectorStorage
-GRAPH_STORAGE=Neo4JStorage
-DOC_STATUS_STORAGE=PGDocStatusStorage
+LIGHTRAG_KV_STORAGE=PGKVStorage
+LIGHTRAG_VECTOR_STORAGE=PGVectorStorage
+LIGHTRAG_GRAPH_STORAGE=Neo4JStorage
+LIGHTRAG_DOC_STATUS_STORAGE=PGDocStatusStorage
 ```
 
 The reranker uses the native Jina binding (the binding's default `base_url`

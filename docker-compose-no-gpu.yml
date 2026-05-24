@@ -48,10 +48,10 @@ services:
       # config reads these at module-import time before python-dotenv runs;
       # putting them at the Docker level guarantees they're set before Python
       # starts.
-      KV_STORAGE: "PGKVStorage"
-      VECTOR_STORAGE: "PGVectorStorage"
-      GRAPH_STORAGE: "Neo4JStorage"
-      DOC_STATUS_STORAGE: "PGDocStatusStorage"
+      LIGHTRAG_KV_STORAGE: "PGKVStorage"
+      LIGHTRAG_VECTOR_STORAGE: "PGVectorStorage"
+      LIGHTRAG_GRAPH_STORAGE: "Neo4JStorage"
+      LIGHTRAG_DOC_STATUS_STORAGE: "PGDocStatusStorage"
       # Bundled-DB hostnames (the compose service names) + credentials
       # forwarded from .env via Compose substitution.
       POSTGRES_HOST: "postgres"
