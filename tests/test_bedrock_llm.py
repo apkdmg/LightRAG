@@ -572,6 +572,24 @@ def _make_args(tmp_path) -> SimpleNamespace:
         embedding_timeout=30,
         rerank_max_async=4,
         rerank_timeout=30,
+        # Enterprise-fork additions — defaults that keep these features OFF for tests
+        oauth2_enabled=False,
+        oauth2_client_id="",
+        oauth2_client_secret="",
+        oauth2_issuer="",
+        oauth2_authorization_endpoint="",
+        oauth2_token_endpoint="",
+        oauth2_userinfo_endpoint="",
+        oauth2_jwks_uri="",
+        oauth2_redirect_uri="",
+        oauth2_scopes="openid profile email",
+        enable_multi_tenancy=False,
+        max_workspace_instances=100,
+        workspace_ttl_minutes=60,
+        auto_create_workspace=True,
+        admin_accounts="",
+        obo_allowlist_path="",
+        obo_default_policy="deny",
     )
 
 
