@@ -6,7 +6,7 @@ including creation, deletion, listing, and impersonation.
 """
 
 import logging
-from typing import List, Optional
+from typing import List
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field

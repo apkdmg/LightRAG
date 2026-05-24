@@ -203,9 +203,7 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
         Multi-tenant mode: the per-workspace instance from the WorkspaceManager.
         Single-instance mode: the default ``rag`` passed to this factory.
         """
-        workspace_manager = getattr(
-            http_request.app.state, "workspace_manager", None
-        )
+        workspace_manager = getattr(http_request.app.state, "workspace_manager", None)
         if workspace_manager is None:
             return rag
         from ..dependencies import resolve_workspace_from_request

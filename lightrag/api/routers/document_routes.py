@@ -2617,9 +2617,7 @@ def create_document_routes(
         """Per-workspace LightRAG, or the default rag (None request = direct call)."""
         if http_request is None:
             return rag
-        workspace_manager = getattr(
-            http_request.app.state, "workspace_manager", None
-        )
+        workspace_manager = getattr(http_request.app.state, "workspace_manager", None)
         if workspace_manager is None:
             return rag
         from ..dependencies import resolve_workspace_from_request
@@ -2631,9 +2629,7 @@ def create_document_routes(
         """Per-workspace DocumentManager, or the default (None request = direct call)."""
         if http_request is None:
             return doc_manager
-        workspace_manager = getattr(
-            http_request.app.state, "workspace_manager", None
-        )
+        workspace_manager = getattr(http_request.app.state, "workspace_manager", None)
         if workspace_manager is None:
             return doc_manager
         from ..dependencies import resolve_workspace_from_request
@@ -2647,11 +2643,12 @@ def create_document_routes(
             )
         return _workspace_doc_managers[workspace]
 
-
     @router.post(
         "/scan", response_model=ScanResponse, dependencies=[Depends(combined_auth)]
     )
-    async def scan_for_new_documents(background_tasks: BackgroundTasks, http_request: Request = None):
+    async def scan_for_new_documents(
+        background_tasks: BackgroundTasks, http_request: Request = None
+    ):
         """
         Trigger the scanning process for new documents.
 
@@ -2777,7 +2774,8 @@ def create_document_routes(
         "/upload", response_model=InsertResponse, dependencies=[Depends(combined_auth)]
     )
     async def upload_to_input_dir(
-        background_tasks: BackgroundTasks, file: UploadFile = File(...),
+        background_tasks: BackgroundTasks,
+        file: UploadFile = File(...),
         http_request: Request = None,
     ):
         """
@@ -3022,7 +3020,8 @@ def create_document_routes(
         "/text", response_model=InsertResponse, dependencies=[Depends(combined_auth)]
     )
     async def insert_text(
-        request: InsertTextRequest, background_tasks: BackgroundTasks,
+        request: InsertTextRequest,
+        background_tasks: BackgroundTasks,
         http_request: Request = None,
     ):
         """
@@ -3117,7 +3116,8 @@ def create_document_routes(
         dependencies=[Depends(combined_auth)],
     )
     async def insert_texts(
-        request: InsertTextsRequest, background_tasks: BackgroundTasks,
+        request: InsertTextsRequest,
+        background_tasks: BackgroundTasks,
         http_request: Request = None,
     ):
         """
@@ -3444,7 +3444,9 @@ def create_document_routes(
         dependencies=[Depends(combined_auth)],
         response_model=PipelineStatusResponse,
     )
-    async def get_pipeline_status(http_request: Request = None) -> PipelineStatusResponse:
+    async def get_pipeline_status(
+        http_request: Request = None,
+    ) -> PipelineStatusResponse:
         """
         Get the current status of the document indexing pipeline.
 
@@ -3827,7 +3829,9 @@ def create_document_routes(
         response_model=DeletionResult,
         dependencies=[Depends(combined_auth)],
     )
-    async def delete_relation(request: DeleteRelationRequest, http_request: Request = None):
+    async def delete_relation(
+        request: DeleteRelationRequest, http_request: Request = None
+    ):
         """
         Delete a relationship between two entities from the knowledge graph.
 
@@ -3866,7 +3870,9 @@ def create_document_routes(
         response_model=TrackStatusResponse,
         dependencies=[Depends(combined_auth)],
     )
-    async def get_track_status(track_id: str, http_request: Request = None) -> TrackStatusResponse:
+    async def get_track_status(
+        track_id: str, http_request: Request = None
+    ) -> TrackStatusResponse:
         """
         Get the processing status of documents by tracking ID.
 
@@ -4124,7 +4130,9 @@ def create_document_routes(
         response_model=StatusCountsResponse,
         dependencies=[Depends(combined_auth)],
     )
-    async def get_document_status_counts(http_request: Request = None) -> StatusCountsResponse:
+    async def get_document_status_counts(
+        http_request: Request = None,
+    ) -> StatusCountsResponse:
         """
         Get counts of documents by status.
 
@@ -4152,7 +4160,9 @@ def create_document_routes(
         response_model=ReprocessResponse,
         dependencies=[Depends(combined_auth)],
     )
-    async def reprocess_failed_documents(background_tasks: BackgroundTasks, http_request: Request = None):
+    async def reprocess_failed_documents(
+        background_tasks: BackgroundTasks, http_request: Request = None
+    ):
         """
         Reprocess failed and pending documents.
 

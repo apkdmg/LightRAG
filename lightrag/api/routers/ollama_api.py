@@ -232,9 +232,7 @@ class OllamaAPI:
         Multi-tenant mode: the per-workspace instance from the WorkspaceManager.
         Single-instance mode: the default instance passed at construction.
         """
-        workspace_manager = getattr(
-            http_request.app.state, "workspace_manager", None
-        )
+        workspace_manager = getattr(http_request.app.state, "workspace_manager", None)
         if workspace_manager is None:
             return self.rag
         from lightrag.api.dependencies import resolve_workspace_from_request
@@ -556,9 +554,7 @@ class OllamaAPI:
                             **role_kwargs,
                         )
                     else:
-                        response = await rag.aquery(
-                            cleaned_query, param=query_param
-                        )
+                        response = await rag.aquery(cleaned_query, param=query_param)
 
                     async def stream_generator():
                         first_chunk_time = None

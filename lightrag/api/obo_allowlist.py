@@ -161,7 +161,11 @@ class OBOAllowlistManager:
     Uses TTL-based caching - config is reloaded if file changed.
     """
 
-    def __init__(self, config_path: Optional[str] = None, cache_ttl: int = DEFAULT_CACHE_TTL_SECONDS):
+    def __init__(
+        self,
+        config_path: Optional[str] = None,
+        cache_ttl: int = DEFAULT_CACHE_TTL_SECONDS,
+    ):
         self._config_path = config_path
         self._cache_ttl = cache_ttl
         self._config: Optional[OBOAllowlistConfig] = None
@@ -180,6 +184,7 @@ class OBOAllowlistManager:
                 self._config_path = env_path
             else:
                 from .config import global_args
+
                 working_dir = getattr(global_args, "working_dir", "./rag_storage")
                 self._config_path = os.path.join(working_dir, ".obo_allowlist")
 
@@ -223,19 +228,24 @@ class OBOAllowlistManager:
             if "OBO_DEFAULT_POLICY" in file_config:
                 config.default_policy = file_config["OBO_DEFAULT_POLICY"].lower()
                 if config.default_policy not in ("allow", "deny"):
-                    logger.warning(f"Invalid OBO_DEFAULT_POLICY, using 'deny'")
+                    logger.warning("Invalid OBO_DEFAULT_POLICY, using 'deny'")
                     config.default_policy = "deny"
 
             if "OBO_ALLOWED_CLIENTS" in file_config:
-                config.clients = _parse_allowed_clients(file_config["OBO_ALLOWED_CLIENTS"])
+                config.clients = _parse_allowed_clients(
+                    file_config["OBO_ALLOWED_CLIENTS"]
+                )
 
             if "OBO_API_KEY_ALLOWED" in file_config:
-                config.api_key_obo_allowed = _parse_bool(file_config["OBO_API_KEY_ALLOWED"])
+                config.api_key_obo_allowed = _parse_bool(
+                    file_config["OBO_API_KEY_ALLOWED"]
+                )
 
             if "OBO_API_KEY_WORKSPACES" in file_config:
-                config.api_key_allowed_workspaces, config.api_key_allow_all_workspaces = (
-                    _parse_workspaces(file_config["OBO_API_KEY_WORKSPACES"])
-                )
+                (
+                    config.api_key_allowed_workspaces,
+                    config.api_key_allow_all_workspaces,
+                ) = _parse_workspaces(file_config["OBO_API_KEY_WORKSPACES"])
 
             logger.info(
                 f"OBO allowlist loaded from {self._config_path}: "
@@ -272,13 +282,17 @@ class OBOAllowlistManager:
         # Handle shared API key
         if client_id == "api_key":
             if not config.api_key_obo_allowed:
-                logger.debug("OBO check: api_key not allowed (OBO_API_KEY_ALLOWED=false)")
+                logger.debug(
+                    "OBO check: api_key not allowed (OBO_API_KEY_ALLOWED=false)"
+                )
                 return config.default_policy == "allow"
             if config.api_key_allow_all_workspaces:
                 return True
             allowed = target_workspace in config.api_key_allowed_workspaces
             if not allowed:
-                logger.debug(f"OBO check: api_key not allowed for workspace '{target_workspace}'")
+                logger.debug(
+                    f"OBO check: api_key not allowed for workspace '{target_workspace}'"
+                )
             return allowed
 
         # Handle OAuth2 client

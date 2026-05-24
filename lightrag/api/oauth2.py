@@ -132,9 +132,7 @@ class KeycloakClient:
         """Remove expired states from the store."""
         now = datetime.utcnow()
         expired = [
-            state
-            for state, data in self._state_store.items()
-            if data["expires"] <= now
+            state for state, data in self._state_store.items() if data["expires"] <= now
         ]
         for state in expired:
             del self._state_store[state]

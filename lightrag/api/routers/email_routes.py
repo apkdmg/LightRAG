@@ -24,7 +24,6 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime
 from email import policy
-from email.message import EmailMessage
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -170,7 +169,11 @@ class EmailParser:
         cc_raw = msg.get("Cc", "")
         subject = msg.get("Subject", "(No Subject)")
         date_str = msg.get("Date", "")
-        thread_id = msg.get("Thread-Index") or msg.get("References", "").split()[0] if msg.get("References") else None
+        thread_id = (
+            msg.get("Thread-Index") or msg.get("References", "").split()[0]
+            if msg.get("References")
+            else None
+        )
 
         # Parse To and CC addresses
         to_addresses = EmailParser._parse_addresses(to_raw)
@@ -181,6 +184,7 @@ class EmailParser:
         if date_str:
             try:
                 from email.utils import parsedate_to_datetime
+
                 date = parsedate_to_datetime(date_str)
             except (ValueError, TypeError):
                 pass
@@ -201,13 +205,19 @@ class EmailParser:
                 if content_id:
                     content_id = content_id.strip("<>")
 
-                if content_type == "text/plain" and "attachment" not in content_disposition:
+                if (
+                    content_type == "text/plain"
+                    and "attachment" not in content_disposition
+                ):
                     payload = part.get_payload(decode=True)
                     if payload:
                         charset = part.get_content_charset() or "utf-8"
                         body_text += payload.decode(charset, errors="replace")
 
-                elif content_type == "text/html" and "attachment" not in content_disposition:
+                elif (
+                    content_type == "text/html"
+                    and "attachment" not in content_disposition
+                ):
                     payload = part.get_payload(decode=True)
                     if payload:
                         charset = part.get_content_charset() or "utf-8"
@@ -225,7 +235,9 @@ class EmailParser:
                         # Fallback to magic bytes detection for images
                         if not ext and payload:
                             ext = detect_image_type_from_bytes(payload) or ""
-                        filename = f"inline_{len(attachments) + len(inline_images)}{ext}"
+                        filename = (
+                            f"inline_{len(attachments) + len(inline_images)}{ext}"
+                        )
 
                     attachment = ParsedAttachment(
                         filename=filename,
@@ -237,7 +249,10 @@ class EmailParser:
 
                     if attachment.is_inline and content_type.startswith("image/"):
                         inline_images.append(attachment)
-                    elif "attachment" in content_disposition or not content_type.startswith("text/"):
+                    elif (
+                        "attachment" in content_disposition
+                        or not content_type.startswith("text/")
+                    ):
                         attachments.append(attachment)
         else:
             # Single part message
@@ -280,6 +295,7 @@ class EmailParser:
     def _generate_message_id() -> str:
         """Generate a unique message ID."""
         import uuid
+
         return f"<{uuid.uuid4()}@lightrag.local>"
 
 
@@ -440,7 +456,9 @@ class EmailIngestionService:
                     documents_created += 1
                     inline_processed += 1
             except Exception as e:
-                logger.warning(f"Failed to process inline image {inline_img.filename}: {e}")
+                logger.warning(
+                    f"Failed to process inline image {inline_img.filename}: {e}"
+                )
 
         # 3. Process attachments
         attachments_processed = 0
@@ -454,7 +472,9 @@ class EmailIngestionService:
                     documents_created += 1
                     attachments_processed += 1
             except Exception as e:
-                logger.warning(f"Failed to process attachment {attachment.filename}: {e}")
+                logger.warning(
+                    f"Failed to process attachment {attachment.filename}: {e}"
+                )
 
         return {
             "bundle_id": bundle_id,
@@ -480,10 +500,12 @@ class EmailIngestionService:
         # Build attachment list
         all_attachments = email.attachments + email.inline_images
         if all_attachments:
-            attachment_list = "\n".join([
-                f"  - {att.filename} ({att.content_type}, {'inline' if att.is_inline else 'attachment'})"
-                for att in all_attachments
-            ])
+            attachment_list = "\n".join(
+                [
+                    f"  - {att.filename} ({att.content_type}, {'inline' if att.is_inline else 'attachment'})"
+                    for att in all_attachments
+                ]
+            )
         else:
             attachment_list = "  (No attachments)"
 
@@ -583,10 +605,7 @@ Content:
                 "summarize the key information."
             )
 
-            response = await self.vision_model_func(
-                prompt,
-                image_data=image_b64
-            )
+            response = await self.vision_model_func(prompt, image_data=image_b64)
 
             return response if response else f"[Image: {image.filename}]"
 
@@ -600,7 +619,12 @@ Content:
         content_type = attachment.content_type.lower()
 
         # Handle text-based files
-        if content_type in ("text/plain", "text/csv", "text/markdown", "application/json"):
+        if content_type in (
+            "text/plain",
+            "text/csv",
+            "text/markdown",
+            "application/json",
+        ):
             try:
                 return attachment.content.decode("utf-8", errors="replace")
             except Exception:
@@ -937,7 +961,9 @@ the LightRAG knowledge graph under the shared Bundle ID.
                     temp_file_path, file_size = await stream_upload_to_temp_file(
                         email_file, max_size=MAX_EMAIL_SIZE_BYTES
                     )
-                    logger.info(f"Uploaded {file_size / (1024*1024):.2f}MB to temp file")
+                    logger.info(
+                        f"Uploaded {file_size / (1024*1024):.2f}MB to temp file"
+                    )
 
                     # Parse in thread pool to avoid blocking
                     parsed_email = await parse_eml_from_file_async(temp_file_path)
@@ -951,6 +977,7 @@ the LightRAG knowledge graph under the shared Bundle ID.
                 # Mode 2: Structured input
                 logger.info("Processing structured email input")
                 import json
+
                 try:
                     meta_dict = json.loads(metadata)
                     email_meta = EmailMetadata(**meta_dict)
@@ -965,33 +992,41 @@ the LightRAG knowledge graph under the shared Bundle ID.
                 for att_file in attachments:
                     if att_file.filename:
                         content = await att_file.read()
-                        parsed_attachments.append(ParsedAttachment(
-                            filename=att_file.filename,
-                            content_type=att_file.content_type or "application/octet-stream",
-                            content=content,
-                            is_inline=False,
-                        ))
+                        parsed_attachments.append(
+                            ParsedAttachment(
+                                filename=att_file.filename,
+                                content_type=att_file.content_type
+                                or "application/octet-stream",
+                                content=content,
+                                is_inline=False,
+                            )
+                        )
 
                 # Process inline image files
                 parsed_inline = []
                 for img_file in inline_images:
                     if img_file.filename:
                         content = await img_file.read()
-                        parsed_inline.append(ParsedAttachment(
-                            filename=img_file.filename,
-                            content_type=img_file.content_type or "image/png",
-                            content=content,
-                            is_inline=True,
-                        ))
+                        parsed_inline.append(
+                            ParsedAttachment(
+                                filename=img_file.filename,
+                                content_type=img_file.content_type or "image/png",
+                                content=content,
+                                is_inline=True,
+                            )
+                        )
 
                 # Build ParsedEmail from structured input
                 parsed_email = ParsedEmail(
-                    message_id=email_meta.message_id or EmailParser._generate_message_id(),
+                    message_id=email_meta.message_id
+                    or EmailParser._generate_message_id(),
                     from_address=email_meta.from_address,
                     to_addresses=email_meta.to_addresses,
                     cc_addresses=email_meta.cc_addresses,
                     subject=email_meta.subject,
-                    date=datetime.fromisoformat(email_meta.date) if email_meta.date else None,
+                    date=datetime.fromisoformat(email_meta.date)
+                    if email_meta.date
+                    else None,
                     body_text=body_text or email_meta.body_text or "",
                     body_html=email_meta.body_html,
                     inline_images=parsed_inline,
@@ -1006,7 +1041,9 @@ the LightRAG knowledge graph under the shared Bundle ID.
                 )
 
             # Generate bundle_id and track_id for background processing
-            bundle_id = hashlib.sha256(parsed_email.message_id.encode()).hexdigest()[:12]
+            bundle_id = hashlib.sha256(parsed_email.message_id.encode()).hexdigest()[
+                :12
+            ]
             bundle_id = f"email_{bundle_id}"
             track_id = generate_track_id("email")
 
@@ -1018,7 +1055,9 @@ the LightRAG knowledge graph under the shared Bundle ID.
             ):
                 """Background task to ingest email."""
                 try:
-                    logger.info(f"[{t_id}] Starting background email ingestion for: {email.subject}")
+                    logger.info(
+                        f"[{t_id}] Starting background email ingestion for: {email.subject}"
+                    )
                     result = await svc.ingest_email(email)
                     logger.info(
                         f"[{t_id}] Email ingestion completed: {result['documents_created']} documents, "

@@ -2111,9 +2111,7 @@ def create_app(args):
         logout_url = keycloak_client.get_logout_url(post_logout_uri)
 
         # Create redirect response and clear cookies
-        response = RedirectResponse(
-            url=logout_url, status_code=status.HTTP_302_FOUND
-        )
+        response = RedirectResponse(url=logout_url, status_code=status.HTTP_302_FOUND)
 
         # Clear both authentication cookies
         response.delete_cookie(key="lightrag_token", path="/")
@@ -2142,7 +2140,9 @@ def create_app(args):
         auth_header = request.headers.get("authorization", "")
         if auth_header:
             if len(auth_header) > 30:
-                auth_header = f"{auth_header[:20]}...{auth_header[-10:]} (len={len(auth_header)})"
+                auth_header = (
+                    f"{auth_header[:20]}...{auth_header[-10:]} (len={len(auth_header)})"
+                )
 
         # Get relevant headers
         relevant_headers = {

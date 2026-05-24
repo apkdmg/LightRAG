@@ -188,8 +188,7 @@ class OpenAIAPI:
                 # Get the last user message as query
                 query = messages[-1].content
                 conversation_history = [
-                    {"role": msg.role, "content": msg.content}
-                    for msg in messages[:-1]
+                    {"role": msg.role, "content": msg.content} for msg in messages[:-1]
                 ]
 
                 # Parse query mode from message prefix
