@@ -20,6 +20,7 @@ with Docker, Docker Compose, or Podman.
 - [Configuration](#configuration)
 - [Data persistence](#data-persistence)
 - [Full stack with storage backends](#full-stack-with-storage-backends)
+- [No-GPU preset](#no-gpu-preset)
 - [Podman](#podman)
 - [Production notes](#production-notes)
 - [Verifying the signed image](#verifying-the-signed-image)
@@ -53,6 +54,7 @@ Don't have Docker yet? See the official install docs:
 | **2. Docker Compose** | Standard deployment, easy upgrades | Yes |
 | **3. Build it yourself** | You've modified the source | Yes |
 | **Full stack** (Compose) | All-in-one with PostgreSQL / Neo4j / Milvus | Yes |
+| **No-GPU preset** | Bundled Postgres + Neo4j, cloud LLM / embedding / reranker | Yes |
 
 ---
 
@@ -491,6 +493,104 @@ Reruns preserve manual edits inside wizard-managed service blocks; to force
 regeneration from the templates, use `make env-base-rewrite` and
 `make env-storage-rewrite`. See [InteractiveSetup.md](./InteractiveSetup.md)
 for the full target reference.
+
+---
+
+## No-GPU preset
+
+For deployments without GPU hardware, the bundled `docker-compose-no-gpu.yml`
+runs **3 containers** — LightRAG, PostgreSQL (with pgvector, also serving KV +
+DOC_STATUS), and Neo4j. Embeddings, reranker, and the LLM all come from cloud
+APIs (e.g. OpenAI + Jina), so nothing local needs a GPU.
+
+### What's in it
+
+| Service | Image | Ports | Role |
+|---------|-------|-------|------|
+| `lightrag` | `ghcr.io/apkdmg/lightrag:latest` | `9621` | API + WebUI |
+| `postgres` | `pgvector/pgvector:pg18` | `127.0.0.1:5432` (DBA-accessible) | KV + DOC_STATUS + VECTORS |
+| `neo4j` | `neo4j:5-community` | `127.0.0.1:7474`, `127.0.0.1:7687` (DBA-accessible) | Graph |
+
+Resource baseline: roughly 4 GB RAM and 10 GB disk for a starter deployment.
+
+### Configure `.env`
+
+A complete template is provided at
+[`env.docker-compose-no-gpu`](../env.docker-compose-no-gpu). Copy and edit:
+
+```bash
+cp env.docker-compose-no-gpu .env
+# edit .env — at minimum:
+#   TOKEN_SECRET, POSTGRES_PASSWORD, NEO4J_PASSWORD,
+#   LLM_BINDING_API_KEY, EMBEDDING_BINDING_API_KEY, RERANK_BINDING_API_KEY
+```
+
+Storage selectors are pre-set in the template:
+
+```bash
+KV_STORAGE=PGKVStorage
+VECTOR_STORAGE=PGVectorStorage
+GRAPH_STORAGE=Neo4JStorage
+DOC_STATUS_STORAGE=PGDocStatusStorage
+```
+
+The reranker uses the Cohere-compatible binding pointed at Jina's hosted
+endpoint:
+
+```bash
+RERANK_BINDING=cohere
+RERANK_MODEL=jina-reranker-v2-base-multilingual
+RERANK_BINDING_HOST=https://api.jina.ai/v1/rerank
+RERANK_BINDING_API_KEY=jina_...
+```
+
+### Bring it up
+
+```bash
+docker compose -f docker-compose-no-gpu.yml up -d
+docker compose -f docker-compose-no-gpu.yml ps        # wait for healthy
+docker compose -f docker-compose-no-gpu.yml logs -f lightrag
+```
+
+LightRAG enables the `pgvector` extension on first connect — no manual SQL
+required.
+
+### DBA access
+
+Both database ports are published to **localhost** by default, so DBAs can
+connect from the host with standard tooling:
+
+```bash
+# Postgres — psql, pg_dump, pgAdmin, DBeaver, DataGrip
+psql -h 127.0.0.1 -U rag -d lightrag
+pg_dump -h 127.0.0.1 -U rag lightrag > backup.sql
+
+# Neo4j Browser (web UI)
+open http://127.0.0.1:7474
+
+# Neo4j Bolt — cypher-shell, official drivers, Neo4j Desktop
+cypher-shell -a bolt://127.0.0.1:7687 -u neo4j -p "$NEO4J_PASSWORD"
+```
+
+To expose the DB ports on your **admin network** rather than localhost, set in
+`.env`:
+
+```bash
+POSTGRES_HOST_BIND=10.0.0.5     # the host's admin-network IP, or 0.0.0.0
+NEO4J_HOST_BIND=10.0.0.5
+```
+
+When you bind to anything other than `127.0.0.1`, restrict the listening port
+at the host firewall, use strong credentials (not the default `rag/rag`), and
+put the Neo4j Browser behind a reverse proxy with HTTPS.
+
+### When to choose this preset
+
+| If you... | Use |
+|-----------|-----|
+| Have no GPU; want LightRAG's data on infra you fully control (DBA + in-house backups) | **This preset** |
+| Have NVIDIA GPU and want to run vLLM / Milvus locally | [Full stack](#full-stack-with-storage-backends) |
+| Use cloud-managed databases (RDS / Neo4j Aura / Zilliz) | The basic [Docker Compose](#method-2--docker-compose-recommended) — point `.env` at the cloud endpoints |
 
 ---
 
