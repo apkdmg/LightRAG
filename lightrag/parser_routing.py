@@ -528,6 +528,11 @@ def _filename_hint_match(
     raises instead of falling back.
     """
     basename = Path(file_path).name
+    # Defensive cap (CodeQL py/polynomial-redos): the regex is polynomial in the
+    # worst case on adversarial inputs (long `.[xx...x`); filenames are OS-bounded
+    # already, but cap formally so it can't degrade performance.
+    if len(basename) > 256:
+        return
     m = _PARSER_HINT_RE.search(basename)
     if not m:
         return None
@@ -563,6 +568,11 @@ def _validate_filename_hint_for_resolution(
 ) -> None:
     """Fail fast for malformed filename hints on ingestion entrypoints."""
     basename = Path(file_path).name
+    # Defensive cap (CodeQL py/polynomial-redos): the regex is polynomial in the
+    # worst case on adversarial inputs (long `.[xx...x`); filenames are OS-bounded
+    # already, but cap formally so it can't degrade performance.
+    if len(basename) > 256:
+        return
     m = _PARSER_HINT_RE.search(basename)
     if not m:
         return

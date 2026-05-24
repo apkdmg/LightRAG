@@ -728,8 +728,11 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
                                 if chunk:  # Only send non-empty content
                                     yield f"{json.dumps({'response': chunk})}\n"
                         except Exception as e:
-                            logger.error(f"Streaming error: {str(e)}")
-                            yield f"{json.dumps({'error': str(e)})}\n"
+                            # CodeQL py/stack-trace-exposure: do not yield str(e) to the
+                            # client (it can include internal paths / hostnames). Log
+                            # details server-side and return a generic message.
+                            logger.error(f"Streaming error: {e}", exc_info=True)
+                            yield f"{json.dumps({'error': 'Streaming failed; see server logs for details.'})}\n"
                 else:
                     # Non-streaming mode: send complete response in one message
                     response_content = llm_response.get("content", "")

@@ -18,7 +18,7 @@ import warnings
 from dataclasses import dataclass
 from datetime import datetime
 from functools import wraps
-from hashlib import md5
+from hashlib import sha256
 from pathlib import Path
 from typing import (
     Any,
@@ -641,11 +641,11 @@ def compute_args_hash(*args: Any) -> str:
     # Use 'replace' error handling to safely encode problematic Unicode characters
     # This replaces invalid characters with Unicode replacement character (U+FFFD)
     try:
-        return md5(args_str.encode("utf-8")).hexdigest()
+        return sha256(args_str.encode("utf-8")).hexdigest()
     except UnicodeEncodeError:
         # Handle surrogate characters and other encoding issues
         safe_bytes = args_str.encode("utf-8", errors="replace")
-        return md5(safe_bytes).hexdigest()
+        return sha256(safe_bytes).hexdigest()
 
 
 def _serialize_cache_variant(value: Any) -> str:

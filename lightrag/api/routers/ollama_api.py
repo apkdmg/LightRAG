@@ -387,13 +387,15 @@ class OllamaAPI:
                                         }
                                         yield f"{json.dumps(data, ensure_ascii=False)}\n"
                             except (asyncio.CancelledError, Exception) as e:
-                                error_msg = str(e)
                                 if isinstance(e, asyncio.CancelledError):
                                     error_msg = "Stream was cancelled by server"
                                 else:
-                                    error_msg = f"Provider error: {error_msg}"
+                                    # CodeQL py/stack-trace-exposure: do not include
+                                    # str(e) in the client-facing message. Log details
+                                    # server-side, return a generic provider error.
+                                    error_msg = "Provider error; see server logs for details."
 
-                                logger.error(f"Stream error: {error_msg}")
+                                logger.error(f"Stream error: {e}", exc_info=True)
 
                                 # Send error message to client
                                 error_data = {
@@ -625,13 +627,15 @@ class OllamaAPI:
                                         }
                                         yield f"{json.dumps(data, ensure_ascii=False)}\n"
                             except (asyncio.CancelledError, Exception) as e:
-                                error_msg = str(e)
                                 if isinstance(e, asyncio.CancelledError):
                                     error_msg = "Stream was cancelled by server"
                                 else:
-                                    error_msg = f"Provider error: {error_msg}"
+                                    # CodeQL py/stack-trace-exposure: do not include
+                                    # str(e) in the client-facing message. Log details
+                                    # server-side, return a generic provider error.
+                                    error_msg = "Provider error; see server logs for details."
 
-                                logger.error(f"Stream error: {error_msg}")
+                                logger.error(f"Stream error: {e}", exc_info=True)
 
                                 # Send error message to client
                                 error_data = {
