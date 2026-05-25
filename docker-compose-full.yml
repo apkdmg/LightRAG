@@ -35,6 +35,21 @@ services:
       INPUT_DIR: "/app/data/inputs"
       PROMPT_DIR: "/app/data/prompts"
       MEMGRAPH_URI: "bolt://host.docker.internal:7687"
+      # Storage selectors — pinned by this preset (the whole point of the
+      # bundled Postgres + Neo4j + Milvus). Set at the Docker level because
+      # LightRAG's config reads these at module-import time, before
+      # python-dotenv loads /app/.env (same hardening as no-GPU preset).
+      LIGHTRAG_KV_STORAGE: "PGKVStorage"
+      LIGHTRAG_VECTOR_STORAGE: "MilvusVectorDBStorage"
+      LIGHTRAG_GRAPH_STORAGE: "Neo4JStorage"
+      LIGHTRAG_DOC_STATUS_STORAGE: "PGDocStatusStorage"
+      # Postgres credentials forwarded from .env via Compose substitution.
+      POSTGRES_USER: "${POSTGRES_USER}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD}"
+      POSTGRES_DATABASE: "${POSTGRES_DATABASE:-lightrag}"
+      # Neo4j credentials forwarded from .env via Compose substitution.
+      NEO4J_USERNAME: "${NEO4J_USERNAME}"
+      NEO4J_PASSWORD: "${NEO4J_PASSWORD}"
       # Document parsing routed to the bundled Docling (CUDA-13 build).
       LIGHTRAG_PARSER: "pdf:docling,docx:docling,pptx:docling,xlsx:docling"
       DOCLING_ENDPOINT: "http://docling:5001/v1/convert/file/async"
