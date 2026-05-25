@@ -1,12 +1,13 @@
 # No-GPU LightRAG preset
 #
-# Three containers:
+# Four containers:
 #   - lightrag  : the LightRAG API + WebUI (CPU)
 #   - postgres  : pgvector — serves KV + DOC_STATUS + VECTORS
 #   - neo4j     : graph storage
+#   - docling   : docling-serve — CPU PDF/Office parser with OCR
 #
 # Embedding, reranker, and LLM are expected to be cloud APIs (e.g. OpenAI +
-# Jina), so nothing here needs a GPU.
+# Jina), so nothing here needs a GPU. Docling runs CPU-only too.
 #
 # Database ports are published to 127.0.0.1 by default so a DBA can connect
 # from the same host via psql / pg_dump / pgAdmin / Neo4j Browser /
@@ -67,6 +68,8 @@ services:
         condition: service_healthy
       neo4j:
         condition: service_healthy
+      docling:
+        condition: service_started
 
   postgres:
     # pgvector-enabled Postgres — used here for KV, DOC_STATUS, and VECTORS.
@@ -109,6 +112,20 @@ services:
       start_period: 10s
     restart: unless-stopped
 
+  docling:
+    # docling-serve (CPU build) — converts PDFs / Office docs to structured
+    # text with OCR. lightrag reaches it at http://docling:5001/.
+    # See env vars: DOCLING_ENDPOINT, DOCLING_DO_OCR, DOCLING_OCR_LANG, etc.
+    image: quay.io/ds4sd/docling-serve-cpu:latest
+    ports:
+      - "${DOCLING_HOST_BIND:-127.0.0.1}:${DOCLING_HOST_PORT:-5001}:5001"
+    environment:
+      DOCLING_SERVE_ENABLE_UI: "false"
+    volumes:
+      - docling_cache:/root/.cache
+    restart: unless-stopped
+
 volumes:
   postgres_data:
   neo4j_data:
+  docling_cache:
