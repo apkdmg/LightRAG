@@ -116,7 +116,7 @@ services:
     # docling-serve (CPU build) — converts PDFs / Office docs to structured
     # text with OCR. lightrag reaches it at http://docling:5001/.
     # See env vars: DOCLING_ENDPOINT, DOCLING_DO_OCR, DOCLING_OCR_LANG, etc.
-    image: quay.io/ds4sd/docling-serve-cpu:latest
+    image: quay.io/docling-project/docling-serve-cpu:latest
     ports:
       - "${DOCLING_HOST_BIND:-127.0.0.1}:${DOCLING_HOST_PORT:-5001}:5001"
     environment:
