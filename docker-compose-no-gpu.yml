@@ -69,7 +69,7 @@ services:
       neo4j:
         condition: service_healthy
       docling:
-        condition: service_started
+        condition: service_healthy
 
   postgres:
     # pgvector-enabled Postgres — used here for KV, DOC_STATUS, and VECTORS.
@@ -116,13 +116,28 @@ services:
     # docling-serve (CPU build) — converts PDFs / Office docs to structured
     # text with OCR. lightrag reaches it at http://docling:5001/.
     # See env vars: DOCLING_ENDPOINT, DOCLING_DO_OCR, DOCLING_OCR_LANG, etc.
-    image: quay.io/docling-project/docling-serve-cpu:latest
+    #
+    # Pinned to v1.4.1 (bundles docling==2.51.0). Newer images (v1.6.0+, and
+    # :latest as of 2026-05) crash with SIGFPE in a compiled module during PDF
+    # layout/OCR — reproducible on real scanned PDFs, dumped to
+    # /opt/app-root/src/cysignals_crash_logs/. v1.4.1's docling lib version is
+    # adjacent to a known-good (2.50.0) deployment.
+    image: quay.io/docling-project/docling-serve-cpu:v1.4.1
     ports:
       - "${DOCLING_HOST_BIND:-127.0.0.1}:${DOCLING_HOST_PORT:-5001}:5001"
     environment:
       DOCLING_SERVE_ENABLE_UI: "false"
     volumes:
       - docling_cache:/root/.cache
+    healthcheck:
+      # docling-serve-cpu can take 60–90s to bind :5001 on cold start (model
+      # warmup). lightrag.depends_on uses service_healthy so the API doesn't
+      # start submitting parse jobs against a closed port.
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:5001/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 30s
     restart: unless-stopped
 
 volumes:
