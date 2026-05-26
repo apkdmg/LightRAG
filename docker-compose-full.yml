@@ -52,7 +52,9 @@ services:
       NEO4J_PASSWORD: "${NEO4J_PASSWORD}"
       # Document parsing routed to the bundled Docling (CUDA-13 build).
       LIGHTRAG_PARSER: "pdf:docling,docx:docling,pptx:docling,xlsx:docling"
-      DOCLING_ENDPOINT: "http://docling:5001/v1/convert/file/async"
+      # Base URL only — LightRAG's docling client appends /v1/convert/file/async
+      # itself. Passing the full path produces a double-appended broken URL.
+      DOCLING_ENDPOINT: "http://docling:5001"
     depends_on:
       vllm-embed:
         condition: service_healthy
@@ -65,7 +67,7 @@ services:
       milvus:
         condition: service_healthy
       docling:
-        condition: service_started
+        condition: service_healthy
 
   vllm-embed:
     image: vllm/vllm-openai:latest
@@ -252,6 +254,14 @@ services:
     # docling-serve (CUDA 13.0 build) — GPU-accelerated PDF / Office parsing
     # with OCR. lightrag reaches it at http://docling:5001/. Tune via
     # DOCLING_ENDPOINT, DOCLING_DO_OCR, DOCLING_OCR_LANG, etc. in .env.
+    #
+    # Pinned to 1.12.0 (latest cu130 tag as of 2026-05). Note: the CPU variants
+    # v1.6.0+ / :latest hit a SIGFPE in a compiled module during PDF layout/OCR
+    # on real scanned PDFs (cysignals crash dumps under
+    # /opt/app-root/src/cysignals_crash_logs/). cu130:1.12.0 has not been
+    # observed to fail this way on our test corpus, but if you see GPU crashes
+    # on similar inputs, drop back to an earlier cu130 tag (e.g. 1.10.x) for
+    # parity with the no-GPU preset's v1.4.1 / docling 2.51.0.
     image: quay.io/docling-project/docling-serve-cu130:1.12.0
     runtime: nvidia
     deploy:
@@ -267,6 +277,16 @@ services:
       DOCLING_SERVE_ENABLE_UI: "false"
     volumes:
       - docling_cache:/root/.cache
+    healthcheck:
+      # docling-serve cold start (model warmup + CUDA init + first-run model
+      # download into docling_cache) can take 60–90s. lightrag.depends_on uses
+      # service_healthy so the API doesn't start submitting parse jobs against
+      # a closed port.
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:5001/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 30s
     restart: unless-stopped
 
 volumes:
