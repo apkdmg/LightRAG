@@ -35,6 +35,24 @@ services:
       INPUT_DIR: "/app/data/inputs"
       PROMPT_DIR: "/app/data/prompts"
       MEMGRAPH_URI: "bolt://host.docker.internal:7687"
+      # Storage selectors — pinned by this preset (the whole point of the
+      # bundled Postgres + Neo4j + Milvus). Set at the Docker level because
+      # LightRAG's config reads these at module-import time, before
+      # python-dotenv loads /app/.env (same hardening as no-GPU preset).
+      LIGHTRAG_KV_STORAGE: "PGKVStorage"
+      LIGHTRAG_VECTOR_STORAGE: "MilvusVectorDBStorage"
+      LIGHTRAG_GRAPH_STORAGE: "Neo4JStorage"
+      LIGHTRAG_DOC_STATUS_STORAGE: "PGDocStatusStorage"
+      # Postgres credentials forwarded from .env via Compose substitution.
+      POSTGRES_USER: "${POSTGRES_USER}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD}"
+      POSTGRES_DATABASE: "${POSTGRES_DATABASE:-lightrag}"
+      # Neo4j credentials forwarded from .env via Compose substitution.
+      NEO4J_USERNAME: "${NEO4J_USERNAME}"
+      NEO4J_PASSWORD: "${NEO4J_PASSWORD}"
+      # Document parsing routed to the bundled Docling (CUDA-13 build).
+      LIGHTRAG_PARSER: "pdf:docling,docx:docling,pptx:docling,xlsx:docling"
+      DOCLING_ENDPOINT: "http://docling:5001/v1/convert/file/async"
     depends_on:
       vllm-embed:
         condition: service_healthy
@@ -46,6 +64,8 @@ services:
         condition: service_healthy
       milvus:
         condition: service_healthy
+      docling:
+        condition: service_started
 
   vllm-embed:
     image: vllm/vllm-openai:latest
@@ -228,6 +248,27 @@ services:
       retries: 3
     restart: unless-stopped
 
+  docling:
+    # docling-serve (CUDA 13.0 build) — GPU-accelerated PDF / Office parsing
+    # with OCR. lightrag reaches it at http://docling:5001/. Tune via
+    # DOCLING_ENDPOINT, DOCLING_DO_OCR, DOCLING_OCR_LANG, etc. in .env.
+    image: quay.io/docling-project/docling-serve-cu130:1.12.0
+    runtime: nvidia
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    ports:
+      - "${DOCLING_HOST_BIND:-127.0.0.1}:${DOCLING_HOST_PORT:-5001}:5001"
+    environment:
+      DOCLING_SERVE_ENABLE_UI: "false"
+    volumes:
+      - docling_cache:/root/.cache
+    restart: unless-stopped
+
 volumes:
   vllm_embed_cache:
   vllm_rerank_cache:
@@ -236,3 +277,4 @@ volumes:
   milvus_data:
   milvus-etcd_data:
   milvus-minio_data:
+  docling_cache:
