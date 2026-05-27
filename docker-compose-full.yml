@@ -51,7 +51,7 @@ services:
       NEO4J_USERNAME: "${NEO4J_USERNAME}"
       NEO4J_PASSWORD: "${NEO4J_PASSWORD}"
       # Document parsing routed to the bundled Docling (CUDA-13 build).
-      LIGHTRAG_PARSER: "pdf:docling,docx:docling,pptx:docling,xlsx:docling"
+      LIGHTRAG_PARSER: "pdf:docling,docx:native,pptx:docling,xlsx:docling"
       # Base URL only — LightRAG's docling client appends /v1/convert/file/async
       # itself. Passing the full path produces a double-appended broken URL.
       DOCLING_ENDPOINT: "http://docling:5001"
