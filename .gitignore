@@ -72,6 +72,12 @@ ignore_this.txt
 /book.txt
 /ag2_demo_workdir/
 
+# Upstream catch-up baselines (captured logs, not source of truth)
+/baselines/
+
+# Storage snapshots produced by scripts/backup/pre-merge-snapshot.sh
+/backups/
+
 # Frontend build output (built during PyPI release)
 /lightrag/api/webui/
 
