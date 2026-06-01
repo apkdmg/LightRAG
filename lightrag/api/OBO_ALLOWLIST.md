@@ -24,6 +24,9 @@ OBO_API_KEY_WORKSPACES=*
 
 # Default policy for unlisted clients
 OBO_DEFAULT_POLICY=deny
+
+# Grant the global admin role to these service-account client_ids
+OBO_ADMIN_CLIENTS=admin-tool
 ```
 
 ## Config Options
@@ -34,6 +37,7 @@ OBO_DEFAULT_POLICY=deny
 | `OBO_API_KEY_ALLOWED` | `false` | Can shared X-API-Key do OBO? |
 | `OBO_API_KEY_WORKSPACES` | `` | Workspaces for API key: `*` or `ws1,ws2` |
 | `OBO_DEFAULT_POLICY` | `deny` | Action for unlisted clients: `deny` or `allow` |
+| `OBO_ADMIN_CLIENTS` | `` | Service-account client_ids granted the global admin role (see below) |
 
 ## OBO_ALLOWED_CLIENTS Format
 
@@ -64,6 +68,59 @@ OBO_ALLOWED_CLIENTS=[partner-app:tenant_a,tenant_b]
 
 ```
 OBO_ALLOWED_CLIENTS=[backend-service:*],[partner-app:tenant_a,tenant_b],[admin-tool:*]
+```
+
+## OBO_ADMIN_CLIENTS (service-account admin role)
+
+`OBO_ADMIN_CLIENTS` grants the **global `admin` role** to the listed
+service-account client_ids (the token's `azp` / `clientId` claim from a
+client-credentials / service-account token).
+
+```
+# Comma-separated client_ids. No wildcard ("*" is NOT supported for admin).
+OBO_ADMIN_CLIENTS=n8n,backend-service
+```
+
+- **Format:** comma-separated `client_id` values; whitespace is stripped and
+  empty entries are dropped. There is **no workspace dimension** and **no `*`
+  wildcard** — admin is a flat, global allowlist (kept deliberately strict).
+- **Hot-reloaded:** like the rest of `.obo_allowlist`, changes apply within
+  60 seconds (no restart). It flows through the same file-mtime reload path.
+- **Default (empty):** NO service account is granted admin; client-credentials
+  tokens authenticate as a normal `user`.
+
+### Role vs scope (admin vs OBO)
+
+These two controls answer different questions:
+
+- **`OBO_ADMIN_CLIENTS` → role.** Grants the `admin` role, which gates the
+  global admin routes (`admin_routes.py`). This is a process-wide capability.
+- **`OBO_ALLOWED_CLIENTS` → scope.** Gates *which workspace data* a client may
+  touch via the `X-Target-Workspace` header (per-workspace OBO).
+
+A client can have one, both, or neither.
+
+### Precedence with the deprecated env var
+
+The admin allowlist is resolved with this precedence (first match wins; once a
+source is present it is authoritative — later sources are ignored):
+
+1. `OBO_ADMIN_CLIENTS` key in the `.obo_allowlist` file.
+2. `OBO_ADMIN_CLIENTS` environment variable.
+3. `OAUTH2_SERVICE_ACCOUNT_ADMIN_CLIENTS` environment variable
+   (**DEPRECATED**; logs a one-time warning when used). Migrate this to
+   `OBO_ADMIN_CLIENTS` in `.obo_allowlist`.
+4. Empty (no admin).
+
+Note: if the file defines `OBO_ADMIN_CLIENTS` (even with a different/empty
+list), the file is authoritative and the env vars are ignored for admin.
+
+### Example: both controls together
+
+```
+OBO_DEFAULT_POLICY=deny
+OBO_ALLOWED_CLIENTS=[n8n:space1]   # which workspace data n8n may touch
+OBO_ADMIN_CLIENTS=n8n              # grant n8n the admin role (global admin routes)
 ```
 
 ## Full Examples
@@ -99,6 +156,8 @@ OBO_API_KEY_WORKSPACES=*
 |----------|---------|-------------|
 | `OBO_ALLOWLIST_PATH` | `{working_dir}/.obo_allowlist` | Config file path |
 | `OBO_DEFAULT_POLICY` | `deny` | Fallback if no config file |
+| `OBO_ADMIN_CLIENTS` | `` | Fallback admin allowlist if not set in the file |
+| `OAUTH2_SERVICE_ACCOUNT_ADMIN_CLIENTS` | `` | DEPRECATED admin allowlist fallback (use `OBO_ADMIN_CLIENTS`) |
 
 ## Behavior
 

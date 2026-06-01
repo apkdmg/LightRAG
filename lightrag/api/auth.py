@@ -283,18 +283,15 @@ def validate_any_token(token: str) -> dict:
             if keycloak_client.is_service_account_token(payload):
                 client_id = payload.get("clientId") or payload.get("azp")
                 # Admin is granted ONLY to client IDs explicitly listed in the
-                # OAUTH2_SERVICE_ACCOUNT_ADMIN_CLIENTS allowlist. With the safe
-                # default (empty allowlist) NO service account becomes admin —
-                # any client-credentials token from the same realm authenticates
-                # as a normal "user", not a LightRAG admin.
-                admin_clients = {
-                    c.strip()
-                    for c in (
-                        global_args.oauth2_service_account_admin_clients or ""
-                    ).split(",")
-                    if c.strip()
-                }
-                if client_id and client_id in admin_clients:
+                # unified OBO admin allowlist (OBO_ADMIN_CLIENTS in the
+                # .obo_allowlist file, hot-reloaded; with a DEPRECATED fallback
+                # to the OAUTH2_SERVICE_ACCOUNT_ADMIN_CLIENTS env var). With the
+                # safe default (empty allowlist) NO service account becomes
+                # admin — any client-credentials token from the same realm
+                # authenticates as a normal "user", not a LightRAG admin.
+                from .obo_allowlist import check_admin_client
+
+                if check_admin_client(client_id):
                     role = "admin"
                     logger.info(
                         f"Service account granted admin role: client_id={client_id}"

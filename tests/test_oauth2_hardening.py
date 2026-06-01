@@ -4,9 +4,11 @@ Covers three security fixes:
 
 FIX #1 -- ``lightrag.api.auth.validate_any_token``: service-account /
 client-credentials tokens are granted ``role="admin"`` ONLY when their
-``clientId``/``azp`` is in the comma-separated allowlist
-``global_args.oauth2_service_account_admin_clients``
-(env ``OAUTH2_SERVICE_ACCOUNT_ADMIN_CLIENTS``); otherwise ``role="user"``.
+``clientId``/``azp`` is in the unified OBO admin allowlist resolved by
+``lightrag.api.obo_allowlist.check_admin_client`` -- which reads
+``OBO_ADMIN_CLIENTS`` from the ``.obo_allowlist`` file (hot-reloaded), then the
+``OBO_ADMIN_CLIENTS`` env var, then the DEPRECATED
+``OAUTH2_SERVICE_ACCOUNT_ADMIN_CLIENTS`` env var; otherwise ``role="user"``.
 
 FIX #2 -- ``lightrag.api.config.validate_auth_configuration`` (and the mirrored
 check in ``AuthHandler.__init__``): a strong ``TOKEN_SECRET`` is required
@@ -70,11 +72,30 @@ class _FakeKeycloakClient:
         return self._payload
 
 
+def _reset_obo_manager():
+    """Reset the module-level OBO allowlist manager singleton so the next call
+    rebuilds it (re-reading OBO_ALLOWLIST_PATH and env vars). The 60s cache TTL
+    lives inside the manager, so dropping the singleton is the cleanest way to
+    force a fresh read between tests."""
+    import lightrag.api.obo_allowlist as obo
+
+    obo._manager = None
+    # Reset the one-time deprecation-warning guard so fallback-path tests can
+    # observe behaviour deterministically regardless of ordering.
+    obo._deprecation_warned = False
+
+
 @pytest.fixture
 def auth_env(monkeypatch):
     """Provide a freshly-reloaded ``lightrag.api.auth`` bound to a controlled,
     mutable ``global_args``. Returns the synthetic namespace so each test can
-    tweak the allowlist / admin accounts in place."""
+    tweak the admin accounts in place.
+
+    Admin-for-service-account decisions now flow through the OBO allowlist
+    manager (``check_admin_client``), so the fixture also clears any admin env
+    vars and resets the manager singleton before and after each test. Tests that
+    want to grant admin point the manager at a temp ``.obo_allowlist`` via
+    ``_point_manager_at_file`` and/or set the (deprecated) env var."""
     import lightrag.api.config as config
 
     mock_global_args = SimpleNamespace(
@@ -88,6 +109,12 @@ def auth_env(monkeypatch):
     )
     monkeypatch.setattr(config, "global_args", mock_global_args)
 
+    # Ensure a clean admin-config baseline: no file, no env knobs.
+    monkeypatch.delenv("OBO_ALLOWLIST_PATH", raising=False)
+    monkeypatch.delenv("OBO_ADMIN_CLIENTS", raising=False)
+    monkeypatch.delenv("OAUTH2_SERVICE_ACCOUNT_ADMIN_CLIENTS", raising=False)
+    _reset_obo_manager()
+
     sys.modules.pop("lightrag.api.auth", None)
     auth = importlib.import_module("lightrag.api.auth")
     auth = importlib.reload(auth)
@@ -98,6 +125,7 @@ def auth_env(monkeypatch):
     yield SimpleNamespace(auth=auth, args=mock_global_args)
 
     sys.modules.pop("lightrag.api.auth", None)
+    _reset_obo_manager()
 
 
 def _patch_keycloak(monkeypatch, payload, is_service):
@@ -112,12 +140,21 @@ def _patch_keycloak(monkeypatch, payload, is_service):
     )
 
 
+def _point_manager_at_file(monkeypatch, tmp_path, contents: str):
+    """Write a temp ``.obo_allowlist`` with ``contents``, point the OBO manager
+    at it via ``OBO_ALLOWLIST_PATH``, and reset the singleton so it reloads."""
+    path = tmp_path / ".obo_allowlist"
+    path.write_text(contents)
+    monkeypatch.setenv("OBO_ALLOWLIST_PATH", str(path))
+    _reset_obo_manager()
+    return path
+
+
 def test_service_account_not_in_allowlist_is_user(auth_env, monkeypatch):
-    """A service-account token whose client_id is NOT in the allowlist => user."""
+    """A service-account token whose client_id is NOT in any admin config => user."""
     payload = {"clientId": "some-svc", "azp": "some-svc", "scope": "openid"}
     _patch_keycloak(monkeypatch, payload, is_service=True)
-    # Empty allowlist => no admin.
-    auth_env.args.oauth2_service_account_admin_clients = ""
+    # auth_env baseline already cleared all admin env vars and the file => no admin.
 
     info = auth_env.auth.validate_any_token("not-a-local-jwt")
 
@@ -126,11 +163,15 @@ def test_service_account_not_in_allowlist_is_user(auth_env, monkeypatch):
     assert info["metadata"]["auth_mode"] == "client_credentials"
 
 
-def test_service_account_in_allowlist_is_admin(auth_env, monkeypatch):
-    """Same token, but with its client_id added to the allowlist => admin."""
+def test_service_account_in_obo_admin_clients_file_is_admin(
+    auth_env, monkeypatch, tmp_path
+):
+    """client_id listed in OBO_ADMIN_CLIENTS of the .obo_allowlist file => admin."""
     payload = {"clientId": "some-svc", "azp": "some-svc", "scope": "openid"}
     _patch_keycloak(monkeypatch, payload, is_service=True)
-    auth_env.args.oauth2_service_account_admin_clients = "other-svc, some-svc , third-svc"
+    _point_manager_at_file(
+        monkeypatch, tmp_path, "OBO_ADMIN_CLIENTS=other-svc, some-svc , third-svc\n"
+    )
 
     info = auth_env.auth.validate_any_token("not-a-local-jwt")
 
@@ -138,16 +179,71 @@ def test_service_account_in_allowlist_is_admin(auth_env, monkeypatch):
     assert info["username"] == "service-account-some-svc"
 
 
-def test_service_account_azp_only_in_allowlist_is_admin(auth_env, monkeypatch):
-    """When only ``azp`` is present (no clientId), it is used for the allowlist."""
+def test_service_account_admin_via_deprecated_env_fallback(auth_env, monkeypatch):
+    """client_id only in the DEPRECATED env var (no file key) => still admin."""
     payload = {"azp": "azp-svc", "scope": "openid"}
     _patch_keycloak(monkeypatch, payload, is_service=True)
-    auth_env.args.oauth2_service_account_admin_clients = "azp-svc"
+    # No .obo_allowlist file and no OBO_ADMIN_CLIENTS env => deprecated fallback.
+    monkeypatch.setenv("OAUTH2_SERVICE_ACCOUNT_ADMIN_CLIENTS", "azp-svc")
+    _reset_obo_manager()
 
     info = auth_env.auth.validate_any_token("not-a-local-jwt")
 
     assert info["role"] == "admin"
     assert info["username"] == "service-account-azp-svc"
+
+
+def test_service_account_file_key_wins_over_deprecated_env(
+    auth_env, monkeypatch, tmp_path
+):
+    """Precedence: when the file defines OBO_ADMIN_CLIENTS, the file is
+    authoritative for admin_clients and the DEPRECATED env var is ignored. Here
+    the file does NOT list the client but the deprecated env does => user."""
+    payload = {"clientId": "some-svc", "azp": "some-svc", "scope": "openid"}
+    _patch_keycloak(monkeypatch, payload, is_service=True)
+    # File present (authoritative) but without our client; deprecated env has it.
+    _point_manager_at_file(monkeypatch, tmp_path, "OBO_ADMIN_CLIENTS=other-svc\n")
+    monkeypatch.setenv("OAUTH2_SERVICE_ACCOUNT_ADMIN_CLIENTS", "some-svc")
+    _reset_obo_manager()
+
+    info = auth_env.auth.validate_any_token("not-a-local-jwt")
+
+    assert info["role"] == "user"
+    assert info["username"] == "service-account-some-svc"
+
+
+def test_check_admin_client_file_and_env_paths(monkeypatch, tmp_path):
+    """Direct unit test of ``obo_allowlist.check_admin_client`` covering both the
+    file-config path and the deprecated-env-fallback path."""
+    import lightrag.api.obo_allowlist as obo
+
+    # Clean baseline.
+    monkeypatch.delenv("OBO_ALLOWLIST_PATH", raising=False)
+    monkeypatch.delenv("OBO_ADMIN_CLIENTS", raising=False)
+    monkeypatch.delenv("OAUTH2_SERVICE_ACCOUNT_ADMIN_CLIENTS", raising=False)
+
+    # File-config path.
+    path = tmp_path / ".obo_allowlist"
+    path.write_text("OBO_ADMIN_CLIENTS=alpha, beta\n")
+    monkeypatch.setenv("OBO_ALLOWLIST_PATH", str(path))
+    _reset_obo_manager()
+    assert obo.check_admin_client("alpha") is True
+    assert obo.check_admin_client("beta") is True
+    assert obo.check_admin_client("gamma") is False
+    assert obo.check_admin_client("") is False
+
+    # Deprecated-env-fallback path (no file key). Point the manager at a
+    # non-existent path so it does not fall back to global_args (which would
+    # trigger argparse against pytest argv); the env fallback applies whether or
+    # not the file exists.
+    missing = tmp_path / ".obo_allowlist_missing"
+    monkeypatch.setenv("OBO_ALLOWLIST_PATH", str(missing))
+    monkeypatch.setenv("OAUTH2_SERVICE_ACCOUNT_ADMIN_CLIENTS", "legacy-svc")
+    _reset_obo_manager()
+    assert obo.check_admin_client("legacy-svc") is True
+    assert obo.check_admin_client("alpha") is False
+
+    _reset_obo_manager()
 
 
 def test_regular_user_token_resolves_via_admin_accounts(auth_env, monkeypatch):

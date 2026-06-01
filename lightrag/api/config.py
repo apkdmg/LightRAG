@@ -693,6 +693,12 @@ def parse_args() -> argparse.Namespace:
         "OAUTH2_REDIRECT_URI", "http://localhost:8020/oauth2/callback"
     )
     args.oauth2_scopes = get_env_value("OAUTH2_SCOPES", "openid profile email")
+    # DEPRECATED: use OBO_ADMIN_CLIENTS in the .obo_allowlist file instead
+    # (hot-reloaded, single place alongside the workspace OBO config). This arg
+    # is still parsed for backward compatibility and is consumed only as a
+    # fallback inside lightrag.api.obo_allowlist (which reads the env var
+    # directly via os.getenv); it is no longer read here in auth.py.
+    #
     # Comma-separated allowlist of Keycloak client IDs (the token's `azp` /
     # `clientId` claim) permitted to act as LightRAG admin when authenticating
     # via a service-account / client-credentials token. Empty (the default)
