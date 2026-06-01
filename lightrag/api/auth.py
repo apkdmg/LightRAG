@@ -54,10 +54,25 @@ class AuthHandler:
     def __init__(self):
         auth_accounts = global_args.auth_accounts
         self.secret = global_args.token_secret
+        # OAuth2/SSO is "usable" only when enabled AND its client credentials
+        # are configured. When usable, the local TOKEN_SECRET signs the session
+        # JWT minted after SSO login, so a strong secret is mandatory (fail
+        # closed) to prevent admin-token forgery against the public default.
+        oauth2_usable = bool(
+            getattr(global_args, "oauth2_enabled", False)
+            and (getattr(global_args, "oauth2_client_id", "") or "").strip()
+            and (getattr(global_args, "oauth2_client_secret", "") or "").strip()
+        )
         if not self.secret:
             if auth_accounts:
                 raise ValueError(
                     "TOKEN_SECRET must be explicitly set to a non-default value when AUTH_ACCOUNTS is configured."
+                )
+            if oauth2_usable:
+                raise ValueError(
+                    "TOKEN_SECRET must be explicitly set to a non-default value when OAuth2/SSO "
+                    "is enabled (OAUTH2_ENABLED=true with OAUTH2_CLIENT_ID and OAUTH2_CLIENT_SECRET set). "
+                    "The default secret is public and would allow admin-token forgery."
                 )
             self.secret = DEFAULT_TOKEN_SECRET
             logger.warning(
@@ -266,11 +281,33 @@ def validate_any_token(token: str) -> dict:
 
             # Check if this is a service account (Client Credentials)
             if keycloak_client.is_service_account_token(payload):
-                # Service accounts get admin role for on-behalf operations
                 client_id = payload.get("clientId") or payload.get("azp")
+                # Admin is granted ONLY to client IDs explicitly listed in the
+                # OAUTH2_SERVICE_ACCOUNT_ADMIN_CLIENTS allowlist. With the safe
+                # default (empty allowlist) NO service account becomes admin —
+                # any client-credentials token from the same realm authenticates
+                # as a normal "user", not a LightRAG admin.
+                admin_clients = {
+                    c.strip()
+                    for c in (
+                        global_args.oauth2_service_account_admin_clients or ""
+                    ).split(",")
+                    if c.strip()
+                }
+                if client_id and client_id in admin_clients:
+                    role = "admin"
+                    logger.info(
+                        f"Service account granted admin role: client_id={client_id}"
+                    )
+                else:
+                    role = "user"
+                    logger.info(
+                        f"Service account authenticated as user (not in admin "
+                        f"allowlist): client_id={client_id}"
+                    )
                 return {
                     "username": f"service-account-{client_id}",
-                    "role": "admin",  # Service accounts have admin privileges
+                    "role": role,
                     "workspace_id": "service_account",
                     "metadata": {
                         "auth_mode": "client_credentials",

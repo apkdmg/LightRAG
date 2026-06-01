@@ -140,15 +140,87 @@ class KeycloakClient:
         if expired:
             logger.debug(f"Cleaned up {len(expired)} expired auth states")
 
+    def create_state_token(
+        self, state: str, code_verifier: str, secret: str, expires_in: int = 600
+    ) -> str:
+        """
+        Create a stateless, signed JWT carrying the PKCE code_verifier.
+
+        This is delivered to the browser as an HttpOnly cookie so the
+        authorize/callback round-trip survives across Gunicorn workers
+        (the in-memory ``_state_store`` is per-process and breaks under
+        multi-worker deployments).
+
+        Args:
+            state: The state parameter (CSRF token) bound to this flow
+            code_verifier: The PKCE code verifier to carry
+            secret: The application TOKEN_SECRET used to sign the JWT
+            expires_in: Lifetime in seconds (default: 10 minutes)
+
+        Returns:
+            str: A signed HS256 JWT
+        """
+        now = datetime.utcnow()
+        claims = {
+            "state": state,
+            "cv": code_verifier,
+            "iat": now,
+            "exp": now + timedelta(seconds=expires_in),
+            "typ": "oauth2_pkce",
+        }
+        return jwt.encode(claims, secret, algorithm="HS256")
+
+    def verify_state_token(
+        self, token: str, expected_state: str, secret: str
+    ) -> Optional[str]:
+        """
+        Verify a signed PKCE state token and return its code_verifier.
+
+        Args:
+            token: The signed JWT from the ``oauth2_pkce`` cookie
+            expected_state: The state parameter received on the callback
+            secret: The application TOKEN_SECRET used to verify the JWT
+
+        Returns:
+            The code_verifier if the signature/expiry are valid AND the
+            embedded state matches AND typ == "oauth2_pkce"; otherwise None.
+            Never raises — invalid tokens simply yield None so callers can
+            fall back to the in-memory store.
+        """
+        try:
+            payload = jwt.decode(
+                token,
+                secret,
+                algorithms=["HS256"],
+                options={"verify_exp": True},
+            )
+        except jwt.PyJWTError as e:
+            logger.warning(f"Invalid PKCE state token: {e}")
+            return None
+
+        if payload.get("typ") != "oauth2_pkce":
+            logger.warning("PKCE state token has unexpected type")
+            return None
+        if payload.get("state") != expected_state:
+            logger.warning("PKCE state token state mismatch")
+            return None
+
+        return payload.get("cv")
+
     def get_authorization_url(self) -> tuple:
         """
         Build Keycloak authorization URL with PKCE.
 
         Returns:
-            tuple: (authorization_url, state) pair
+            tuple: (authorization_url, state, code_verifier). The code_verifier
+            is also stored in the in-memory fallback store; it is returned so
+            callers can additionally carry it in a signed, stateless cookie for
+            multi-worker safety.
         """
         state = self.generate_state()
         code_verifier, code_challenge = self.generate_pkce_pair()
+        # Keep the in-memory fallback so single-worker deployments that worked
+        # before continue to work even without the signed cookie.
         self.store_auth_state(state, code_verifier)
 
         params = {
@@ -164,15 +236,21 @@ class KeycloakClient:
         authorization_url = f"{self.config.authorization_endpoint}?{urlencode(params)}"
         logger.info(f"Generated authorization URL with state: {state[:8]}...")
 
-        return authorization_url, state
+        return authorization_url, state, code_verifier
 
-    async def exchange_code(self, code: str, state: str) -> Dict[str, Any]:
+    async def exchange_code(
+        self, code: str, state: str, code_verifier: Optional[str] = None
+    ) -> Dict[str, Any]:
         """
         Exchange authorization code for tokens.
 
         Args:
             code: The authorization code from Keycloak
             state: The state parameter for validation
+            code_verifier: The PKCE code verifier. If provided (e.g. recovered
+                from a signed cookie), it is used directly and the in-memory
+                store lookup is skipped. If None, falls back to the in-memory
+                store keyed by ``state`` (preserves single-worker behavior).
 
         Returns:
             dict: Token response containing access_token, id_token, etc.
@@ -180,7 +258,8 @@ class KeycloakClient:
         Raises:
             HTTPException: If state is invalid or token exchange fails
         """
-        code_verifier = self.get_auth_state(state)
+        if code_verifier is None:
+            code_verifier = self.get_auth_state(state)
         if not code_verifier:
             logger.error(f"Invalid or expired state parameter: {state[:8]}...")
             raise HTTPException(

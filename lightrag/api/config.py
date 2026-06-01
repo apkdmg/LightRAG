@@ -161,9 +161,28 @@ def validate_auth_configuration(args: argparse.Namespace) -> None:
     auth_accounts = (getattr(args, "auth_accounts", "") or "").strip()
     token_secret = (getattr(args, "token_secret", "") or "").strip()
 
-    if auth_accounts and (not token_secret or token_secret == DEFAULT_TOKEN_SECRET):
+    # OAuth2/SSO is "usable" only when it is enabled AND its client credentials
+    # are configured. In that case the local TOKEN_SECRET signs the LightRAG
+    # session JWT minted after a successful SSO login, so a strong secret is
+    # mandatory — otherwise admin-token forgery against the public default
+    # secret becomes possible even with no AUTH_ACCOUNTS configured.
+    oauth2_usable = bool(
+        getattr(args, "oauth2_enabled", False)
+        and (getattr(args, "oauth2_client_id", "") or "").strip()
+        and (getattr(args, "oauth2_client_secret", "") or "").strip()
+    )
+
+    secret_required = bool(auth_accounts) or oauth2_usable
+
+    if secret_required and (not token_secret or token_secret == DEFAULT_TOKEN_SECRET):
+        if auth_accounts:
+            raise ValueError(
+                "TOKEN_SECRET must be explicitly set to a non-default value when AUTH_ACCOUNTS is configured."
+            )
         raise ValueError(
-            "TOKEN_SECRET must be explicitly set to a non-default value when AUTH_ACCOUNTS is configured."
+            "TOKEN_SECRET must be explicitly set to a non-default value when OAuth2/SSO "
+            "is enabled (OAUTH2_ENABLED=true with OAUTH2_CLIENT_ID and OAUTH2_CLIENT_SECRET set). "
+            "The default secret is public and would allow admin-token forgery."
         )
 
 
@@ -674,6 +693,13 @@ def parse_args() -> argparse.Namespace:
         "OAUTH2_REDIRECT_URI", "http://localhost:8020/oauth2/callback"
     )
     args.oauth2_scopes = get_env_value("OAUTH2_SCOPES", "openid profile email")
+    # Comma-separated allowlist of Keycloak client IDs (the token's `azp` /
+    # `clientId` claim) permitted to act as LightRAG admin when authenticating
+    # via a service-account / client-credentials token. Empty (the default)
+    # means NO service account is granted admin — they authenticate as "user".
+    args.oauth2_service_account_admin_clients = get_env_value(
+        "OAUTH2_SERVICE_ACCOUNT_ADMIN_CLIENTS", "", str
+    )
 
     # Token auto-renewal configuration (sliding window expiration)
     args.token_auto_renew = get_env_value("TOKEN_AUTO_RENEW", True, bool)
