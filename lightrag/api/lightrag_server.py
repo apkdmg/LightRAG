@@ -1874,10 +1874,15 @@ def create_app(args):
         }
 
     @app.get("/oauth2/authorize")
-    async def oauth2_authorize():
+    async def oauth2_authorize(request: Request):
         """
         Initiate OAuth2 authorization flow.
         Returns the Keycloak authorization URL for frontend redirect.
+
+        In addition to the in-memory PKCE store, the code_verifier is carried
+        in a signed HttpOnly cookie ("oauth2_pkce") so the authorize/callback
+        round-trip survives across Gunicorn workers under the default
+        multi-worker deployment.
         """
         from .oauth2 import get_keycloak_client
 
@@ -1891,13 +1896,49 @@ def create_app(args):
                 ),
             )
 
-        auth_url, state = keycloak.get_authorization_url()
-        return {"authorization_url": auth_url, "state": state}
+        auth_url, state, code_verifier = keycloak.get_authorization_url()
 
-    async def _process_oauth2_callback(code: str, state: str) -> dict:
+        response = JSONResponse(
+            content={"authorization_url": auth_url, "state": state}
+        )
+
+        # Derive HTTPS via the same indicators the callback uses, so the cookie
+        # gets the Secure attribute behind TLS-terminating reverse proxies.
+        is_ssl_configured = getattr(global_args, "ssl", False)
+        forwarded_proto = request.headers.get("x-forwarded-proto", "").lower()
+        request_scheme_is_https = request.url.scheme == "https"
+        forwarded_ssl = request.headers.get("x-forwarded-ssl", "").lower()
+        is_secure = (
+            is_ssl_configured
+            or forwarded_proto == "https"
+            or request_scheme_is_https
+            or forwarded_ssl == "on"
+        )
+
+        state_token = keycloak.create_state_token(
+            state, code_verifier, global_args.token_secret
+        )
+        response.set_cookie(
+            key="oauth2_pkce",
+            value=state_token,
+            httponly=True,
+            secure=is_secure,
+            samesite="lax",
+            max_age=600,
+            path="/",
+        )
+        return response
+
+    async def _process_oauth2_callback(
+        code: str, state: str, request: Request = None
+    ) -> dict:
         """
         Internal function to process OAuth2 callback.
         Returns token data dict on success, raises HTTPException on failure.
+
+        If a valid signed "oauth2_pkce" cookie is present on the request, its
+        code_verifier is used (multi-worker safe). Otherwise the exchange falls
+        back to the in-memory PKCE store (single-worker behavior).
         """
         from .oauth2 import get_keycloak_client
 
@@ -1908,8 +1949,18 @@ def create_app(args):
                 detail="OAuth2/SSO is not configured",
             )
 
+        # Prefer the signed-cookie code_verifier when available so the flow
+        # works even if authorize and callback ran on different workers.
+        code_verifier = None
+        if request is not None:
+            pkce_cookie = request.cookies.get("oauth2_pkce")
+            if pkce_cookie:
+                code_verifier = keycloak.verify_state_token(
+                    pkce_cookie, state, global_args.token_secret
+                )
+
         # Exchange authorization code for tokens
-        tokens = await keycloak.exchange_code(code, state)
+        tokens = await keycloak.exchange_code(code, state, code_verifier)
         id_token = tokens.get("id_token")
 
         if not id_token:
@@ -1970,12 +2021,12 @@ def create_app(args):
         }
 
     @app.get("/api/oauth2/callback")
-    async def api_oauth2_callback(code: str, state: str):
+    async def api_oauth2_callback(request: Request, code: str, state: str):
         """
         Handle OAuth2 callback for REST API clients.
         Returns JSON response with access token (for programmatic use).
         """
-        return await _process_oauth2_callback(code, state)
+        return await _process_oauth2_callback(code, state, request)
 
     @app.get("/oauth2/callback")
     async def oauth2_callback(request: Request, code: str, state: str):
@@ -1991,7 +2042,7 @@ def create_app(args):
         import json
 
         try:
-            token_data = await _process_oauth2_callback(code, state)
+            token_data = await _process_oauth2_callback(code, state, request)
 
             # Create redirect response
             redirect_response = RedirectResponse(
@@ -2066,6 +2117,10 @@ def create_app(args):
                 path="/",
             )
 
+            # The PKCE state cookie is single-use; clear it now that the
+            # exchange succeeded.
+            redirect_response.delete_cookie("oauth2_pkce", path="/")
+
             return redirect_response
 
         except HTTPException as e:
@@ -2073,7 +2128,10 @@ def create_app(args):
             error_params = urlencode(
                 {"error": "auth_failed", "error_description": e.detail}
             )
-            return RedirectResponse(url=f"/webui/#/oauth2/callback?{error_params}")
+            response = RedirectResponse(url=f"/webui/#/oauth2/callback?{error_params}")
+            # Clear the single-use PKCE state cookie on failure as well.
+            response.delete_cookie("oauth2_pkce", path="/")
+            return response
 
     @app.get("/oauth2/logout")
     async def oauth2_logout(request: Request):
