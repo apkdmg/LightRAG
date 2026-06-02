@@ -68,7 +68,7 @@ from lightrag.kg.shared_storage import (
     finalize_share_data,
 )
 from fastapi.security import OAuth2PasswordRequestForm
-from lightrag.api.auth import auth_handler
+from lightrag.api.auth import auth_handler, _is_admin_user
 
 # use the .env that is inside the current folder
 # allows to use different .env file for each lightrag instance
@@ -1838,13 +1838,10 @@ def create_app(args):
         if not auth_handler.verify_password(username, form_data.password):
             raise HTTPException(status_code=401, detail="Incorrect credentials")
 
-        # Determine the user role based on ADMIN_ACCOUNTS configuration
-        admin_usernames = {
-            name.strip()
-            for name in (global_args.admin_accounts or "").split(",")
-            if name.strip()
-        }
-        role = "admin" if username in admin_usernames else "user"
+        # Determine the user role based on ADMIN_ACCOUNTS configuration.
+        # Uses the shared, case-insensitive matcher so admin status is
+        # consistent across /login, SSO, and Keycloak-direct auth paths.
+        role = "admin" if _is_admin_user(username) else "user"
 
         user_token = auth_handler.create_token(
             username=username, role=role, metadata={"auth_mode": "enabled"}
@@ -1986,15 +1983,18 @@ def create_app(args):
                 detail="Could not determine username from identity provider token",
             )
 
-        # Determine role: only ADMIN_ACCOUNTS get admin, all SSO users get "user"
-        admin_usernames = set()
-        if global_args.admin_accounts:
-            admin_usernames = {
-                name.strip()
-                for name in global_args.admin_accounts.split(",")
-                if name.strip()
-            }
-        role = "admin" if username in admin_usernames else "user"
+        # Determine role: only ADMIN_ACCOUNTS get admin, all SSO users get "user".
+        # Pass all available identifiers so email- and username-based admin
+        # entries both work consistently with the other auth paths.
+        role = (
+            "admin"
+            if _is_admin_user(
+                user_info.get("email"),
+                user_info.get("preferred_username"),
+                user_info.get("sub"),
+            )
+            else "user"
+        )
 
         # Create local JWT token
         user_token = auth_handler.create_token(

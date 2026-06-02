@@ -269,9 +269,13 @@ def get_combined_auth_dependency(api_key: Optional[str] = None):
         ):
             # Store service-account user info in request state so downstream
             # dependencies (get_current_user) can resolve a valid identity.
+            # Security rationale: a leaked shared key with the "admin" role grants
+            # full access (and can act on behalf of others). The role is therefore
+            # configurable via LIGHTRAG_API_KEY_ROLE (default "admin" for backward
+            # compatibility); set it to "user" to scope a shared key down.
             request.state.api_key_user = {
                 "username": "api_key_service_account",
-                "role": "admin",  # shared-key holder may act on behalf of others
+                "role": global_args.api_key_role,
                 "workspace_id": "service_account",
                 "metadata": {"auth_mode": "api_key"},
             }

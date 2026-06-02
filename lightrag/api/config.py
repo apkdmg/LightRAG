@@ -353,6 +353,17 @@ def parse_args() -> argparse.Namespace:
         help="API key for authentication. This protects lightrag server against unauthorized access",
     )
 
+    # Role granted to the holder of the shared LIGHTRAG_API_KEY. Defaults to
+    # "admin" for backward compatibility (the global key has historically been
+    # full-access), but can be scoped down to "user" so a leaked key cannot act
+    # as an admin. See AUTH_MODEL.md.
+    parser.add_argument(
+        "--api-key-role",
+        type=str,
+        default=get_env_value("LIGHTRAG_API_KEY_ROLE", "admin", str),
+        help="Role granted to the shared LIGHTRAG_API_KEY holder (admin or user, default admin)",
+    )
+
     # Optional https parameters
     parser.add_argument(
         "--ssl",
@@ -499,6 +510,16 @@ def parse_args() -> argparse.Namespace:
         GeminiEmbeddingOptions.add_args(parser)
 
     args = parser.parse_args()
+
+    # Validate the shared API key role; fall back to the secure-by-history
+    # default ("admin") if an unrecognized value is supplied.
+    if args.api_key_role not in {"admin", "user"}:
+        logger.warning(
+            'Invalid LIGHTRAG_API_KEY_ROLE="%s"; expected "admin" or "user". '
+            'Falling back to "admin".',
+            args.api_key_role,
+        )
+        args.api_key_role = "admin"
 
     # convert relative path to absolute path
     args.working_dir = os.path.abspath(args.working_dir)

@@ -1,5 +1,7 @@
 # OBO (On-Behalf-Of) Client Allowlist
 
+> For the big picture of how principals, roles, and data scope fit together, see [AUTH_MODEL.md](AUTH_MODEL.md).
+
 Controls which OAuth2 clients and API keys can perform OBO operations using the `X-Target-Workspace` header.
 
 ## Quick Start

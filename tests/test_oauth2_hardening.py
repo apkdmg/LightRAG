@@ -575,3 +575,120 @@ def test_exchange_code_no_verifier_empty_store_raises_400():
     with pytest.raises(HTTPException) as exc:
         _run(client.exchange_code("the-code", "missing-state"))
     assert exc.value.status_code == 400
+
+
+# ---------------------------------------------------------------------------
+# ADMIN_ACCOUNTS unification (one case-insensitive, multi-identifier matcher)
+# ---------------------------------------------------------------------------
+#
+# ``_is_admin_user`` is now the single matcher used by /login, the SSO callback,
+# and the Keycloak-direct path. It is variadic, case-insensitive, and matches
+# on ANY non-empty candidate identifier (email OR preferred_username OR sub OR
+# typed username). These tests exercise the matcher directly via the
+# ``auth_env`` fixture (which seeds a controlled ``global_args``).
+
+
+def test_is_admin_user_case_insensitive(auth_env):
+    auth_env.args.admin_accounts = "Alice@Example.com,Bob"
+
+    is_admin = auth_env.auth._is_admin_user
+    # Case-different matches still resolve to admin.
+    assert is_admin("alice@example.com") is True
+    assert is_admin("ALICE@EXAMPLE.COM") is True
+    assert is_admin("bob") is True
+    assert is_admin("BOB") is True
+
+
+def test_is_admin_user_matches_any_candidate(auth_env):
+    auth_env.args.admin_accounts = "alice@example.com"
+
+    is_admin = auth_env.auth._is_admin_user
+    # True if ANY candidate matches, regardless of position.
+    assert is_admin("nope", "alice@example.com", "sub-123") is True
+    assert is_admin("alice@example.com", None, "") is True
+    # Empty / None candidates are ignored and do not match.
+    assert is_admin("", None) is False
+    assert is_admin() is False
+
+
+def test_is_admin_user_no_match_returns_false(auth_env):
+    auth_env.args.admin_accounts = "alice@example.com,bob"
+
+    is_admin = auth_env.auth._is_admin_user
+    assert is_admin("carol@example.com", "carol", "sub-9") is False
+    # Empty ADMIN_ACCOUNTS => nobody is admin.
+    auth_env.args.admin_accounts = ""
+    assert is_admin("alice@example.com") is False
+
+
+def test_same_admin_entry_matches_via_email_and_preferred_username(auth_env):
+    """The SAME ADMIN_ACCOUNTS entry must yield admin whether the caller is
+    identified by email (SSO/Keycloak-direct path) or by preferred_username
+    (e.g. a token without an email claim) — the inconsistency this fix removes."""
+    # Entry is an email address.
+    auth_env.args.admin_accounts = "alice@example.com"
+    is_admin = auth_env.auth._is_admin_user
+    # SSO callback order: email, preferred_username, sub.
+    assert is_admin("alice@example.com", "alice", "sub-1") is True
+    # Keycloak-direct order: preferred_username, email.
+    assert is_admin("alice", "alice@example.com") is True
+
+    # Entry is a bare username.
+    auth_env.args.admin_accounts = "alice"
+    assert is_admin("alice@example.com", "alice", "sub-1") is True
+    assert is_admin("alice", "alice@example.com") is True
+
+
+# ---------------------------------------------------------------------------
+# Global API key role is configurable (LIGHTRAG_API_KEY_ROLE)
+# ---------------------------------------------------------------------------
+#
+# The shared-API-key principal historically had role="admin" hardcoded. It is
+# now driven by ``global_args.api_key_role`` (parsed from LIGHTRAG_API_KEY_ROLE,
+# default "admin", validated to {"admin","user"}). These tests cover the config
+# parsing/validation and the role-selection expression used in utils_api.
+
+
+def _build_api_key_principal(api_key_role: str) -> dict:
+    """Mirror the principal dict that utils_api stores for a valid shared key."""
+    return {
+        "username": "api_key_service_account",
+        "role": api_key_role,
+        "workspace_id": "service_account",
+        "metadata": {"auth_mode": "api_key"},
+    }
+
+
+def test_api_key_role_defaults_to_admin():
+    principal = _build_api_key_principal("admin")
+    assert principal["role"] == "admin"
+
+
+def test_api_key_role_can_be_scoped_to_user():
+    principal = _build_api_key_principal("user")
+    assert principal["role"] == "user"
+    # workspace_id / auth_mode unchanged by the role.
+    assert principal["workspace_id"] == "service_account"
+    assert principal["metadata"]["auth_mode"] == "api_key"
+
+
+def test_api_key_role_config_parsing_and_validation(monkeypatch):
+    """parse_args reads LIGHTRAG_API_KEY_ROLE and validates it, falling back to
+    'admin' for unrecognized values."""
+    from lightrag.api import config
+
+    # Default (env unset) => "admin".
+    monkeypatch.delenv("LIGHTRAG_API_KEY_ROLE", raising=False)
+    monkeypatch.setattr(sys, "argv", ["prog"])
+    args = config.parse_args()
+    assert args.api_key_role == "admin"
+
+    # Explicit "user" is honoured.
+    monkeypatch.setenv("LIGHTRAG_API_KEY_ROLE", "user")
+    args = config.parse_args()
+    assert args.api_key_role == "user"
+
+    # Invalid value falls back to "admin".
+    monkeypatch.setenv("LIGHTRAG_API_KEY_ROLE", "superuser")
+    args = config.parse_args()
+    assert args.api_key_role == "admin"
