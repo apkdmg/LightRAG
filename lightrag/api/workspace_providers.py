@@ -2,27 +2,30 @@
 Per-workspace bring-your-own (BYO) LLM / Vision-LLM provider credentials.
 
 A workspace owner may optionally supply their own OpenAI-compatible provider
-(base URL + API key + model) for the **text LLM** and the **vision LLM (VLM)**.
-When a workspace has no override, the system default applies — that fallback is
-handled by the role-config resolution in ``lightrag_server.py``; this module only
-owns *storage* of the overrides.
+(base URL + API key + model, plus an optional reasoning effort) for each role
+group:
+
+- ``extraction`` → applied to the ``extract`` and ``keyword`` roles
+  (ingestion + query-keyword extraction; a fast, non-thinking model is ideal).
+- ``query``      → applied to the ``query`` role (answer generation; a reasoning
+  model is usually preferred).
+- ``vision``     → applied to the ``vlm`` role (image/infographic description).
+
+When a slot has no override, the system default applies — that fallback is
+handled by the role-config resolution in ``lightrag_server.py``; this module
+only owns *storage* of the overrides and *applying* them to a LightRAG instance.
 
 Design notes (fork-only, self-contained to keep upstream merges trivial):
 
 - API keys are encrypted at rest with ``cryptography.fernet.Fernet``. The key is
   derived from the ``WORKSPACE_PROVIDER_SECRET`` server secret.
 - Persistence is one JSON file per workspace under
-  ``working_dir/.workspace_providers/<workspace>.json`` — mirroring the existing
-  ``.api_keys.json`` / ``.obo_allowlist`` file precedents, and readable
-  synchronously at instance-build time (no async storage dependency).
+  ``working_dir/.workspace_providers/<workspace>.json``.
 - The persistence detail sits behind :class:`WorkspaceProviderStore` so a
-  DB-backed implementation can replace the file store later for multi-replica
-  deployments without touching any caller.
-
-Two logical "slots" map onto LightRAG roles (see ``lightrag/llm_roles.py``):
-
-- ``llm``    → applied to the ``extract``, ``keyword`` and ``query`` roles.
-- ``vision`` → applied to the ``vlm`` role.
+  DB-backed implementation can replace the file store later without touching
+  any caller.
+- Overrides are applied purely via the public ``rag.aupdate_llm_role_config``
+  API (no core LightRAG code is modified).
 """
 
 from __future__ import annotations
@@ -41,12 +44,24 @@ from pydantic import BaseModel, Field, SecretStr
 
 logger = logging.getLogger("lightrag.api.workspace_providers")
 
-# Role groups the two owner-facing slots map onto. Imported by the apply helper.
-TEXT_LLM_ROLES: tuple[str, ...] = ("extract", "keyword", "query")
+# Role groups the three owner-facing slots map onto. Imported by the routes.
+EXTRACTION_ROLES: tuple[str, ...] = ("extract", "keyword")
+QUERY_ROLE: str = "query"
 VISION_LLM_ROLE: str = "vlm"
+
+# Slot name -> the roles it drives.
+SLOT_ROLES: dict[str, tuple[str, ...]] = {
+    "extraction": EXTRACTION_ROLES,
+    "query": (QUERY_ROLE,),
+    "vision": (VISION_LLM_ROLE,),
+}
 
 # All BYO overrides are OpenAI-compatible by contract.
 OVERRIDE_BINDING = "openai"
+
+# Accepted reasoning-effort values (OpenAI-compatible; Gemini maps these to its
+# thinking budget). None/"" means "leave the provider default".
+REASONING_EFFORTS = ("none", "low", "medium", "high")
 
 _SUBDIR = ".workspace_providers"
 _ENV_SECRET = "WORKSPACE_PROVIDER_SECRET"
@@ -57,13 +72,14 @@ class WorkspaceProviderError(Exception):
 
 
 class ProviderSlot(BaseModel):
-    """One OpenAI-compatible provider override (text LLM or vision LLM)."""
+    """One OpenAI-compatible provider override for a role group."""
 
     base_url: Optional[str] = None
     api_key: Optional[SecretStr] = None
     model: Optional[str] = None
-    # Opaque UI hint (which preset the owner picked). Stored verbatim, never
-    # interpreted by the apply logic.
+    # Optional thinking/reasoning control (none|low|medium|high). None = default.
+    reasoning_effort: Optional[str] = None
+    # Opaque UI hint (which preset the owner picked). Stored verbatim.
     preset_id: Optional[str] = None
 
     def is_active(self) -> bool:
@@ -72,19 +88,27 @@ class ProviderSlot(BaseModel):
 
 
 class WorkspaceProviderConfig(BaseModel):
-    """Full per-workspace provider configuration (both slots)."""
+    """Full per-workspace provider configuration (three role-group slots)."""
 
-    llm: ProviderSlot = Field(default_factory=ProviderSlot)
+    extraction: ProviderSlot = Field(default_factory=ProviderSlot)
+    query: ProviderSlot = Field(default_factory=ProviderSlot)
     vision: ProviderSlot = Field(default_factory=ProviderSlot)
     updated_at: Optional[str] = None
     updated_by: Optional[str] = None
 
+    def slot(self, name: str) -> ProviderSlot:
+        return getattr(self, name)
+
     def is_empty(self) -> bool:
-        return not (self.llm.is_active() or self.vision.is_active())
+        return not (
+            self.extraction.is_active()
+            or self.query.is_active()
+            or self.vision.is_active()
+        )
 
 
 def generate_secret() -> str:
-    """Return a fresh Fernet-compatible secret suitable for WORKSPACE_PROVIDER_SECRET."""
+    """Return a fresh Fernet-compatible secret for WORKSPACE_PROVIDER_SECRET."""
     return Fernet.generate_key().decode("utf-8")
 
 
@@ -93,8 +117,7 @@ def _build_fernet(secret: str) -> Fernet:
 
     Accepts either a canonical Fernet key (urlsafe-base64, 32 bytes) or any
     arbitrary passphrase, which is deterministically stretched to a 32-byte
-    urlsafe-base64 key via SHA-256. This keeps configuration forgiving while
-    still requiring an explicit, stable secret.
+    urlsafe-base64 key via SHA-256.
     """
     secret = secret.strip()
     try:
@@ -125,7 +148,6 @@ class WorkspaceProviderStore:
         get_secret: Callable[[], Optional[str]] | None = None,
     ) -> None:
         self._base_dir = Path(working_dir) / _SUBDIR
-        # Default secret source: env var. The server wires this to global_args.
         self._get_secret = get_secret or (lambda: os.getenv(_ENV_SECRET))
 
     # -- secret handling -------------------------------------------------
@@ -154,7 +176,11 @@ class WorkspaceProviderStore:
         Returns ``None`` when no override is stored. On a decryption failure
         (e.g. the secret was rotated/lost) this logs an error and returns
         ``None`` so the instance falls back to the system default rather than
-        failing to start — availability over hard failure.
+        failing to start.
+
+        Backward compatibility: an older config used a single ``llm`` slot
+        (applied to extract/keyword/query). It is migrated on read by mapping
+        ``llm`` onto both ``extraction`` and ``query``.
         """
         path = self._path(workspace_id)
         if not path.exists():
@@ -171,9 +197,11 @@ class WorkspaceProviderStore:
             logger.error(f"Cannot decrypt provider config for '{workspace_id}': {e}")
             return None
 
+        legacy = raw.get("llm")  # pre role-aware format
         try:
             return WorkspaceProviderConfig(
-                llm=self._decode_slot(raw.get("llm"), fernet),
+                extraction=self._decode_slot(raw.get("extraction") or legacy, fernet),
+                query=self._decode_slot(raw.get("query") or legacy, fernet),
                 vision=self._decode_slot(raw.get("vision"), fernet),
                 updated_at=raw.get("updated_at"),
                 updated_by=raw.get("updated_by"),
@@ -196,6 +224,7 @@ class WorkspaceProviderStore:
             base_url=data.get("base_url"),
             api_key=api_key,
             model=data.get("model"),
+            reasoning_effort=data.get("reasoning_effort"),
             preset_id=data.get("preset_id"),
         )
 
@@ -204,14 +233,14 @@ class WorkspaceProviderStore:
         """Encrypt secrets and persist a workspace's provider config."""
         fernet = self._fernet()  # fail closed if no secret
         payload: dict[str, Any] = {
-            "llm": self._encode_slot(config.llm, fernet),
+            "extraction": self._encode_slot(config.extraction, fernet),
+            "query": self._encode_slot(config.query, fernet),
             "vision": self._encode_slot(config.vision, fernet),
             "updated_at": config.updated_at or datetime.now(timezone.utc).isoformat(),
             "updated_by": config.updated_by,
         }
         path = self._path(workspace_id)
         path.parent.mkdir(parents=True, exist_ok=True)
-        # Atomic-ish write: tmp then replace.
         tmp = path.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         os.replace(tmp, path)
@@ -221,6 +250,7 @@ class WorkspaceProviderStore:
         out: dict[str, Any] = {
             "base_url": slot.base_url,
             "model": slot.model,
+            "reasoning_effort": slot.reasoning_effort,
             "preset_id": slot.preset_id,
         }
         if slot.api_key and slot.api_key.get_secret_value():
@@ -233,9 +263,9 @@ class WorkspaceProviderStore:
     def delete(self, workspace_id: str, which: str = "all") -> bool:
         """Remove an override.
 
-        ``which`` may be ``"all"`` (delete the whole record), ``"llm"`` or
-        ``"vision"`` (clear a single slot, keeping the other). Returns True if
-        anything was removed.
+        ``which`` may be ``"all"`` (delete the whole record) or a slot name
+        (``"extraction"`` / ``"query"`` / ``"vision"``) to clear one slot,
+        keeping the others. Returns True if anything was removed.
         """
         path = self._path(workspace_id)
         if not path.exists():
@@ -249,8 +279,10 @@ class WorkspaceProviderStore:
                 logger.error(f"Failed to delete provider config for '{workspace_id}': {e}")
                 return False
 
-        if which not in ("llm", "vision"):
-            raise ValueError(f"Invalid slot '{which}'; expected 'all', 'llm' or 'vision'")
+        if which not in SLOT_ROLES:
+            raise ValueError(
+                f"Invalid slot '{which}'; expected 'all' or one of {list(SLOT_ROLES)}"
+            )
 
         config = self.get(workspace_id)
         if config is None:
@@ -264,20 +296,35 @@ class WorkspaceProviderStore:
     # -- masked view (safe for API responses) ----------------------------
     def get_masked(self, workspace_id: str) -> dict[str, Any]:
         """Return a secret-free view of the stored config for API responses."""
-        config = self.get(workspace_id)
-        if config is None:
-            return {
-                "llm": _masked_slot(ProviderSlot()),
-                "vision": _masked_slot(ProviderSlot()),
-                "updated_at": None,
-                "updated_by": None,
-            }
+        config = self.get(workspace_id) or WorkspaceProviderConfig()
         return {
-            "llm": _masked_slot(config.llm),
+            "extraction": _masked_slot(config.extraction),
+            "query": _masked_slot(config.query),
             "vision": _masked_slot(config.vision),
             "updated_at": config.updated_at,
             "updated_by": config.updated_by,
         }
+
+
+async def _apply_slot(rag: Any, roles: tuple[str, ...], slot: ProviderSlot) -> None:
+    """Apply one slot's override to its role(s) via the public role API."""
+    api_key = slot.api_key.get_secret_value()
+    for role in roles:
+        provider_options = None
+        if slot.reasoning_effort:
+            # Merge onto the role's existing (scrubbed) provider options so we
+            # don't drop temperature/etc.; get_llm_role_config never leaks keys.
+            current = rag.get_llm_role_config(role)
+            provider_options = dict((current.get("metadata") or {}).get("provider_options") or {})
+            provider_options["reasoning_effort"] = slot.reasoning_effort
+        await rag.aupdate_llm_role_config(
+            role,
+            binding=OVERRIDE_BINDING,
+            host=slot.base_url,
+            api_key=api_key,
+            model=slot.model,
+            provider_options=provider_options,
+        )
 
 
 async def apply_workspace_provider_overrides(
@@ -287,13 +334,10 @@ async def apply_workspace_provider_overrides(
 ) -> None:
     """Apply a workspace's stored provider overrides to its LightRAG roles.
 
-    The text-LLM override is applied to the ``extract``/``keyword``/``query``
-    roles; the vision override to the ``vlm`` role. Roles without an override
-    keep their env/default configuration (the system-default fallback).
-
-    Implemented purely via the public ``rag.aupdate_llm_role_config`` API so no
-    core LightRAG code is modified. Safe to call on every instance build; when
-    no override is stored it is a no-op (system default applies).
+    ``extraction`` → ``extract``/``keyword``; ``query`` → ``query``;
+    ``vision`` → ``vlm``. Roles without an override keep their env/default
+    configuration (the system-default fallback). Safe to call on every instance
+    build; a no-op when nothing is stored.
     """
     if store is None:
         return
@@ -301,30 +345,15 @@ async def apply_workspace_provider_overrides(
     if config is None or config.is_empty():
         return
 
-    if config.llm.is_active():
-        for role in TEXT_LLM_ROLES:
-            await rag.aupdate_llm_role_config(
-                role,
-                binding=OVERRIDE_BINDING,
-                host=config.llm.base_url,
-                api_key=config.llm.api_key.get_secret_value(),
-                model=config.llm.model,
-            )
-        logger.info(
-            f"Applied BYO text-LLM provider for workspace '{workspace_id}'"
-        )
-
+    if config.extraction.is_active():
+        await _apply_slot(rag, EXTRACTION_ROLES, config.extraction)
+        logger.info(f"Applied BYO extraction provider for workspace '{workspace_id}'")
+    if config.query.is_active():
+        await _apply_slot(rag, (QUERY_ROLE,), config.query)
+        logger.info(f"Applied BYO query provider for workspace '{workspace_id}'")
     if config.vision.is_active():
-        await rag.aupdate_llm_role_config(
-            VISION_LLM_ROLE,
-            binding=OVERRIDE_BINDING,
-            host=config.vision.base_url,
-            api_key=config.vision.api_key.get_secret_value(),
-            model=config.vision.model,
-        )
-        logger.info(
-            f"Applied BYO vision-LLM provider for workspace '{workspace_id}'"
-        )
+        await _apply_slot(rag, (VISION_LLM_ROLE,), config.vision)
+        logger.info(f"Applied BYO vision provider for workspace '{workspace_id}'")
 
 
 def slot_effective_view(role_cfg: dict[str, Any], active: bool) -> dict[str, Any]:
@@ -333,13 +362,15 @@ def slot_effective_view(role_cfg: dict[str, Any], active: bool) -> dict[str, Any
     ``role_cfg`` is a credential-scrubbed entry from
     ``rag.get_llm_role_config(role)``. ``source`` tells the owner whether the
     value in effect comes from their own override (``custom``) or the system
-    default fallback (``system_default``). Only an allow-list of non-secret
-    fields is returned.
+    default fallback (``system_default``).
     """
+    meta = role_cfg.get("metadata") or {}
+    options = meta.get("provider_options") or {}
     return {
         "binding": role_cfg.get("binding"),
         "model": role_cfg.get("model"),
         "host": role_cfg.get("host"),
+        "reasoning_effort": options.get("reasoning_effort"),
         "source": "custom" if active else "system_default",
     }
 
@@ -349,6 +380,7 @@ def _masked_slot(slot: ProviderSlot) -> dict[str, Any]:
     return {
         "base_url": slot.base_url,
         "model": slot.model,
+        "reasoning_effort": slot.reasoning_effort,
         "preset_id": slot.preset_id,
         "api_key_set": bool(plain),
         "api_key_preview": _mask_key(plain),
