@@ -781,6 +781,15 @@ def parse_args() -> argparse.Namespace:
     args.workspace_ttl_minutes = get_env_value("WORKSPACE_TTL_MINUTES", 60, int)
     args.auto_create_workspace = get_env_value("AUTO_CREATE_WORKSPACE", True, bool)
 
+    # Per-workspace BYO LLM / Vision-LLM providers (fork feature).
+    # When enabled, a workspace owner may supply their own OpenAI-compatible
+    # provider (base URL + API key + model); the system default is the fallback.
+    # WORKSPACE_PROVIDER_SECRET encrypts stored API keys at rest.
+    args.enable_workspace_providers = get_env_value(
+        "ENABLE_WORKSPACE_PROVIDERS", False, bool
+    )
+    args.workspace_provider_secret = get_env_value("WORKSPACE_PROVIDER_SECRET", None)
+
     # OBO (On-Behalf-Of) allowlist configuration
     # The .obo_allowlist file (hot-reloadable) takes precedence; these are
     # fallbacks only. See lightrag/api/OBO_ALLOWLIST.md

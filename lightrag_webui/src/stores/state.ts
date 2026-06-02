@@ -33,6 +33,7 @@ interface AuthState {
   coreVersion: string | null;
   apiVersion: string | null;
   username: string | null; // login username
+  role: string | null; // role from JWT (user | admin | guest); used for admin-only UI
   webuiTitle: string | null; // Custom title
   webuiDescription: string | null; // Title description
   lastTokenRenewal: string | null; // Human-readable local time of last token renewal (for debugging and monitoring)
@@ -193,6 +194,11 @@ const getUsernameFromToken = (token: string): string | null => {
   return payload.sub || null;
 };
 
+const getRoleFromToken = (token: string): string | null => {
+  const payload = parseTokenPayload(token);
+  return payload.role || null;
+};
+
 const isGuestToken = (token: string): boolean => {
   const payload = parseTokenPayload(token);
   return payload.role === 'guest';
@@ -203,7 +209,7 @@ const getTokenExpiresAt = (token: string): number | null => {
   return payload.exp ? payload.exp * 1000 : null; // Convert to milliseconds
 };
 
-const initAuthState = (): { isAuthenticated: boolean; isGuestMode: boolean; isSSOMode: boolean; coreVersion: string | null; apiVersion: string | null; username: string | null; webuiTitle: string | null; webuiDescription: string | null; lastTokenRenewal: string | null; tokenExpiresAt: number | null } => {
+const initAuthState = (): { isAuthenticated: boolean; isGuestMode: boolean; isSSOMode: boolean; coreVersion: string | null; apiVersion: string | null; username: string | null; role: string | null; webuiTitle: string | null; webuiDescription: string | null; lastTokenRenewal: string | null; tokenExpiresAt: number | null } => {
   const token = localStorage.getItem('LIGHTRAG-API-TOKEN');
   const coreVersion = localStorage.getItem('LIGHTRAG-CORE-VERSION');
   const apiVersion = localStorage.getItem('LIGHTRAG-API-VERSION');
@@ -212,6 +218,7 @@ const initAuthState = (): { isAuthenticated: boolean; isGuestMode: boolean; isSS
   const lastTokenRenewal = localStorage.getItem('LIGHTRAG-LAST-TOKEN-RENEWAL');
   const isSSOMode = localStorage.getItem('LIGHTRAG-SSO-MODE') === 'true';
   const username = token ? getUsernameFromToken(token) : null;
+  const role = token ? getRoleFromToken(token) : null;
   const tokenExpiresAt = token ? getTokenExpiresAt(token) : null;
 
   if (!token) {
@@ -222,6 +229,7 @@ const initAuthState = (): { isAuthenticated: boolean; isGuestMode: boolean; isSS
       coreVersion: coreVersion,
       apiVersion: apiVersion,
       username: null,
+      role: null,
       webuiTitle: webuiTitle,
       webuiDescription: webuiDescription,
       lastTokenRenewal: null,
@@ -236,6 +244,7 @@ const initAuthState = (): { isAuthenticated: boolean; isGuestMode: boolean; isSS
     coreVersion: coreVersion,
     apiVersion: apiVersion,
     username: username,
+    role: role,
     webuiTitle: webuiTitle,
     webuiDescription: webuiDescription,
     lastTokenRenewal: lastTokenRenewal,
@@ -254,6 +263,7 @@ export const useAuthStore = create<AuthState>(set => {
     coreVersion: initialState.coreVersion,
     apiVersion: initialState.apiVersion,
     username: initialState.username,
+    role: initialState.role,
     webuiTitle: initialState.webuiTitle,
     webuiDescription: initialState.webuiDescription,
     lastTokenRenewal: initialState.lastTokenRenewal,
@@ -289,6 +299,7 @@ export const useAuthStore = create<AuthState>(set => {
       }
 
       const username = getUsernameFromToken(token);
+      const role = getRoleFromToken(token);
       const tokenExpiresAt = getTokenExpiresAt(token);
       const now = Date.now();
       const formattedTime = formatTimestampToLocalString(now);
@@ -301,6 +312,7 @@ export const useAuthStore = create<AuthState>(set => {
         isGuestMode: isGuest,
         isSSOMode: isSSO,
         username: username,
+        role: role,
         coreVersion: coreVersion,
         apiVersion: apiVersion,
         webuiTitle: webuiTitle,
@@ -328,6 +340,7 @@ export const useAuthStore = create<AuthState>(set => {
         isGuestMode: false,
         isSSOMode: false,
         username: null,
+        role: null,
         coreVersion: coreVersion,
         apiVersion: apiVersion,
         webuiTitle: webuiTitle,

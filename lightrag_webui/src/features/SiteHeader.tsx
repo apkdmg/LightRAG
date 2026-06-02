@@ -33,6 +33,7 @@ function NavigationTab({ value, currentTab, children }: NavigationTabProps) {
 
 function TabsNavigation() {
   const currentTab = useSettingsStore.use.currentTab()
+  const { isGuestMode } = useAuthStore()
   const { t } = useTranslation()
 
   return (
@@ -50,6 +51,12 @@ function TabsNavigation() {
         <NavigationTab value="api" currentTab={currentTab}>
           {t('header.api')}
         </NavigationTab>
+        {/* BYO provider settings are workspace-scoped; hidden for guests. */}
+        {!isGuestMode && (
+          <NavigationTab value="providers" currentTab={currentTab}>
+            {t('header.providers')}
+          </NavigationTab>
+        )}
       </TabsList>
     </div>
   )

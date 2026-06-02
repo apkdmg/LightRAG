@@ -81,6 +81,7 @@ api = [
     "httpx>=0.28.1",
     "jiter",
     "bcrypt>=4.0.0",
+    "cryptography>=41.0.0",  # Fernet encryption for per-workspace provider credentials
     "psutil",
     "PyJWT>=2.8.0,<3.0.0",
     "python-jose[cryptography]",

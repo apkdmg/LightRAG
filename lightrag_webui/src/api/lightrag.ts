@@ -1303,3 +1303,137 @@ export const handleOAuth2Callback = async (
   })
   return response.data
 }
+
+/**
+ * Per-workspace BYO LLM / Vision-LLM provider configuration.
+ * The owner supplies an OpenAI-compatible provider per slot; the system default
+ * is the fallback. Secrets are never returned by the server — only a masked view.
+ */
+/** The provider actually in effect for a slot (custom override or system default). */
+export type ProviderEffective = {
+  binding: string | null
+  model: string | null
+  host: string | null
+  source: 'custom' | 'system_default'
+}
+
+export type ProviderSlotMasked = {
+  base_url: string | null
+  model: string | null
+  preset_id: string | null
+  api_key_set: boolean
+  api_key_preview: string
+  active: boolean
+  /** Present on GET; the live provider in use (incl. the default's host/model). */
+  effective?: ProviderEffective
+}
+
+export type ProviderConfigMasked = {
+  llm: ProviderSlotMasked
+  vision: ProviderSlotMasked
+  updated_at: string | null
+  updated_by: string | null
+}
+
+/** One slot in an update request. Omit `api_key` to keep the stored key. */
+export type ProviderSlotInput = {
+  base_url?: string
+  api_key?: string
+  model?: string
+  preset_id?: string
+}
+
+export type UpdateProviderConfigRequest = {
+  llm?: ProviderSlotInput
+  vision?: ProviderSlotInput
+}
+
+/**
+ * Build the optional X-Target-Workspace header for admin on-behalf-of calls.
+ * When `targetWorkspace` is falsy the request acts on the caller's own workspace.
+ */
+const targetWorkspaceHeader = (targetWorkspace?: string | null) =>
+  targetWorkspace ? { 'X-Target-Workspace': targetWorkspace } : undefined
+
+/** Fetch the masked provider config for a workspace (own, or an admin's target). */
+export const getProviderConfig = async (
+  targetWorkspace?: string | null
+): Promise<ProviderConfigMasked> => {
+  const response = await axiosInstance.get('/workspace/provider-config', {
+    headers: targetWorkspaceHeader(targetWorkspace)
+  })
+  return response.data
+}
+
+/** Set/update one or both provider slots. `test` probes connectivity first. */
+export const updateProviderConfig = async (
+  body: UpdateProviderConfigRequest,
+  test = false,
+  targetWorkspace?: string | null
+): Promise<ProviderConfigMasked> => {
+  const response = await axiosInstance.put('/workspace/provider-config', body, {
+    params: { test },
+    headers: targetWorkspaceHeader(targetWorkspace)
+  })
+  return response.data
+}
+
+/** Clear a provider override (slot = 'all' | 'llm' | 'vision'). */
+export const deleteProviderConfig = async (
+  slot: 'all' | 'llm' | 'vision' = 'all',
+  targetWorkspace?: string | null
+): Promise<ProviderConfigMasked> => {
+  const response = await axiosInstance.delete('/workspace/provider-config', {
+    params: { slot },
+    headers: targetWorkspaceHeader(targetWorkspace)
+  })
+  return response.data
+}
+
+/** One LLM role's live, credential-scrubbed effective configuration. */
+export type EffectiveRoleConfig = {
+  binding: string | null
+  model: string | null
+  host: string | null
+  is_cross_provider: boolean
+  source: 'custom' | 'system_default'
+}
+
+export type EffectiveRolesResponse = {
+  roles: Record<string, EffectiveRoleConfig>
+}
+
+/** Ground-truth: what each LLM role (incl. vlm) is actually calling right now. */
+export const getEffectiveRoleConfig = async (
+  targetWorkspace?: string | null
+): Promise<EffectiveRolesResponse> => {
+  const response = await axiosInstance.get('/workspace/provider-config/effective', {
+    headers: targetWorkspaceHeader(targetWorkspace)
+  })
+  return response.data
+}
+
+/** A workspace as listed by the admin endpoint. */
+export type AdminWorkspace = {
+  workspace_id: string
+  owner_username: string
+  is_active: boolean
+}
+
+export type AdminWorkspaceListResponse = {
+  workspaces: AdminWorkspace[]
+  total: number
+  page: number
+  page_size: number
+}
+
+/** Admin-only: list workspaces (used by the provider "Manage workspace" selector). */
+export const listAdminWorkspaces = async (
+  page = 1,
+  pageSize = 1000
+): Promise<AdminWorkspaceListResponse> => {
+  const response = await axiosInstance.get('/admin/workspaces', {
+    params: { page, page_size: pageSize }
+  })
+  return response.data
+}

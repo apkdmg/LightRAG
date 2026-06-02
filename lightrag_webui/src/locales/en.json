@@ -11,12 +11,66 @@
     "knowledgeGraph": "Knowledge Graph",
     "retrieval": "Retrieval",
     "api": "API",
+    "providers": "Providers",
     "projectRepository": "Project Repository",
     "logout": "Logout",
     "frontendNeedsRebuild": "Frontend needs rebuild",
     "themeToggle": {
       "switchToLight": "Switch to light theme",
       "switchToDark": "Switch to dark theme"
+    }
+  },
+  "providerSettings": {
+    "title": "LLM Providers",
+    "subtitle": "Use your own OpenAI-compatible provider for this workspace. Leave empty to use the system default.",
+    "llmTitle": "Text LLM",
+    "llmDescription": "Used for extraction, keywords and query answering.",
+    "visionTitle": "Vision LLM",
+    "visionDescription": "Used to describe images during multimodal ingestion.",
+    "provider": "Provider",
+    "baseUrl": "Base URL",
+    "model": "Model",
+    "modelPlaceholder": "e.g. gpt-4o-mini",
+    "apiKey": "API Key",
+    "apiKeyPlaceholder": "Paste your API key",
+    "apiKeyKeepPlaceholder": "Leave blank to keep current key ({{preview}})",
+    "getApiKey": "Get an API key",
+    "testConnection": "Test connection before saving",
+    "save": "Save",
+    "clear": "Clear",
+    "clearConfirm": "Remove this provider override and fall back to the system default?",
+    "saved": "Provider saved",
+    "cleared": "Provider cleared",
+    "loading": "Loading…",
+    "disabledNotice": "Per-workspace providers are not enabled on this server.",
+    "lastUpdated": "Last updated {{at}} by {{by}}",
+    "effectiveLine": "In use: {{host}} · {{model}}",
+    "effective": {
+      "title": "Effective configuration (what each role is calling)",
+      "role": "Role",
+      "host": "Host",
+      "model": "Model",
+      "source": "Source"
+    },
+    "status": {
+      "custom": "Custom provider",
+      "systemDefault": "System default"
+    },
+    "admin": {
+      "manageWorkspace": "Manage workspace",
+      "myWorkspace": "My workspace",
+      "otherWorkspace": "Other workspace…",
+      "otherWorkspacePlaceholder": "Enter a workspace id",
+      "actingOn": "Editing on behalf of {{workspace}}",
+      "loadWorkspacesFailed": "Failed to load workspaces"
+    },
+    "errors": {
+      "baseUrlRequired": "Base URL is required",
+      "modelRequired": "Model is required",
+      "apiKeyRequired": "API key is required",
+      "saveFailed": "Failed to save provider",
+      "clearFailed": "Failed to clear provider",
+      "loadFailed": "Failed to load provider settings"
     }
   },
   "login": {
