@@ -6,8 +6,8 @@ Controls which OAuth2 clients and API keys can perform OBO operations using the 
 
 ## Quick Start
 
-1. Create `.obo_allowlist` in your working directory
-2. Add your config (see format below)
+1. Copy the starter file [`.obo_allowlist.example`](../../.obo_allowlist.example) (repo root) into your working directory as `.obo_allowlist`
+2. Edit your config (see format below)
 3. Changes apply automatically within 60 seconds (no restart needed)
 
 ## Config File
