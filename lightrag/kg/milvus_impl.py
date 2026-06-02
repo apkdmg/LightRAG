@@ -411,9 +411,13 @@ class MilvusVectorDBStorage(BaseVectorStorage):
         dimension = self.embedding_func.embedding_dim
 
         # Base fields (common to all collections)
+        # NOTE: ``id`` holds ``<prefix>-<sha256 hexdigest>`` ids (compute_mdhash_id):
+        # e.g. ``chunk-``/``ent-``/``rel-`` + 64 hex = 68-70+ chars, and docling
+        # sidecar block-ref chunk ids can be longer still. 256 leaves ample headroom
+        # (the legacy 64 only fit the old MD5 32-hex ids and overflows on SHA-256).
         base_fields = [
             FieldSchema(
-                name="id", dtype=DataType.VARCHAR, max_length=64, is_primary=True
+                name="id", dtype=DataType.VARCHAR, max_length=256, is_primary=True
             ),
             FieldSchema(name="vector", dtype=DataType.FLOAT_VECTOR, dim=dimension),
             FieldSchema(name="created_at", dtype=DataType.INT64),
@@ -459,7 +463,9 @@ class MilvusVectorDBStorage(BaseVectorStorage):
                 FieldSchema(
                     name="full_doc_id",
                     dtype=DataType.VARCHAR,
-                    max_length=64,
+                    # Holds a ``doc-<sha256>`` id (68 chars); 64 overflowed. See the
+                    # ``id`` field note above.
+                    max_length=256,
                     nullable=True,
                 ),
                 FieldSchema(
