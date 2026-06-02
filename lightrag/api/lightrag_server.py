@@ -475,6 +475,15 @@ def create_app(args):
             # Note: initialize_storages() now auto-initializes pipeline_status for rag.workspace
             await rag.initialize_storages()
 
+            # Apply any BYO provider override stored for the default workspace.
+            store = getattr(app.state, "workspace_provider_store", None)
+            if store is not None:
+                from lightrag.api.workspace_providers import (
+                    apply_workspace_provider_overrides,
+                )
+
+                await apply_workspace_provider_overrides(rag, args.workspace, store)
+
             # Data migration regardless of storage implementation
             await rag.check_and_migrate_data()
 
@@ -1684,6 +1693,36 @@ def create_app(args):
     # per-workspace instances lazily via the same `build_rag` factory.
     rag = build_rag(args.workspace)
 
+    # Per-workspace BYO provider store (fork feature). Encrypts owner-supplied
+    # OpenAI-compatible LLM/Vision-LLM credentials; overrides are applied to a
+    # workspace's instance on (re)build via the on_instance_ready hook below.
+    if args.enable_workspace_providers:
+        from lightrag.api.workspace_providers import (
+            WorkspaceProviderStore,
+            apply_workspace_provider_overrides,
+        )
+
+        workspace_provider_store = WorkspaceProviderStore(
+            working_dir=args.working_dir,
+            get_secret=lambda: args.workspace_provider_secret,
+        )
+        app.state.workspace_provider_store = workspace_provider_store
+        if not workspace_provider_store.has_secret():
+            logger.warning(
+                "ENABLE_WORKSPACE_PROVIDERS is on but WORKSPACE_PROVIDER_SECRET "
+                "is not set; owners will be unable to save provider credentials "
+                "until a secret is configured."
+            )
+
+        async def _on_instance_ready(rag_instance, workspace_id):
+            await apply_workspace_provider_overrides(
+                rag_instance, workspace_id, workspace_provider_store
+            )
+    else:
+        workspace_provider_store = None
+        app.state.workspace_provider_store = None
+        _on_instance_ready = None
+
     # Multi-tenancy: wire the factory-based WorkspaceManager when enabled.
     if args.enable_multi_tenancy:
         from lightrag.api.workspace_manager import WorkspaceManager
@@ -1692,6 +1731,7 @@ def create_app(args):
             instance_factory=build_rag,
             max_instances=args.max_workspace_instances,
             ttl_minutes=args.workspace_ttl_minutes,
+            on_instance_ready=_on_instance_ready,
         )
         logger.info(
             "Multi-tenancy enabled: WorkspaceManager active "
@@ -1731,6 +1771,15 @@ def create_app(args):
     if args.enable_multi_tenancy:
         app.include_router(create_admin_routes())
         logger.info("Admin routes enabled for multi-tenancy management")
+
+    # Per-workspace BYO provider routes (multi-tenancy + feature flag).
+    if args.enable_multi_tenancy and args.enable_workspace_providers:
+        from lightrag.api.routers.provider_routes import create_provider_routes
+
+        app.include_router(create_provider_routes(api_key=api_key))
+        logger.info(
+            "Per-workspace provider routes enabled (/workspace/provider-config)"
+        )
 
     # Add Ollama API routes
     ollama_api = OllamaAPI(rag, top_k=args.top_k, api_key=api_key)

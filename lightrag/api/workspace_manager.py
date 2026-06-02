@@ -15,7 +15,7 @@ import re
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 from lightrag import LightRAG
 
@@ -90,6 +90,7 @@ class WorkspaceManager:
         instance_factory: Callable[[str], LightRAG],
         max_instances: int = 100,
         ttl_minutes: int = 60,
+        on_instance_ready: Optional[Callable[[LightRAG, str], Awaitable[None]]] = None,
     ):
         """
         Initialize the WorkspaceManager.
@@ -101,10 +102,15 @@ class WorkspaceManager:
                 (eviction / shutdown call ``finalize_storages()``).
             max_instances: Maximum number of instances to keep in memory.
             ttl_minutes: Time-to-live for inactive instances.
+            on_instance_ready: Optional async hook invoked with
+                ``(rag, workspace_id)`` right after ``initialize_storages()``,
+                before the instance is served. Used to apply per-workspace
+                provider overrides; kept generic so the manager stays decoupled.
         """
         self._instance_factory = instance_factory
         self._max_instances = max_instances
         self._ttl_minutes = ttl_minutes
+        self._on_instance_ready = on_instance_ready
 
         # LRU cache: workspace_id -> (LightRAG, created_at, last_accessed, access_count)
         self._instances: OrderedDict[str, Tuple[LightRAG, float, float, int]] = (
@@ -134,10 +140,45 @@ class WorkspaceManager:
         """Build and initialize a new LightRAG instance for a workspace."""
         rag = self._instance_factory(workspace_id)
         await rag.initialize_storages()
+        if self._on_instance_ready is not None:
+            try:
+                await self._on_instance_ready(rag, workspace_id)
+            except Exception as e:
+                # An override-application failure must not take the instance
+                # down; it simply continues on the system-default provider.
+                logger.error(
+                    f"on_instance_ready hook failed for workspace '{workspace_id}': {e}"
+                )
         logger.info(
             f"LightRAG instance created and initialized for workspace: {workspace_id}"
         )
         return rag
+
+    async def invalidate(self, workspace_id: str) -> bool:
+        """Finalize and drop a cached instance WITHOUT deleting its data/metadata.
+
+        Used to apply per-workspace configuration changes (e.g. BYO provider
+        credentials) with no server restart: the next request for the workspace
+        rebuilds a fresh instance, which re-runs ``on_instance_ready`` and picks
+        up the new configuration. Returns True if an instance was evicted.
+
+        This is non-destructive (unlike :meth:`delete_workspace`): the
+        workspace's stored data and metadata are untouched.
+        """
+        async with self._lock:
+            entry = self._instances.pop(workspace_id, None)
+            if entry is None:
+                return False
+            rag = entry[0]
+            try:
+                await rag.finalize_storages()
+            except Exception as e:
+                logger.error(
+                    f"Error finalizing storage during invalidate for "
+                    f"{workspace_id}: {e}"
+                )
+            logger.info(f"Invalidated cached instance for workspace: {workspace_id}")
+            return True
 
     async def get_instance(self, workspace_id: str) -> LightRAG:
         """
