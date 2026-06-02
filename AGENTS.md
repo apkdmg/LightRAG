@@ -284,7 +284,7 @@ Primary configuration file for API server. Generate it with `make env-base` or c
 - Reranking configuration (RERANK_BINDING, RERANK_MODEL)
 - Authentication (AUTH_ACCOUNTS, LIGHTRAG_API_KEY)
 
-See `env.example` for comprehensive template.
+See `env.example` for comprehensive template. For the full authentication/authorization model (principal types, roles, and data scope), see `lightrag/api/AUTH_MODEL.md`.
 
 ### Setup Wizard Outputs
 - Keep `.env` host-usable. Container-only hostnames and staged SSL paths belong in the wizard-managed compose layer, not persisted back into `.env`.

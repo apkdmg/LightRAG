@@ -224,21 +224,28 @@ class AuthHandler:
 auth_handler = AuthHandler()
 
 
-def _is_admin_user(username: str) -> bool:
+def _is_admin_user(*usernames: str) -> bool:
     """
-    Check if username is in ADMIN_ACCOUNTS.
+    Check if any of the given identifiers is in ADMIN_ACCOUNTS.
+
+    Matching is case-insensitive and accepts multiple candidate identifiers
+    (e.g. email and preferred_username) so the same human is treated as an
+    admin regardless of which identifier a given auth path surfaces.
 
     Args:
-        username: The username to check
+        *usernames: One or more candidate identifiers to check. Empty/None
+            candidates are ignored.
 
     Returns:
-        bool: True if user is an admin
+        bool: True if ANY non-empty candidate matches an ADMIN_ACCOUNTS entry.
     """
     admin_accounts = global_args.admin_accounts
     if not admin_accounts:
         return False
-    admins = [a.strip().lower() for a in admin_accounts.split(",")]
-    return username.lower() in admins
+    admins = {a.strip().lower() for a in admin_accounts.split(",") if a.strip()}
+    if not admins:
+        return False
+    return any(u and u.strip().lower() in admins for u in usernames)
 
 
 def validate_any_token(token: str) -> dict:
@@ -283,18 +290,15 @@ def validate_any_token(token: str) -> dict:
             if keycloak_client.is_service_account_token(payload):
                 client_id = payload.get("clientId") or payload.get("azp")
                 # Admin is granted ONLY to client IDs explicitly listed in the
-                # OAUTH2_SERVICE_ACCOUNT_ADMIN_CLIENTS allowlist. With the safe
-                # default (empty allowlist) NO service account becomes admin —
-                # any client-credentials token from the same realm authenticates
-                # as a normal "user", not a LightRAG admin.
-                admin_clients = {
-                    c.strip()
-                    for c in (
-                        global_args.oauth2_service_account_admin_clients or ""
-                    ).split(",")
-                    if c.strip()
-                }
-                if client_id and client_id in admin_clients:
+                # unified OBO admin allowlist (OBO_ADMIN_CLIENTS in the
+                # .obo_allowlist file, hot-reloaded; with a DEPRECATED fallback
+                # to the OAUTH2_SERVICE_ACCOUNT_ADMIN_CLIENTS env var). With the
+                # safe default (empty allowlist) NO service account becomes
+                # admin — any client-credentials token from the same realm
+                # authenticates as a normal "user", not a LightRAG admin.
+                from .obo_allowlist import check_admin_client
+
+                if check_admin_client(client_id):
                     role = "admin"
                     logger.info(
                         f"Service account granted admin role: client_id={client_id}"
@@ -325,7 +329,7 @@ def validate_any_token(token: str) -> dict:
             username = preferred_username
             # Derive workspace_id from email to match SSO login behavior
             workspace_source = email or preferred_username
-            role = "admin" if _is_admin_user(username) else "user"
+            role = "admin" if _is_admin_user(preferred_username, email) else "user"
 
             logger.info(
                 f"OAuth2 user resolved: username={username}, "

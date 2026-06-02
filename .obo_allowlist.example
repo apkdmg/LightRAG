@@ -1,0 +1,99 @@
+# ============================================================================
+# .obo_allowlist — example / starter file
+# ============================================================================
+# Controls service-account (machine) authorization for LightRAG:
+#   - which OAuth2 client / API key may act on which workspace (OBO scope)
+#   - which service-account client_ids get the global "admin" role
+#
+# HUMAN admins are NOT configured here — they live in ADMIN_ACCOUNTS in .env.
+# See lightrag/api/AUTH_MODEL.md and lightrag/api/OBO_ALLOWLIST.md for the
+# full model.
+#
+# SETUP
+#   1. Copy this file to your working directory as `.obo_allowlist`
+#      (Docker: /app/data/rag_storage/.obo_allowlist — i.e. inside the data
+#       volume; default path is {working_dir}/.obo_allowlist, or set
+#       OBO_ALLOWLIST_PATH to point elsewhere).
+#   2. Edit the values below.
+#   3. Save. Changes hot-reload within ~60s — NO restart needed.
+#
+# FORMAT: .env-like  KEY=VALUE  (lines starting with # are comments)
+# Only relevant when ENABLE_MULTI_TENANCY=true. With multi-tenancy off this
+# file is inert (single shared workspace, no OBO).
+# ============================================================================
+
+
+# ----------------------------------------------------------------------------
+# Default policy for clients NOT listed below: deny (recommended) or allow.
+# Keep this `deny` in production — only explicitly-listed clients get through.
+# ----------------------------------------------------------------------------
+OBO_DEFAULT_POLICY=deny
+
+
+# ----------------------------------------------------------------------------
+# WORKSPACE SCOPE — which workspace data each client may touch via the
+# X-Target-Workspace header.
+#
+# Format: [client_id:workspace1,workspace2] or [client_id:*] for all.
+# client_id = the token's azp/clientId (e.g. your Keycloak client).
+# Comma-separate multiple clients.
+# ----------------------------------------------------------------------------
+
+# Example: n8n may operate only on the "space1" workspace.
+OBO_ALLOWED_CLIENTS=[n8n:space1]
+
+# More patterns (uncomment / adapt):
+# OBO_ALLOWED_CLIENTS=[n8n:space1],[partner-app:tenant_a,tenant_b],[backend:*]
+
+
+# ----------------------------------------------------------------------------
+# ADMIN ROLE — service-account client_ids granted the global admin role
+# (gates the /admin routes: create/delete/list workspaces, impersonate, etc.).
+#
+# Comma-separated client_ids. NO wildcard, NO workspace dimension — deliberately
+# strict. Leave EMPTY (the safe default) if no machine client needs admin; such
+# clients then authenticate as a normal "user".
+#
+# NOTE: admin role and workspace scope are independent. A client that only
+# ingests/queries needs OBO_ALLOWED_CLIENTS but should NOT be in OBO_ADMIN_CLIENTS.
+# ----------------------------------------------------------------------------
+
+# Example: grant n8n the admin role (only if it performs admin operations).
+OBO_ADMIN_CLIENTS=n8n
+
+# Most integrations only ingest/query — in that case leave it empty instead:
+# OBO_ADMIN_CLIENTS=
+
+
+# ----------------------------------------------------------------------------
+# GLOBAL SHARED API KEY (LIGHTRAG_API_KEY) — whether it may use OBO, and where.
+# Its role is set separately via LIGHTRAG_API_KEY_ROLE in .env (default admin;
+# set to "user" to scope a shared key down).
+# ----------------------------------------------------------------------------
+OBO_API_KEY_ALLOWED=false
+# OBO_API_KEY_WORKSPACES=*          # or a comma list: space1,space2
+
+
+# ============================================================================
+# Quick reference — common setups
+# ============================================================================
+#
+# A) One automation (n8n) that needs admin on one workspace (your current case):
+#       OBO_DEFAULT_POLICY=deny
+#       OBO_ALLOWED_CLIENTS=[n8n:space1]
+#       OBO_ADMIN_CLIENTS=n8n
+#
+# B) Read/write integration on one workspace, NO admin (most common, safest):
+#       OBO_DEFAULT_POLICY=deny
+#       OBO_ALLOWED_CLIENTS=[n8n:space1]
+#       OBO_ADMIN_CLIENTS=
+#
+# C) Trusted backend with full access to all workspaces + admin:
+#       OBO_DEFAULT_POLICY=deny
+#       OBO_ALLOWED_CLIENTS=[backend:*]
+#       OBO_ADMIN_CLIENTS=backend
+#
+# D) Shared X-API-Key allowed to target any workspace:
+#       OBO_API_KEY_ALLOWED=true
+#       OBO_API_KEY_WORKSPACES=*
+# ============================================================================

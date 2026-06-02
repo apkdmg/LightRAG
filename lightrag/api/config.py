@@ -353,6 +353,17 @@ def parse_args() -> argparse.Namespace:
         help="API key for authentication. This protects lightrag server against unauthorized access",
     )
 
+    # Role granted to the holder of the shared LIGHTRAG_API_KEY. Defaults to
+    # "admin" for backward compatibility (the global key has historically been
+    # full-access), but can be scoped down to "user" so a leaked key cannot act
+    # as an admin. See AUTH_MODEL.md.
+    parser.add_argument(
+        "--api-key-role",
+        type=str,
+        default=get_env_value("LIGHTRAG_API_KEY_ROLE", "admin", str),
+        help="Role granted to the shared LIGHTRAG_API_KEY holder (admin or user, default admin)",
+    )
+
     # Optional https parameters
     parser.add_argument(
         "--ssl",
@@ -499,6 +510,16 @@ def parse_args() -> argparse.Namespace:
         GeminiEmbeddingOptions.add_args(parser)
 
     args = parser.parse_args()
+
+    # Validate the shared API key role; fall back to the secure-by-history
+    # default ("admin") if an unrecognized value is supplied.
+    if args.api_key_role not in {"admin", "user"}:
+        logger.warning(
+            'Invalid LIGHTRAG_API_KEY_ROLE="%s"; expected "admin" or "user". '
+            'Falling back to "admin".',
+            args.api_key_role,
+        )
+        args.api_key_role = "admin"
 
     # convert relative path to absolute path
     args.working_dir = os.path.abspath(args.working_dir)
@@ -693,6 +714,12 @@ def parse_args() -> argparse.Namespace:
         "OAUTH2_REDIRECT_URI", "http://localhost:8020/oauth2/callback"
     )
     args.oauth2_scopes = get_env_value("OAUTH2_SCOPES", "openid profile email")
+    # DEPRECATED: use OBO_ADMIN_CLIENTS in the .obo_allowlist file instead
+    # (hot-reloaded, single place alongside the workspace OBO config). This arg
+    # is still parsed for backward compatibility and is consumed only as a
+    # fallback inside lightrag.api.obo_allowlist (which reads the env var
+    # directly via os.getenv); it is no longer read here in auth.py.
+    #
     # Comma-separated allowlist of Keycloak client IDs (the token's `azp` /
     # `clientId` claim) permitted to act as LightRAG admin when authenticating
     # via a service-account / client-credentials token. Empty (the default)
