@@ -22,15 +22,28 @@
   },
   "providerSettings": {
     "title": "LLM Providers",
-    "subtitle": "Use your own OpenAI-compatible provider for this workspace. Leave empty to use the system default.",
-    "llmTitle": "Text LLM",
-    "llmDescription": "Used for extraction, keywords and query answering.",
+    "subtitle": "Use your own OpenAI-compatible provider per role for this workspace. Leave a slot empty to use the system default.",
+    "extractionTitle": "Extraction LLM",
+    "extractionDescription": "Ingestion: entity/relation extraction and query keywords. A fast, non-thinking model is ideal.",
+    "queryTitle": "Query LLM",
+    "queryDescription": "Inference: final answer generation. A reasoning model is usually preferred.",
     "visionTitle": "Vision LLM",
     "visionDescription": "Used to describe images during multimodal ingestion.",
     "provider": "Provider",
     "baseUrl": "Base URL",
     "model": "Model",
     "modelPlaceholder": "e.g. gpt-4o-mini",
+    "reasoning": {
+      "label": "Reasoning",
+      "help": "Thinking effort for reasoning models. Use 'Off' for fast extraction; higher for query answers.",
+      "options": {
+        "default": "Provider default",
+        "none": "Off",
+        "low": "Low",
+        "medium": "Medium",
+        "high": "High"
+      }
+    },
     "apiKey": "API Key",
     "apiKeyPlaceholder": "Paste your API key",
     "apiKeyKeepPlaceholder": "Leave blank to keep current key ({{preview}})",

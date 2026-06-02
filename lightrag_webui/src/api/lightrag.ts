@@ -1310,16 +1310,20 @@ export const handleOAuth2Callback = async (
  * is the fallback. Secrets are never returned by the server — only a masked view.
  */
 /** The provider actually in effect for a slot (custom override or system default). */
+export type ReasoningEffort = 'none' | 'low' | 'medium' | 'high'
+
 export type ProviderEffective = {
   binding: string | null
   model: string | null
   host: string | null
+  reasoning_effort: string | null
   source: 'custom' | 'system_default'
 }
 
 export type ProviderSlotMasked = {
   base_url: string | null
   model: string | null
+  reasoning_effort: string | null
   preset_id: string | null
   api_key_set: boolean
   api_key_preview: string
@@ -1328,8 +1332,12 @@ export type ProviderSlotMasked = {
   effective?: ProviderEffective
 }
 
+/** The three role-group slots. */
+export type ProviderSlotKey = 'extraction' | 'query' | 'vision'
+
 export type ProviderConfigMasked = {
-  llm: ProviderSlotMasked
+  extraction: ProviderSlotMasked
+  query: ProviderSlotMasked
   vision: ProviderSlotMasked
   updated_at: string | null
   updated_by: string | null
@@ -1340,11 +1348,13 @@ export type ProviderSlotInput = {
   base_url?: string
   api_key?: string
   model?: string
+  reasoning_effort?: string
   preset_id?: string
 }
 
 export type UpdateProviderConfigRequest = {
-  llm?: ProviderSlotInput
+  extraction?: ProviderSlotInput
+  query?: ProviderSlotInput
   vision?: ProviderSlotInput
 }
 
@@ -1378,9 +1388,9 @@ export const updateProviderConfig = async (
   return response.data
 }
 
-/** Clear a provider override (slot = 'all' | 'llm' | 'vision'). */
+/** Clear a provider override (slot = 'all' | 'extraction' | 'query' | 'vision'). */
 export const deleteProviderConfig = async (
-  slot: 'all' | 'llm' | 'vision' = 'all',
+  slot: 'all' | ProviderSlotKey = 'all',
   targetWorkspace?: string | null
 ): Promise<ProviderConfigMasked> => {
   const response = await axiosInstance.delete('/workspace/provider-config', {
@@ -1395,6 +1405,7 @@ export type EffectiveRoleConfig = {
   binding: string | null
   model: string | null
   host: string | null
+  reasoning_effort: string | null
   is_cross_provider: boolean
   source: 'custom' | 'system_default'
 }

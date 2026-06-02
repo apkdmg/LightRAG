@@ -27,6 +27,7 @@ import {
   getEffectiveRoleConfig,
   listAdminWorkspaces,
   type ProviderSlotMasked,
+  type ProviderSlotKey,
   type EffectiveRolesResponse,
   type AdminWorkspace
 } from '@/api/lightrag'
@@ -39,13 +40,15 @@ import {
   type ProviderPreset
 } from '@/features/providerPresets'
 
-type SlotKey = 'llm' | 'vision'
+// 'default' = let the provider decide (stored as empty/None server-side).
+const REASONING_OPTIONS = ['default', 'none', 'low', 'medium', 'high'] as const
 
 interface SlotDraft {
   presetId: string
   baseUrl: string
   model: string
   apiKey: string
+  reasoning: string // '' = default, else none|low|medium|high
 }
 
 function draftFromMasked(masked: ProviderSlotMasked): SlotDraft {
@@ -56,12 +59,13 @@ function draftFromMasked(masked: ProviderSlotMasked): SlotDraft {
     presetId: preset.id,
     baseUrl: masked.base_url ?? preset.baseUrl,
     model: masked.model ?? '',
-    apiKey: ''
+    apiKey: '',
+    reasoning: masked.reasoning_effort ?? ''
   }
 }
 
 interface SlotFormProps {
-  slot: SlotKey
+  slot: ProviderSlotKey
   masked: ProviderSlotMasked
   targetWorkspace: string | null
   onSaved: () => void
@@ -76,19 +80,14 @@ function ProviderSlotForm({ slot, masked, targetWorkspace, onSaved }: SlotFormPr
   const [busy, setBusy] = useState(false)
 
   const preset: ProviderPreset = getPreset(draft.presetId)
-  const suggestedModels =
-    slot === 'vision' ? preset.suggestedVisionModels : preset.suggestedModels
+  const isVision = slot === 'vision'
+  const suggestedModels = isVision ? preset.suggestedVisionModels : preset.suggestedModels
   const datalistId = `provider-models-${slot}`
 
   const onPresetChange = useCallback((id: string) => {
     setDraft((d) => {
       const p = getPreset(id)
-      return {
-        ...d,
-        presetId: id,
-        // Adopt the preset base URL unless it's the free-form "custom" preset.
-        baseUrl: p.editableBaseUrl ? d.baseUrl : p.baseUrl
-      }
+      return { ...d, presetId: id, baseUrl: p.editableBaseUrl ? d.baseUrl : p.baseUrl }
     })
   }, [])
 
@@ -113,7 +112,7 @@ function ProviderSlotForm({ slot, masked, targetWorkspace, onSaved }: SlotFormPr
             base_url: draft.baseUrl.trim(),
             model: draft.model.trim(),
             preset_id: draft.presetId,
-            // Send the key only when the user typed a new one (keep existing otherwise).
+            reasoning_effort: draft.reasoning, // '' => provider default
             ...(draft.apiKey ? { api_key: draft.apiKey } : {})
           }
         },
@@ -153,10 +152,7 @@ function ProviderSlotForm({ slot, masked, targetWorkspace, onSaved }: SlotFormPr
           }
         >
           <span
-            className={
-              'size-2 rounded-full ' +
-              (masked.active ? 'bg-emerald-500' : 'bg-zinc-400')
-            }
+            className={'size-2 rounded-full ' + (masked.active ? 'bg-emerald-500' : 'bg-zinc-400')}
           />
           {masked.active
             ? t('providerSettings.status.custom')
@@ -164,7 +160,6 @@ function ProviderSlotForm({ slot, masked, targetWorkspace, onSaved }: SlotFormPr
         </span>
       </div>
 
-      {/* Effective provider actually in use — shown even for the system default. */}
       {masked.effective && (
         <p className="text-xs text-muted-foreground">
           {t('providerSettings.effectiveLine', {
@@ -174,7 +169,6 @@ function ProviderSlotForm({ slot, masked, targetWorkspace, onSaved }: SlotFormPr
         </p>
       )}
 
-      {/* Provider preset */}
       <label className="text-sm font-medium">{t('providerSettings.provider')}</label>
       <Select value={draft.presetId} onValueChange={onPresetChange}>
         <SelectTrigger>
@@ -189,7 +183,6 @@ function ProviderSlotForm({ slot, masked, targetWorkspace, onSaved }: SlotFormPr
         </SelectContent>
       </Select>
 
-      {/* Base URL — read-only unless "custom" */}
       <label className="text-sm font-medium">{t('providerSettings.baseUrl')}</label>
       <Input
         value={draft.baseUrl}
@@ -200,7 +193,6 @@ function ProviderSlotForm({ slot, masked, targetWorkspace, onSaved }: SlotFormPr
         autoComplete="off"
       />
 
-      {/* Model (editable dropdown via datalist) */}
       <label className="text-sm font-medium">{t('providerSettings.model')}</label>
       <Input
         value={draft.model}
@@ -217,7 +209,24 @@ function ProviderSlotForm({ slot, masked, targetWorkspace, onSaved }: SlotFormPr
         </datalist>
       )}
 
-      {/* API key (password) */}
+      <label className="text-sm font-medium">{t('providerSettings.reasoning.label')}</label>
+      <Select
+        value={draft.reasoning || 'default'}
+        onValueChange={(v) => setDraft((d) => ({ ...d, reasoning: v === 'default' ? '' : v }))}
+      >
+        <SelectTrigger>
+          <SelectValue />
+        </SelectTrigger>
+        <SelectContent>
+          {REASONING_OPTIONS.map((opt) => (
+            <SelectItem key={opt} value={opt}>
+              {t(`providerSettings.reasoning.options.${opt}`)}
+            </SelectItem>
+          ))}
+        </SelectContent>
+      </Select>
+      <p className="text-xs text-muted-foreground">{t('providerSettings.reasoning.help')}</p>
+
       <label className="text-sm font-medium">{t('providerSettings.apiKey')}</label>
       <Input
         type="password"
@@ -243,11 +252,7 @@ function ProviderSlotForm({ slot, masked, targetWorkspace, onSaved }: SlotFormPr
       )}
 
       <label className="mt-1 inline-flex items-center gap-2 text-xs text-muted-foreground">
-        <input
-          type="checkbox"
-          checked={test}
-          onChange={(e) => setTest(e.target.checked)}
-        />
+        <input type="checkbox" checked={test} onChange={(e) => setTest(e.target.checked)} />
         {t('providerSettings.testConnection')}
       </label>
 
@@ -256,12 +261,7 @@ function ProviderSlotForm({ slot, masked, targetWorkspace, onSaved }: SlotFormPr
           <SaveIcon className="size-4" />
           {t('providerSettings.save')}
         </Button>
-        <Button
-          onClick={handleClear}
-          disabled={busy || !masked.active}
-          variant="outline"
-          size="sm"
-        >
+        <Button onClick={handleClear} disabled={busy || !masked.active} variant="outline" size="sm">
           <Trash2Icon className="size-4" />
           {t('providerSettings.clear')}
         </Button>
@@ -318,25 +318,19 @@ function ManageWorkspaceSelector({ value, onChange }: ManageWorkspaceSelectorPro
   return (
     <Card>
       <CardContent className="flex flex-col gap-2 pt-6">
-        <label className="text-sm font-medium">
-          {t('providerSettings.admin.manageWorkspace')}
-        </label>
+        <label className="text-sm font-medium">{t('providerSettings.admin.manageWorkspace')}</label>
         <Select value={selectValue} onValueChange={handleSelect}>
           <SelectTrigger>
             <SelectValue />
           </SelectTrigger>
           <SelectContent>
-            <SelectItem value={SELF_WORKSPACE}>
-              {t('providerSettings.admin.myWorkspace')}
-            </SelectItem>
+            <SelectItem value={SELF_WORKSPACE}>{t('providerSettings.admin.myWorkspace')}</SelectItem>
             {workspaces.map((w) => (
               <SelectItem key={w.workspace_id} value={w.workspace_id}>
                 {w.owner_username} ({w.workspace_id})
               </SelectItem>
             ))}
-            <SelectItem value={OTHER_WORKSPACE}>
-              {t('providerSettings.admin.otherWorkspace')}
-            </SelectItem>
+            <SelectItem value={OTHER_WORKSPACE}>{t('providerSettings.admin.otherWorkspace')}</SelectItem>
           </SelectContent>
         </Select>
         {manual && (
@@ -360,6 +354,12 @@ function ManageWorkspaceSelector({ value, onChange }: ManageWorkspaceSelectorPro
   )
 }
 
+const SLOT_META: { key: ProviderSlotKey; titleKey: string; descKey: string }[] = [
+  { key: 'extraction', titleKey: 'extractionTitle', descKey: 'extractionDescription' },
+  { key: 'query', titleKey: 'queryTitle', descKey: 'queryDescription' },
+  { key: 'vision', titleKey: 'visionTitle', descKey: 'visionDescription' }
+]
+
 export default function ProviderSettings() {
   const { t } = useTranslation()
   const { role } = useAuthStore()
@@ -370,7 +370,6 @@ export default function ProviderSettings() {
   const [loading, setLoading] = useState(false)
   const [disabled, setDisabled] = useState(false)
   const [effective, setEffective] = useState<EffectiveRolesResponse | null>(null)
-  // Bumped after each reload to remount the slot forms with fresh state.
   const [reloadKey, setReloadKey] = useState(0)
 
   const reload = useCallback(async () => {
@@ -380,14 +379,12 @@ export default function ProviderSettings() {
       setConfig(data)
       setDisabled(false)
       setReloadKey((k) => k + 1)
-      // Best-effort ground-truth introspection; ignore failures.
       try {
         setEffective(await getEffectiveRoleConfig(targetWorkspace))
       } catch {
         setEffective(null)
       }
     } catch (err: any) {
-      // 503 → feature not enabled on this server; show a notice rather than an error.
       if (typeof err?.message === 'string' && err.message.includes('503')) {
         setDisabled(true)
         setConfig(null)
@@ -405,7 +402,7 @@ export default function ProviderSettings() {
   }, [reload])
 
   return (
-    <div className="mx-auto flex max-w-3xl flex-col gap-4 overflow-auto p-6">
+    <div className="mx-auto flex max-w-5xl flex-col gap-4 overflow-auto p-6">
       <div>
         <h1 className="text-xl font-bold">{t('providerSettings.title')}</h1>
         <p className="text-sm text-muted-foreground">{t('providerSettings.subtitle')}</p>
@@ -418,46 +415,30 @@ export default function ProviderSettings() {
       {disabled && (
         <Card>
           <CardContent className="pt-6">
-            <p className="text-sm text-muted-foreground">
-              {t('providerSettings.disabledNotice')}
-            </p>
+            <p className="text-sm text-muted-foreground">{t('providerSettings.disabledNotice')}</p>
           </CardContent>
         </Card>
       )}
 
       {config && (
-        <div className="grid gap-4 md:grid-cols-2">
-          <Card>
-            <CardHeader>
-              <CardTitle>{t('providerSettings.llmTitle')}</CardTitle>
-              <CardDescription>{t('providerSettings.llmDescription')}</CardDescription>
-            </CardHeader>
-            <CardContent>
-              <ProviderSlotForm
-                key={`llm-${reloadKey}`}
-                slot="llm"
-                masked={config.llm}
-                targetWorkspace={targetWorkspace}
-                onSaved={reload}
-              />
-            </CardContent>
-          </Card>
-
-          <Card>
-            <CardHeader>
-              <CardTitle>{t('providerSettings.visionTitle')}</CardTitle>
-              <CardDescription>{t('providerSettings.visionDescription')}</CardDescription>
-            </CardHeader>
-            <CardContent>
-              <ProviderSlotForm
-                key={`vision-${reloadKey}`}
-                slot="vision"
-                masked={config.vision}
-                targetWorkspace={targetWorkspace}
-                onSaved={reload}
-              />
-            </CardContent>
-          </Card>
+        <div className="grid gap-4 lg:grid-cols-3">
+          {SLOT_META.map(({ key, titleKey, descKey }) => (
+            <Card key={key}>
+              <CardHeader>
+                <CardTitle>{t(`providerSettings.${titleKey}`)}</CardTitle>
+                <CardDescription>{t(`providerSettings.${descKey}`)}</CardDescription>
+              </CardHeader>
+              <CardContent>
+                <ProviderSlotForm
+                  key={`${key}-${reloadKey}`}
+                  slot={key}
+                  masked={config[key]}
+                  targetWorkspace={targetWorkspace}
+                  onSaved={reload}
+                />
+              </CardContent>
+            </Card>
+          ))}
         </div>
       )}
 
@@ -470,7 +451,6 @@ export default function ProviderSettings() {
         </p>
       )}
 
-      {/* Ground-truth: exactly what each LLM role is calling right now. */}
       {effective && (
         <details className="rounded-md border border-border/60 p-3 text-sm">
           <summary className="cursor-pointer font-medium">
@@ -482,15 +462,17 @@ export default function ProviderSettings() {
                 <th className="py-1 pr-3 font-medium">{t('providerSettings.effective.role')}</th>
                 <th className="py-1 pr-3 font-medium">{t('providerSettings.effective.host')}</th>
                 <th className="py-1 pr-3 font-medium">{t('providerSettings.effective.model')}</th>
+                <th className="py-1 pr-3 font-medium">{t('providerSettings.reasoning.label')}</th>
                 <th className="py-1 font-medium">{t('providerSettings.effective.source')}</th>
               </tr>
             </thead>
             <tbody>
-              {Object.entries(effective.roles).map(([role, cfg]) => (
-                <tr key={role} className="border-t border-border/40">
-                  <td className="py-1 pr-3 font-mono">{role}</td>
+              {Object.entries(effective.roles).map(([roleName, cfg]) => (
+                <tr key={roleName} className="border-t border-border/40">
+                  <td className="py-1 pr-3 font-mono">{roleName}</td>
                   <td className="py-1 pr-3 font-mono break-all">{cfg.host || '—'}</td>
                   <td className="py-1 pr-3 font-mono break-all">{cfg.model || '—'}</td>
+                  <td className="py-1 pr-3 font-mono">{cfg.reasoning_effort || '—'}</td>
                   <td className="py-1">
                     <span
                       className={

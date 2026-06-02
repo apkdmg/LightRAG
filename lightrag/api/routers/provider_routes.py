@@ -1,17 +1,24 @@
 """
-Per-workspace BYO LLM / Vision-LLM provider routes.
+Per-workspace BYO LLM / Vision-LLM provider routes (role-aware).
 
-Lets a workspace **owner** (self-service) — or an admin acting on behalf of a
-workspace via ``X-Target-Workspace`` — register, view, update and clear their own
-OpenAI-compatible provider (base URL + API key + model) for the text LLM and the
-vision LLM. The system default is used as fallback when no override is set.
+A workspace **owner** (self-service) — or an admin acting on behalf of a
+workspace via ``X-Target-Workspace`` — can register, view, update and clear
+their own OpenAI-compatible provider per role group:
 
-Changes take effect with **no server restart**: after persisting, the workspace's
-cached LightRAG instance is invalidated, so the next request rebuilds it and the
-build-time hook re-applies the (new) override or falls back to the system default.
+- ``extraction`` → ``extract`` + ``keyword`` (ingestion; fast / non-thinking)
+- ``query``      → ``query`` (answer generation; reasoning model preferred)
+- ``vision``     → ``vlm`` (image description)
 
-This router is registered only when both multi-tenancy and the feature flag
-(``ENABLE_WORKSPACE_PROVIDERS``) are enabled. It is fork-only and self-contained.
+Each slot carries ``base_url`` + ``api_key`` + ``model`` and an optional
+``reasoning_effort`` (none/low/medium/high). The system default is the fallback
+when a slot has no override.
+
+Changes take effect with **no server restart**: after persisting, the cached
+LightRAG instance is invalidated, so the next request rebuilds it and the
+build-time hook re-applies the (new) overrides.
+
+Registered only when both multi-tenancy and ``ENABLE_WORKSPACE_PROVIDERS`` are
+enabled. Fork-only and self-contained.
 """
 
 import logging
@@ -31,6 +38,10 @@ from lightrag.api.dependencies import (
 )
 from lightrag.api.utils_api import get_combined_auth_dependency
 from lightrag.api.workspace_providers import (
+    EXTRACTION_ROLES,
+    QUERY_ROLE,
+    REASONING_EFFORTS,
+    SLOT_ROLES,
     VISION_LLM_ROLE,
     ProviderSlot,
     WorkspaceProviderConfig,
@@ -39,11 +50,14 @@ from lightrag.api.workspace_providers import (
     slot_effective_view,
 )
 
-# Role used to represent each owner-facing slot in the effective view. The three
-# text roles share the same override, so any one of them is representative.
-_SLOT_REPRESENTATIVE_ROLE = {"llm": "query", "vision": VISION_LLM_ROLE}
-
 logger = logging.getLogger("lightrag.api.provider_routes")
+
+# Representative role used to surface each slot's effective config.
+_SLOT_REPRESENTATIVE_ROLE = {
+    "extraction": "extract",
+    "query": QUERY_ROLE,
+    "vision": VISION_LLM_ROLE,
+}
 
 
 # ----------------------------- request/response models -----------------------------
@@ -53,13 +67,15 @@ class ProviderSlotInput(BaseModel):
     base_url: Optional[str] = None
     api_key: Optional[str] = None  # omit to keep the existing stored key
     model: Optional[str] = None
+    reasoning_effort: Optional[str] = None  # none|low|medium|high; "" = default
     preset_id: Optional[str] = None
 
 
 class UpdateProviderConfigRequest(BaseModel):
     """Update request. Omitted slots are left unchanged; use DELETE to clear."""
 
-    llm: Optional[ProviderSlotInput] = None
+    extraction: Optional[ProviderSlotInput] = None
+    query: Optional[ProviderSlotInput] = None
     vision: Optional[ProviderSlotInput] = None
 
 
@@ -82,17 +98,36 @@ def _validate_base_url(base_url: str) -> None:
         )
 
 
+def _normalize_reasoning(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    value = value.strip().lower()
+    if value == "":
+        return None
+    if value not in REASONING_EFFORTS:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"reasoning_effort must be one of {list(REASONING_EFFORTS)} or empty",
+        )
+    return value
+
+
 def _merge_slot(existing: ProviderSlot, incoming: ProviderSlotInput) -> ProviderSlot:
     """Merge a submitted slot onto the existing stored slot.
 
     A missing ``api_key`` keeps the previously stored key (lets owners edit the
-    base URL / model without re-entering their secret). The merged result is
-    validated to be a complete, active override.
+    base URL / model / reasoning without re-entering their secret). The merged
+    result is validated to be a complete, active override.
     """
     base_url = incoming.base_url if incoming.base_url is not None else existing.base_url
     model = incoming.model if incoming.model is not None else existing.model
     preset_id = (
         incoming.preset_id if incoming.preset_id is not None else existing.preset_id
+    )
+    reasoning_effort = (
+        _normalize_reasoning(incoming.reasoning_effort)
+        if incoming.reasoning_effort is not None
+        else existing.reasoning_effort
     )
     if incoming.api_key:
         api_key: Optional[SecretStr] = SecretStr(incoming.api_key)
@@ -100,32 +135,23 @@ def _merge_slot(existing: ProviderSlot, incoming: ProviderSlotInput) -> Provider
         api_key = existing.api_key
 
     if not base_url:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="base_url is required",
-        )
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "base_url is required")
     _validate_base_url(base_url)
     if not (api_key and api_key.get_secret_value()):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="api_key is required",
-        )
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "api_key is required")
     if not model:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="model is required",
-        )
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "model is required")
     return ProviderSlot(
-        base_url=base_url, api_key=api_key, model=model, preset_id=preset_id
+        base_url=base_url,
+        api_key=api_key,
+        model=model,
+        reasoning_effort=reasoning_effort,
+        preset_id=preset_id,
     )
 
 
 async def _probe_provider(slot: ProviderSlot) -> None:
-    """Best-effort connectivity/auth probe against the provider's /models.
-
-    Raises 400 on a clear connection or auth failure; tolerates providers that
-    do not implement /models (only hard auth/connection errors are fatal).
-    """
+    """Best-effort connectivity/auth probe against the provider's /models."""
     url = slot.base_url.rstrip("/") + "/models"
     headers = {"Authorization": f"Bearer {slot.api_key.get_secret_value()}"}
     try:
@@ -143,75 +169,66 @@ async def _probe_provider(slot: ProviderSlot) -> None:
         )
 
 
+def _role_source(role_name: str, masked: dict) -> str:
+    if role_name in EXTRACTION_ROLES:
+        active = masked["extraction"]["active"]
+    elif role_name == QUERY_ROLE:
+        active = masked["query"]["active"]
+    elif role_name == VISION_LLM_ROLE:
+        active = masked["vision"]["active"]
+    else:
+        active = False
+    return "custom" if active else "system_default"
+
+
 def create_provider_routes(api_key: Optional[str] = None) -> APIRouter:
     router = APIRouter(prefix="/workspace", tags=["providers"])
     combined_auth = get_combined_auth_dependency(api_key)
 
-    @router.get(
-        "/provider-config",
-        dependencies=[Depends(combined_auth)],
-    )
+    @router.get("/provider-config", dependencies=[Depends(combined_auth)])
     async def get_provider_config(
         request: Request,
         workspace: str = Depends(get_current_workspace),
         workspace_manager=Depends(get_workspace_manager),
     ):
-        """Return the masked provider config plus the **effective** provider in
-        use for each slot — including the system default's host/model when no
-        override is set, so the owner always sees what is actually being called.
-        """
+        """Masked config plus the **effective** provider in use for each slot."""
         store = _get_store(request)
         masked = store.get_masked(workspace)
-        # Build/fetch the workspace instance and read its live, scrubbed role
-        # config so the effective host/model reflect any applied override.
         rag = await workspace_manager.get_instance(workspace)
         roles = rag.get_llm_role_config()
-        masked["llm"]["effective"] = slot_effective_view(
-            roles[_SLOT_REPRESENTATIVE_ROLE["llm"]], masked["llm"]["active"]
-        )
-        masked["vision"]["effective"] = slot_effective_view(
-            roles[_SLOT_REPRESENTATIVE_ROLE["vision"]], masked["vision"]["active"]
-        )
+        for slot, role in _SLOT_REPRESENTATIVE_ROLE.items():
+            masked[slot]["effective"] = slot_effective_view(
+                roles[role], masked[slot]["active"]
+            )
         return masked
 
-    @router.get(
-        "/provider-config/effective",
-        dependencies=[Depends(combined_auth)],
-    )
+    @router.get("/provider-config/effective", dependencies=[Depends(combined_auth)])
     async def get_effective_role_config(
         request: Request,
         workspace: str = Depends(get_current_workspace),
         workspace_manager=Depends(get_workspace_manager),
     ):
-        """Return the live, credential-scrubbed config of every LLM role.
-
-        Ground-truth introspection of what each role (``extract``/``keyword``/
-        ``query`` = text LLM, ``vlm`` = vision LLM) is actually calling, with a
-        ``source`` of ``custom`` (owner override) or ``system_default``.
-        """
+        """Live, credential-scrubbed config of every LLM role + its source."""
         store = _get_store(request)
         masked = store.get_masked(workspace)
-        llm_active = masked["llm"]["active"]
-        vision_active = masked["vision"]["active"]
         rag = await workspace_manager.get_instance(workspace)
         roles = rag.get_llm_role_config()
-
         out: dict[str, dict] = {}
         for role_name, cfg in roles.items():
-            active = vision_active if role_name == VISION_LLM_ROLE else llm_active
+            meta = cfg.get("metadata") or {}
             out[role_name] = {
                 "binding": cfg.get("binding"),
                 "model": cfg.get("model"),
                 "host": cfg.get("host"),
+                "reasoning_effort": (meta.get("provider_options") or {}).get(
+                    "reasoning_effort"
+                ),
                 "is_cross_provider": cfg.get("is_cross_provider", False),
-                "source": "custom" if active else "system_default",
+                "source": _role_source(role_name, masked),
             }
         return {"roles": out}
 
-    @router.put(
-        "/provider-config",
-        dependencies=[Depends(combined_auth)],
-    )
+    @router.put("/provider-config", dependencies=[Depends(combined_auth)])
     async def update_provider_config(
         request: Request,
         body: UpdateProviderConfigRequest,
@@ -220,7 +237,7 @@ def create_provider_routes(api_key: Optional[str] = None) -> APIRouter:
         user: UserInfo = Depends(get_current_user),
         workspace_manager=Depends(get_workspace_manager),
     ):
-        """Set / update provider credentials, then apply live (no restart)."""
+        """Set / update provider credentials per slot, then apply live."""
         store = _get_store(request)
         if not store.has_secret():
             raise HTTPException(
@@ -228,46 +245,41 @@ def create_provider_routes(api_key: Optional[str] = None) -> APIRouter:
                 detail="Server is missing WORKSPACE_PROVIDER_SECRET; cannot store "
                 "provider credentials securely.",
             )
-        if body.llm is None and body.vision is None:
+        provided = {
+            name: getattr(body, name)
+            for name in SLOT_ROLES
+            if getattr(body, name) is not None
+        }
+        if not provided:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Provide at least one of 'llm' or 'vision'",
+                detail=f"Provide at least one of {list(SLOT_ROLES)}",
             )
 
-        existing = store.get(workspace) or WorkspaceProviderConfig()
-        if body.llm is not None:
-            existing.llm = _merge_slot(existing.llm, body.llm)
-        if body.vision is not None:
-            existing.vision = _merge_slot(existing.vision, body.vision)
+        config = store.get(workspace) or WorkspaceProviderConfig()
+        for name, incoming in provided.items():
+            merged = _merge_slot(config.slot(name), incoming)
+            setattr(config, name, merged)
+            if test:
+                await _probe_provider(merged)
 
-        if test:
-            if body.llm is not None:
-                await _probe_provider(existing.llm)
-            if body.vision is not None:
-                await _probe_provider(existing.vision)
-
-        existing.updated_at = datetime.now(timezone.utc).isoformat()
-        existing.updated_by = user.username
+        config.updated_at = datetime.now(timezone.utc).isoformat()
+        config.updated_by = user.username
         try:
-            store.set(workspace, existing)
+            store.set(workspace, config)
         except WorkspaceProviderError as e:
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(e)
             )
 
-        # Apply with no restart: drop the cached instance so the next request
-        # rebuilds it and re-applies the override via the on_instance_ready hook.
         await workspace_manager.invalidate(workspace)
         logger.info(
             f"Provider config updated for workspace '{workspace}' by "
-            f"'{user.username}'"
+            f"'{user.username}' (slots: {list(provided)})"
         )
         return store.get_masked(workspace)
 
-    @router.delete(
-        "/provider-config",
-        dependencies=[Depends(combined_auth)],
-    )
+    @router.delete("/provider-config", dependencies=[Depends(combined_auth)])
     async def delete_provider_config(
         request: Request,
         slot: str = "all",
@@ -275,19 +287,14 @@ def create_provider_routes(api_key: Optional[str] = None) -> APIRouter:
         user: UserInfo = Depends(get_current_user),
         workspace_manager=Depends(get_workspace_manager),
     ):
-        """Clear a provider override (``slot`` = all | llm | vision).
-
-        After clearing, the workspace falls back to the system default.
-        """
-        if slot not in ("all", "llm", "vision"):
+        """Clear a provider override (``slot`` = all | extraction | query | vision)."""
+        if slot != "all" and slot not in SLOT_ROLES:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="slot must be 'all', 'llm' or 'vision'",
+                detail=f"slot must be 'all' or one of {list(SLOT_ROLES)}",
             )
         store = _get_store(request)
         removed = store.delete(workspace, which=slot)
-        # Rebuild on next request regardless, so a previously-applied override on
-        # the live instance is reset to the system default.
         await workspace_manager.invalidate(workspace)
         logger.info(
             f"Provider config slot '{slot}' cleared for workspace '{workspace}' "
