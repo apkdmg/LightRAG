@@ -737,7 +737,8 @@ def compute_mdhash_id(content: str, prefix: str = "") -> str:
     """
     Compute a unique ID for a given content string.
 
-    The ID is a combination of the given prefix and the MD5 hash of the content string.
+    The ID is a combination of the given prefix and the SHA-256 hash (hex digest,
+    64 chars) of the content string.
     """
     return prefix + compute_args_hash(content)
 
