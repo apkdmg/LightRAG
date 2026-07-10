@@ -1944,9 +1944,7 @@ def create_app(args):
 
         auth_url, state, code_verifier = keycloak.get_authorization_url()
 
-        response = JSONResponse(
-            content={"authorization_url": auth_url, "state": state}
-        )
+        response = JSONResponse(content={"authorization_url": auth_url, "state": state})
 
         # Derive HTTPS via the same indicators the callback uses, so the cookie
         # gets the Secure attribute behind TLS-terminating reverse proxies.

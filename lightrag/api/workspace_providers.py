@@ -123,7 +123,9 @@ def _build_fernet(secret: str) -> Fernet:
     try:
         return Fernet(secret.encode("utf-8"))
     except (ValueError, TypeError):
-        derived = base64.urlsafe_b64encode(hashlib.sha256(secret.encode("utf-8")).digest())
+        derived = base64.urlsafe_b64encode(
+            hashlib.sha256(secret.encode("utf-8")).digest()
+        )
         return Fernet(derived)
 
 
@@ -276,7 +278,9 @@ class WorkspaceProviderStore:
                 logger.info(f"Deleted provider config for workspace '{workspace_id}'")
                 return True
             except OSError as e:
-                logger.error(f"Failed to delete provider config for '{workspace_id}': {e}")
+                logger.error(
+                    f"Failed to delete provider config for '{workspace_id}': {e}"
+                )
                 return False
 
         if which not in SLOT_ROLES:
@@ -315,7 +319,9 @@ async def _apply_slot(rag: Any, roles: tuple[str, ...], slot: ProviderSlot) -> N
             # Merge onto the role's existing (scrubbed) provider options so we
             # don't drop temperature/etc.; get_llm_role_config never leaks keys.
             current = rag.get_llm_role_config(role)
-            provider_options = dict((current.get("metadata") or {}).get("provider_options") or {})
+            provider_options = dict(
+                (current.get("metadata") or {}).get("provider_options") or {}
+            )
             provider_options["reasoning_effort"] = slot.reasoning_effort
         await rag.aupdate_llm_role_config(
             role,
