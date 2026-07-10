@@ -1450,6 +1450,7 @@ class MilvusVectorDBStorage(BaseVectorStorage):
 
                 # Create collection and check compatibility
                 self._create_collection_if_not_exist()
+                self._verify_index_health()
                 self._initialized = True
                 logger.info(
                     f"[{self.workspace}] Milvus collection '{self.namespace}' initialized successfully"
@@ -1459,6 +1460,73 @@ class MilvusVectorDBStorage(BaseVectorStorage):
                     f"[{self.workspace}] Failed to initialize Milvus collection '{self.namespace}': {e}"
                 )
                 raise
+
+    # Self-search score below this means the index failed to find a vector
+    # that is verbatim in the collection — i.e. recall is corrupted.
+    INDEX_HEALTH_MIN_SELF_SEARCH_SCORE = 0.9
+
+    def _verify_index_health(self) -> None:
+        """Detect a vector index that returns broken similarity scores.
+
+        Searches the collection with one of its own stored vectors; a healthy
+        index scores ~1.0 on that self-search. Milvus can build such broken
+        indexes without any error: on milvus-gpu builds, AUTOINDEX resolves to
+        GPU CAGRA, which does not support the COSINE metric and silently
+        returns garbage scores, so every query falls below
+        cosine_better_than_threshold and retrieval comes back empty.
+
+        Only runs for the COSINE metric (score semantics differ for L2/IP).
+        Disable with MILVUS_INDEX_HEALTH_CHECK=false. Logs an error instead of
+        raising so a degraded index never blocks startup.
+        """
+        if not _get_env_bool("MILVUS_INDEX_HEALTH_CHECK", True):
+            return
+        if self.index_config.metric_type != "COSINE":
+            return
+        try:
+            self._ensure_collection_loaded()
+            rows = self._client.query(
+                collection_name=self.final_namespace,
+                limit=1,
+                output_fields=["vector"],
+            )
+            if not rows:
+                return
+            result = self._client.search(
+                collection_name=self.final_namespace,
+                data=[rows[0]["vector"]],
+                limit=1,
+                search_params={"metric_type": self.index_config.metric_type},
+            )
+            if not result or not result[0]:
+                top_score = None
+            else:
+                top_score = float(result[0][0]["distance"])
+        except Exception as e:
+            logger.debug(
+                f"[{self.workspace}] Index health check skipped for "
+                f"'{self.final_namespace}': {e}"
+            )
+            return
+
+        if top_score is None or top_score < self.INDEX_HEALTH_MIN_SELF_SEARCH_SCORE:
+            logger.error(
+                f"[{self.workspace}] Vector index health check FAILED for "
+                f"'{self.final_namespace}': self-search score "
+                f"{'n/a' if top_score is None else f'{top_score:.3f}'} "
+                f"(expected ~1.0). The index returns broken similarity scores, "
+                f"so queries against this collection will silently return few "
+                f"or no results. Known cause: AUTOINDEX resolves to GPU CAGRA "
+                f"on milvus-gpu server builds, which does not support the "
+                f"COSINE metric. Remediation: set MILVUS_INDEX_TYPE=HNSW and "
+                f"rebuild this collection's vector index (drop and recreate it "
+                f"as HNSW/COSINE)."
+            )
+        else:
+            logger.debug(
+                f"[{self.workspace}] Index health check passed for "
+                f"'{self.final_namespace}' (self-search score {top_score:.3f})"
+            )
 
     async def upsert(self, data: dict[str, dict[str, Any]]) -> None:
         # logger.debug(f"[{self.workspace}] Inserting {len(data)} to {self.namespace}")
