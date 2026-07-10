@@ -1519,13 +1519,15 @@ class MilvusVectorDBStorage(BaseVectorStorage):
         # Build search params from index config
         search_params_base = self.index_config.build_search_params()
 
-        # Merge with metric type and radius threshold
+        # Plain top-k search; the cosine threshold is applied client-side below.
+        # A server-side range search ("radius" param) must not be used here:
+        # GPU indexes (AUTOINDEX resolves to the CAGRA family on milvus-gpu)
+        # do not implement RangeSearch, so it fails as soon as a sealed segment
+        # gets a vector index built. Since the range search was already capped
+        # at top_k, top-k + client-side filtering returns the identical set.
         search_params = {
             "metric_type": self.index_config.metric_type,
-            "params": {
-                **search_params_base.get("params", {}),
-                "radius": self.cosine_better_than_threshold,
-            },
+            "params": search_params_base.get("params", {}),
         }
 
         results = self._client.search(
@@ -1543,6 +1545,7 @@ class MilvusVectorDBStorage(BaseVectorStorage):
                 "created_at": dp.get("created_at"),
             }
             for dp in results[0]
+            if dp["distance"] > self.cosine_better_than_threshold
         ]
 
     async def index_done_callback(self) -> None:
