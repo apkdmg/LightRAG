@@ -590,6 +590,10 @@ def _make_args(tmp_path) -> SimpleNamespace:
         admin_accounts="",
         obo_allowlist_path="",
         obo_default_policy="deny",
+        enable_workspace_providers=False,
+        # initialize_config(force=True) leaks these args process-wide; any
+        # attribute read by later test modules' request paths must exist here.
+        api_key_role="admin",
     )
 
 
