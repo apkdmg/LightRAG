@@ -501,14 +501,13 @@ async def openai_complete_if_cache(
                     if enable_cot:
                         if content:
                             # Regular content is present
-                            if not initial_content_seen:
-                                initial_content_seen = True
-                                # If both content and reasoning_content are present initially, don't start COT
-                                if reasoning_content:
-                                    cot_active = False
-                                    cot_started = False
+                            initial_content_seen = True
 
-                            # If COT was active, end it
+                            # If COT was active, end it. This must run even
+                            # when the delta carries both reasoning_content
+                            # and content (e.g. Gemini via OpenAI-compatible
+                            # routers sends the transition in one delta) —
+                            # otherwise the <think> tag is never closed.
                             if cot_active:
                                 yield "</think>"
                                 cot_active = False
