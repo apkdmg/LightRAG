@@ -74,7 +74,9 @@ def test_encrypt_decrypt_roundtrip(tmp_path):
     store = _store(tmp_path)
     store.set("ws1", _full_cfg())
     got = store.get("ws1")
-    assert got.extraction.is_active() and got.query.is_active() and got.vision.is_active()
+    assert (
+        got.extraction.is_active() and got.query.is_active() and got.vision.is_active()
+    )
     assert got.extraction.api_key.get_secret_value() == "sk-ext-abcd"
     assert got.query.api_key.get_secret_value() == "sk-qry-9999"
     assert got.query.reasoning_effort == "medium"
@@ -166,16 +168,22 @@ def test_legacy_llm_config_migrates(tmp_path):
     """An old single-`llm` file maps onto extraction + query on read."""
     store = _store(tmp_path)
     fernet = store._fernet()
-    enc = store._encode_slot(
-        ProviderSlot(api_key=SecretStr("sk-legacy")), fernet
-    )["api_key_enc"]
+    enc = store._encode_slot(ProviderSlot(api_key=SecretStr("sk-legacy")), fernet)[
+        "api_key_enc"
+    ]
     legacy = {
-        "llm": {"base_url": "https://legacy/v1", "model": "old-model", "api_key_enc": enc},
+        "llm": {
+            "base_url": "https://legacy/v1",
+            "model": "old-model",
+            "api_key_enc": enc,
+        },
         "vision": {},
         "updated_by": "old",
     }
     (Path(tmp_path) / ".workspace_providers").mkdir(parents=True, exist_ok=True)
-    (Path(tmp_path) / ".workspace_providers" / "wsl.json").write_text(json.dumps(legacy))
+    (Path(tmp_path) / ".workspace_providers" / "wsl.json").write_text(
+        json.dumps(legacy)
+    )
 
     cfg = store.get("wsl")
     assert cfg.extraction.base_url == "https://legacy/v1"
@@ -258,4 +266,10 @@ def test_slot_effective_labels_source_and_reasoning():
     assert custom["model"] == "gemini-3.5-flash"
     default = slot_effective_view(role_cfg, active=False)
     assert default["source"] == "system_default"
-    assert set(default.keys()) == {"binding", "model", "host", "reasoning_effort", "source"}
+    assert set(default.keys()) == {
+        "binding",
+        "model",
+        "host",
+        "reasoning_effort",
+        "source",
+    }

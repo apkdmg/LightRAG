@@ -167,7 +167,10 @@ def get_combined_auth_dependency(api_key: Optional[str] = None):
                 token_info = validate_any_token(token)
 
                 # ========== Token Auto-Renewal Logic ==========
-                from lightrag.api.config import global_args
+                # NOTE: global_args comes from the module-level import; a local
+                # re-import here would shadow it as a function-local for the
+                # whole function and break code paths that don't reach this
+                # branch (UnboundLocalError in the X-API-Key path below).
                 from datetime import datetime, timezone
 
                 if global_args.token_auto_renew:
