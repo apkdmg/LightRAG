@@ -817,9 +817,7 @@ class EmailIngestionService:
             )
 
         inline_ok = sum(
-            1
-            for o in outcomes
-            if o["kind"] == "inline_image" and o["status"] == "ok"
+            1 for o in outcomes if o["kind"] == "inline_image" and o["status"] == "ok"
         )
         att_ok = sum(
             1 for o in outcomes if o["kind"] == "attachment" and o["status"] == "ok"
@@ -869,9 +867,7 @@ class EmailIngestionService:
                 break
             await asyncio.sleep(2.0 * (attempt + 1))
         if not acquired:
-            raise RuntimeError(
-                f"Cannot overwrite email bundle {prefix_base}: {reason}"
-            )
+            raise RuntimeError(f"Cannot overwrite email bundle {prefix_base}: {reason}")
         try:
             existing = await _enumerate_bundle_doc_ids(rag, prefix)
             if existing:
@@ -1126,7 +1122,9 @@ Content:
             logger.warning(f"PDF extraction failed for {attachment.filename}: {e}")
             return ExtractionResult(None, "failed", "PDF extraction error")
 
-    async def _extract_docx_text(self, attachment: ParsedAttachment) -> ExtractionResult:
+    async def _extract_docx_text(
+        self, attachment: ParsedAttachment
+    ) -> ExtractionResult:
         """Extract text from a DOCX attachment using python-docx."""
         try:
             import docx
@@ -1489,11 +1487,14 @@ the LightRAG knowledge graph under the shared Bundle ID.
                 # content-derived id (not a random UUID that breaks re-sync).
                 resolved_body = body_text or email_meta.body_text or ""
                 resolved_date = _safe_parse_date(email_meta.date)
-                resolved_message_id = email_meta.message_id or _derive_stable_message_id(
-                    email_meta.subject,
-                    email_meta.from_address,
-                    resolved_date,
-                    resolved_body,
+                resolved_message_id = (
+                    email_meta.message_id
+                    or _derive_stable_message_id(
+                        email_meta.subject,
+                        email_meta.from_address,
+                        resolved_date,
+                        resolved_body,
+                    )
                 )
 
                 # Build ParsedEmail from structured input

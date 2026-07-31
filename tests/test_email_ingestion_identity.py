@@ -92,7 +92,9 @@ def test_component_paths_are_unique_and_canonicalization_stable():
     paths = [
         _component_file_path(bundle, "master", 0, None),
         _component_file_path(bundle, "inline", 0, "image001.png"),
-        _component_file_path(bundle, "inline", 1, "image001.png"),  # same name, diff idx
+        _component_file_path(
+            bundle, "inline", 1, "image001.png"
+        ),  # same name, diff idx
         _component_file_path(bundle, "attachment", 0, "report.pdf"),
         _component_file_path(bundle, "attachment", 1, "report.pdf"),
     ]
@@ -151,7 +153,10 @@ async def test_legacy_doc_attachment_is_skipped_not_ingested():
 async def test_inline_image_without_vision_model_is_skipped():
     svc = EmailIngestionService(rag_instance=None, vision_model_func=None)
     img = ParsedAttachment(
-        filename="poster.png", content_type="image/png", content=b"\x89PNG", is_inline=True
+        filename="poster.png",
+        content_type="image/png",
+        content=b"\x89PNG",
+        is_inline=True,
     )
 
     from types import SimpleNamespace
