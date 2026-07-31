@@ -1460,6 +1460,24 @@ class PostgreSQLDB:
                 "new_type": "TEXT",
                 "description": "file_path to TEXT NULL",
             },
+            # The relation-chunks id is a composite `src<SEP>tgt` key: with both
+            # entity names at DEFAULT_ENTITY_NAME_MAX_LENGTH (256) it reaches
+            # 256+5+256=517 chars, overflowing VARCHAR(512). Widen both twin
+            # chunk-tracking tables to 1024.
+            {
+                "table": "LIGHTRAG_ENTITY_CHUNKS",
+                "column": "id",
+                "old_type": "character varying(512)",
+                "new_type": "VARCHAR(1024)",
+                "description": "chunk-tracking id from 512 to 1024 (composite relation key can reach 517)",
+            },
+            {
+                "table": "LIGHTRAG_RELATION_CHUNKS",
+                "column": "id",
+                "old_type": "character varying(512)",
+                "new_type": "VARCHAR(1024)",
+                "description": "chunk-tracking id from 512 to 1024 (composite relation key can reach 517)",
+            },
         ]
 
         try:
@@ -1534,6 +1552,10 @@ class PostgreSQLDB:
                         migration["column"] == "file_path"
                         and current_type == "character varying"
                     ):
+                        needs_migration = True
+                    elif migration["column"] == "id" and current_length == 512:
+                        # Chunk-tracking tables (ENTITY_CHUNKS / RELATION_CHUNKS):
+                        # only these declare an `id` migration in the list above.
                         needs_migration = True
 
                     if needs_migration:
@@ -6881,7 +6903,7 @@ TABLES = {
     },
     "LIGHTRAG_ENTITY_CHUNKS": {
         "ddl": """CREATE TABLE LIGHTRAG_ENTITY_CHUNKS (
-                    id VARCHAR(512),
+                    id VARCHAR(1024),
                     workspace VARCHAR(255),
                     chunk_ids JSONB,
                     count INTEGER,
@@ -6892,7 +6914,9 @@ TABLES = {
     },
     "LIGHTRAG_RELATION_CHUNKS": {
         "ddl": """CREATE TABLE LIGHTRAG_RELATION_CHUNKS (
-                    id VARCHAR(512),
+                    id VARCHAR(1024),
+                    -- 1024: id is a composite `src<SEP>tgt` relation key; two
+                    -- 256-char entity names + 5-char separator = 517 minimum.
                     workspace VARCHAR(255),
                     chunk_ids JSONB,
                     count INTEGER,

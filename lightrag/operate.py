@@ -138,6 +138,44 @@ def _truncate_entity_identifier(
     return display_value
 
 
+# Identifier-blob threshold: a whitespace-free entity name at or above this
+# length is essentially always machine junk (URL-encoded tracking tokens,
+# hashes) rather than a meaningful entity. Real long names (titles, emails,
+# organization names) either contain whitespace or stay far below it.
+_ENTITY_NAME_BLOB_MIN_LENGTH = 100
+
+_URL_SCHEME_RE = re.compile(r"^(?:https?://|www\.)", re.IGNORECASE)
+
+
+def _reject_invalid_entity_name(name: str, chunk_key: str, role: str) -> bool:
+    """Return True when an LLM-extracted entity name is URL/identifier junk.
+
+    Weaker models extract raw links and URL-encoded tracking blobs from
+    marketing emails as "entities". Beyond polluting the graph, two such names
+    in one relation overflow the relation-chunks composite key. Rejected names
+    must be dropped from BOTH entity records and relation endpoints — dropping
+    only the entity is defeated by edge-side stub auto-vivification.
+    """
+
+    is_url = bool(_URL_SCHEME_RE.match(name)) or "://" in name
+    is_blob = len(name) >= _ENTITY_NAME_BLOB_MIN_LENGTH and not any(
+        ch.isspace() for ch in name
+    )
+    if not (is_url or is_blob):
+        return False
+
+    preview = name[:20]  # Show first 20 characters as preview
+    logger.warning(
+        "%s: %s rejected as %s (len %d, Name: '%s...')",
+        chunk_key,
+        role,
+        "URL" if is_url else "identifier blob",
+        len(name),
+        preview,
+    )
+    return True
+
+
 def _truncate_vdb_content(content: str, global_config: dict, content_label: str) -> str:
     """Clamp vector-store payload size to stay under embedding limits."""
 
@@ -711,6 +749,9 @@ async def _process_json_extraction_result(
                 )
                 continue
 
+            if _reject_invalid_entity_name(entity_name, chunk_key, "Entity name"):
+                continue
+
             truncated_name = _truncate_entity_identifier(
                 entity_name,
                 DEFAULT_ENTITY_NAME_MAX_LENGTH,
@@ -781,6 +822,14 @@ async def _process_json_extraction_result(
                 logger.warning(
                     f"{chunk_key}: Empty description for relationship '{source}' ~ '{target}', skipping"
                 )
+                continue
+
+            # Drop the whole relation when either endpoint is URL/blob junk —
+            # keeping it would resurrect the rejected entity as an UNKNOWN stub
+            # during merge and rebuild the oversized relation-chunks key.
+            if _reject_invalid_entity_name(
+                source, chunk_key, "Relation entity"
+            ) or _reject_invalid_entity_name(target, chunk_key, "Relation entity"):
                 continue
 
             truncated_source = _truncate_entity_identifier(
@@ -1289,6 +1338,11 @@ async def _process_extraction_result(
             record_attributes, chunk_key, timestamp, file_path
         )
         if entity_data is not None:
+            if _reject_invalid_entity_name(
+                entity_data["entity_name"], chunk_key, "Entity name"
+            ):
+                await _cooperative_yield(i, every=8)
+                continue
             truncated_name = _truncate_entity_identifier(
                 entity_data["entity_name"],
                 DEFAULT_ENTITY_NAME_MAX_LENGTH,
@@ -1305,6 +1359,16 @@ async def _process_extraction_result(
             record_attributes, chunk_key, timestamp, file_path
         )
         if relationship_data is not None:
+            # Drop the whole relation when either endpoint is URL/blob junk —
+            # keeping it would resurrect the rejected entity as an UNKNOWN stub
+            # during merge and rebuild the oversized relation-chunks key.
+            if _reject_invalid_entity_name(
+                relationship_data["src_id"], chunk_key, "Relation entity"
+            ) or _reject_invalid_entity_name(
+                relationship_data["tgt_id"], chunk_key, "Relation entity"
+            ):
+                await _cooperative_yield(i, every=8)
+                continue
             truncated_source = _truncate_entity_identifier(
                 relationship_data["src_id"],
                 DEFAULT_ENTITY_NAME_MAX_LENGTH,
