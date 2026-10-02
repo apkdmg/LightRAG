@@ -34,10 +34,9 @@ All endpoints are mounted at the server root (no `/api` prefix). The default ser
 
 ### Authentication
 
-> **`/v1/*` endpoints REQUIRE authentication.** Unlike the Ollama-compatible
-> `/api/*` endpoints — which are in the default `WHITELIST_PATHS`
-> (`/health,/api/*`) and are therefore **public by default** — the OpenAI
-> routes are **not whitelisted**. Every `/v1/*` request passes through the
+> **`/v1/*` endpoints REQUIRE authentication.** They are not in
+> `WHITELIST_PATHS` (default `/health`), and neither are the Ollama-compatible
+> `/api/*` endpoints. Every `/v1/*` request passes through the
 > `combined_auth` dependency (`get_combined_auth_dependency` in
 > [`lightrag/api/utils_api.py`](../lightrag/api/utils_api.py)).
 

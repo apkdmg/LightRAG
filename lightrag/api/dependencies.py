@@ -225,9 +225,19 @@ async def _resolve_user(
         HTTPException: If authentication fails or token is invalid.
     """
     from .auth import auth_handler, validate_any_token
+    from .config import global_args
 
     # Check if auth is configured
-    if not auth_handler.accounts:
+    if not auth_handler.login_required:
+        # A shared API key is the only protection configured. Requests that
+        # presented it were already resolved via request.state.api_key_user,
+        # so reaching this point means no valid credential was supplied
+        # (e.g. on a whitelisted path) — do not fall back to guest.
+        if getattr(global_args, "key", None):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Not authenticated",
+            )
         # Auth disabled - return guest user
         return UserInfo(
             username="guest",

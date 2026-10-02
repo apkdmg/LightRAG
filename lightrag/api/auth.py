@@ -8,7 +8,7 @@ from fastapi import HTTPException, status
 from pydantic import BaseModel
 
 from ..utils import logger
-from .config import DEFAULT_TOKEN_SECRET, global_args
+from .config import DEFAULT_TOKEN_SECRET, global_args, is_oauth2_usable
 from .passwords import verify_password
 
 # use the .env that is inside the current folder
@@ -58,11 +58,8 @@ class AuthHandler:
         # are configured. When usable, the local TOKEN_SECRET signs the session
         # JWT minted after SSO login, so a strong secret is mandatory (fail
         # closed) to prevent admin-token forgery against the public default.
-        oauth2_usable = bool(
-            getattr(global_args, "oauth2_enabled", False)
-            and (getattr(global_args, "oauth2_client_id", "") or "").strip()
-            and (getattr(global_args, "oauth2_client_secret", "") or "").strip()
-        )
+        oauth2_usable = is_oauth2_usable(global_args)
+        self.oauth2_usable = oauth2_usable
         if not self.secret:
             if auth_accounts:
                 raise ValueError(
@@ -105,6 +102,16 @@ class AuthHandler:
             raise ValueError(
                 "AUTH_ACCOUNTS must use comma-separated user:password pairs."
             )
+
+    @property
+    def login_required(self) -> bool:
+        """True when users must authenticate: password accounts or usable SSO.
+
+        This — not ``accounts`` alone — decides whether anonymous guest access
+        is permitted, so an SSO-only deployment (no AUTH_ACCOUNTS) is not
+        treated as "authentication disabled".
+        """
+        return bool(self.accounts) or self.oauth2_usable
 
     def verify_password(self, username: str, plain_password: str) -> bool:
         """

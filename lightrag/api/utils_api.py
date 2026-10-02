@@ -69,23 +69,42 @@ def check_env_file():
     return True
 
 
-# Get whitelist paths from global_args, only once during initialization
-whitelist_paths = global_args.whitelist_paths.split(",")
+def parse_whitelist_patterns(whitelist: str) -> List[Tuple[str, bool]]:
+    """Parse WHITELIST_PATHS into ``(path, is_prefix_match)`` tuples.
 
-# Pre-compile path matching patterns
-whitelist_patterns: List[Tuple[str, bool]] = []
-for path in whitelist_paths:
-    path = path.strip()
-    if path:
-        # If path ends with /*, match all paths with that prefix
+    An entry ending in ``/*`` matches that path and everything below it.
+    """
+    patterns: List[Tuple[str, bool]] = []
+    for path in (whitelist or "").split(","):
+        path = path.strip()
+        if not path:
+            continue
         if path.endswith("/*"):
-            prefix = path[:-2]
-            whitelist_patterns.append((prefix, True))  # (prefix, is_prefix_match)
+            patterns.append((path[:-2], True))
         else:
-            whitelist_patterns.append((path, False))  # (exact_path, is_prefix_match)
+            patterns.append((path, False))
+    return patterns
+
+
+def is_whitelisted_path(path: str, patterns: List[Tuple[str, bool]]) -> bool:
+    """Return True when ``path`` is exempt from authentication.
+
+    Prefix entries match on a path-segment boundary, so ``/api/*`` covers
+    ``/api`` and ``/api/chat`` but not ``/api-keys``.
+    """
+    for pattern, is_prefix in patterns:
+        if path == pattern:
+            return True
+        if is_prefix and path.startswith(pattern + "/"):
+            return True
+    return False
+
+
+# Get whitelist paths from global_args, only once during initialization
+whitelist_patterns = parse_whitelist_patterns(global_args.whitelist_paths)
 
 # Global authentication configuration
-auth_configured = bool(auth_handler.accounts)
+auth_configured = auth_handler.login_required
 
 
 def get_combined_auth_dependency(api_key: Optional[str] = None):
@@ -127,11 +146,8 @@ def get_combined_auth_dependency(api_key: Optional[str] = None):
     ):
         # 1. Check if path is in whitelist
         path = request.url.path
-        for pattern, is_prefix in whitelist_patterns:
-            if (is_prefix and path.startswith(pattern)) or (
-                not is_prefix and path == pattern
-            ):
-                return  # Whitelist path, allow access
+        if is_whitelisted_path(path, whitelist_patterns):
+            return  # Whitelist path, allow access
 
         # 2. Check for a per-user API key (sk-lightrag-...) FIRST.
         # These keys have the workspace embedded, so no X-Target-Workspace
@@ -242,18 +258,23 @@ def get_combined_auth_dependency(api_key: Optional[str] = None):
                             logger.warning(f"Token auto-renew failed: {e}")
                 # ========== End of Token Auto-Renewal Logic ==========
 
-                # Accept guest token if no auth is configured
-                if not auth_configured and token_info.get("role") == "guest":
+                is_guest_token = token_info.get("role") == "guest"
+                if not auth_configured and is_guest_token:
+                    # Accept guest token if no auth is configured. Guest tokens
+                    # are handed out by /auth-status to anyone, so they must
+                    # never stand in for a configured shared API key: fall
+                    # through to the X-API-Key check below in that case.
+                    if not api_key_configured:
+                        return
+                elif auth_configured and not is_guest_token:
+                    # Accept non-guest token if auth is configured
                     return
-                # Accept non-guest token if auth is configured
-                if auth_configured and token_info.get("role") != "guest":
-                    return
-
-                # Token validation failed, immediately return 401 error
-                raise HTTPException(
-                    status_code=status.HTTP_401_UNAUTHORIZED,
-                    detail="Invalid token. Please login again.",
-                )
+                else:
+                    # Token validation failed, immediately return 401 error
+                    raise HTTPException(
+                        status_code=status.HTTP_401_UNAUTHORIZED,
+                        detail="Invalid token. Please login again.",
+                    )
             except HTTPException as e:
                 # If already a 401 error, re-raise it
                 if e.status_code == status.HTTP_401_UNAUTHORIZED:

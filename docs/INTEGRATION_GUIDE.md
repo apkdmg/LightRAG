@@ -553,7 +553,7 @@ Server-side env vars most relevant to integration (full list in `env.example`):
 | `TOKEN_SECRET` | Signs all JWTs — **required** in production |
 | `TOKEN_EXPIRE_HOURS`, `TOKEN_AUTO_RENEW` | JWT lifetime / sliding renewal |
 | `LIGHTRAG_API_KEY` | Shared `X-API-Key` value |
-| `WHITELIST_PATHS` | Public (no-auth) paths — default `/health,/api/*` |
+| `WHITELIST_PATHS` | Public (no-auth) paths — default `/health` |
 | `OBO_ALLOWLIST_PATH`, `OBO_DEFAULT_POLICY` | On-behalf-of allowlist for service accounts |
 | `VLM_PROCESS_ENABLE`, `VLM_LLM_*` | Native multimodal / inline-image vision |
 
