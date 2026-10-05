@@ -8,7 +8,7 @@ including creation, deletion, listing, and impersonation.
 import logging
 from typing import List
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, Field
 
 from lightrag.api.dependencies import (
@@ -80,6 +80,33 @@ class WorkspaceStatsResponse(BaseModel):
     created_at: float
     last_accessed_at: float
     access_count: int
+
+
+class WorkspaceOwnerResponse(BaseModel):
+    """Owner binding of a workspace in the ownership registry."""
+
+    workspace_id: str
+    identity: str
+    email: str | None = None
+    created_at: float
+    last_login_at: float
+
+
+class SetWorkspaceOwnerRequest(BaseModel):
+    """Bind a workspace to an identity (``kc:<keycloak sub>`` or ``local:<username>``)."""
+
+    identity: str = Field(..., pattern=r"^(kc|local):.+$", max_length=512)
+    email: str | None = Field(default=None, max_length=512)
+
+
+def _get_registry(request: Request):
+    registry = getattr(request.app.state, "workspace_registry", None)
+    if registry is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Workspace ownership registry is not enabled",
+        )
+    return registry
 
 
 class DeleteWorkspaceResponse(BaseModel):
@@ -362,6 +389,64 @@ def create_admin_routes():
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail=f"Failed to generate impersonation token: {str(e)}",
             )
+
+    @router.get(
+        "/workspace-owners",
+        response_model=List[WorkspaceOwnerResponse],
+        dependencies=[Depends(require_admin)],
+    )
+    async def list_workspace_owners(request: Request):
+        """List which identity owns each workspace."""
+        registry = _get_registry(request)
+        owners = await registry.list_owners()
+        return [WorkspaceOwnerResponse(**vars(o)) for o in owners]
+
+    @router.put(
+        "/workspaces/{workspace_id}/owner",
+        response_model=WorkspaceOwnerResponse,
+    )
+    async def set_workspace_owner(
+        workspace_id: str,
+        body: SetWorkspaceOwnerRequest,
+        request: Request,
+        admin_user: UserInfo = Depends(require_admin),
+    ):
+        """Bind a workspace to an identity.
+
+        Use this to resolve a refused sign-in: bind the existing workspace to
+        the new identity (same person, re-created account), or bind the new
+        identity to a fresh workspace ID (a different person who was given a
+        previously used email address).
+        """
+        registry = _get_registry(request)
+        sanitized_id = sanitize_workspace_id(workspace_id)
+        await registry.set_owner(sanitized_id, body.identity, body.email)
+        logger.warning(
+            f"Admin '{admin_user.username}' bound workspace '{sanitized_id}' "
+            f"to {body.identity}"
+        )
+        owner = await registry.get_by_workspace(sanitized_id)
+        return WorkspaceOwnerResponse(**vars(owner))
+
+    @router.delete("/workspaces/{workspace_id}/owner")
+    async def release_workspace_owner(
+        workspace_id: str,
+        request: Request,
+        admin_user: UserInfo = Depends(require_admin),
+    ):
+        """Remove a workspace's owner binding. The next person whose sign-in
+        maps to this workspace ID will claim it, so use with care."""
+        registry = _get_registry(request)
+        sanitized_id = sanitize_workspace_id(workspace_id)
+        if not await registry.release(sanitized_id):
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"No owner recorded for workspace: {sanitized_id}",
+            )
+        logger.warning(
+            f"Admin '{admin_user.username}' released ownership of '{sanitized_id}'"
+        )
+        return {"status": "success", "workspace_id": sanitized_id}
 
     @router.get(
         "/status",
