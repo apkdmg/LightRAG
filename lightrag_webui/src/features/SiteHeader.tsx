@@ -77,7 +77,7 @@ export default function SiteHeader() {
     : versionDisplay ? `v${versionDisplay}` : '';
 
   const handleLogout = () => {
-    navigationService.navigateToLogin();
+    navigationService.logout();
   }
 
   return (

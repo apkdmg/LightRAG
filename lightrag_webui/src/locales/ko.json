@@ -403,7 +403,8 @@
       "copyManualInstruction": "텍스트를 직접 선택하여 복사하세요",
       "thinking": "생각 중...",
       "thinkingTime": "생각 소요 시간 {{time}}초",
-      "thinkingInProgress": "생각 진행 중..."
+      "thinkingInProgress": "생각 진행 중...",
+      "imageNotLoaded": "[이미지를 불러오지 않음: {{alt}}]"
     },
     "retrieval": {
       "startPrompt": "아래에 질문을 입력하여 검색을 시작하세요",

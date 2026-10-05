@@ -403,7 +403,8 @@
       "copyManualInstruction": "Vui lòng chọn và sao chép văn bản thủ công",
       "thinking": "Đang suy nghĩ...",
       "thinkingTime": "Thời gian suy nghĩ {{time}}s",
-      "thinkingInProgress": "Đang suy nghĩ..."
+      "thinkingInProgress": "Đang suy nghĩ...",
+      "imageNotLoaded": "[Không tải hình ảnh: {{alt}}]"
     },
     "retrieval": {
       "startPrompt": "Bắt đầu truy xuất bằng cách nhập truy vấn của bạn bên dưới",

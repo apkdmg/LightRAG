@@ -69,6 +69,7 @@ from lightrag.kg.shared_storage import (
 )
 from fastapi.security import OAuth2PasswordRequestForm
 from lightrag.api.auth import auth_handler, _is_admin_user
+from lightrag.api.security_headers import SecurityHeadersMiddleware, build_webui_csp
 
 # use the .env that is inside the current folder
 # allows to use different .env file for each lightrag instance
@@ -604,6 +605,8 @@ def create_app(args):
             "X-New-Token"
         ],  # Expose token renewal header for cross-origin requests
     )
+    # Baseline security headers on every response (nosniff, framing, referrer).
+    app.add_middleware(SecurityHeadersMiddleware)
 
     # Create combined auth dependency for all endpoints
     combined_auth = get_combined_auth_dependency(api_key)
@@ -2423,9 +2426,13 @@ def create_app(args):
             "webuiPrefix": f"{api_prefix}{webui_path}/",
         }
     ).replace("</", "<\\/")
-    runtime_config_script = (
-        f"<script>window.__LIGHTRAG_CONFIG__ = {_runtime_config_payload};</script>"
+    runtime_config_script_body = (
+        f"window.__LIGHTRAG_CONFIG__ = {_runtime_config_payload};"
     )
+    runtime_config_script = f"<script>{runtime_config_script_body}</script>"
+    # Content-Security-Policy for WebUI pages; the runtime-config script is
+    # allowed by its hash, so no other inline script can run.
+    webui_csp = build_webui_csp([runtime_config_script_body])
 
     # Custom StaticFiles class for smart caching + runtime config injection
     class SmartStaticFiles(StaticFiles):  # Renamed from NoCacheStaticFiles
@@ -2454,6 +2461,7 @@ def create_app(args):
                 response = self._inject_runtime_config(response)
 
             if is_html:
+                response.headers["Content-Security-Policy"] = webui_csp
                 response.headers["Cache-Control"] = (
                     "no-cache, no-store, must-revalidate"
                 )

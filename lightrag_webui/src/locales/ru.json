@@ -403,7 +403,8 @@
       "copyManualInstruction": "Пожалуйста, выберите и скопируйте текст вручную",
       "thinking": "Размышление...",
       "thinkingTime": "Время размышления {{time}}с",
-      "thinkingInProgress": "Размышление в процессе..."
+      "thinkingInProgress": "Размышление в процессе...",
+      "imageNotLoaded": "[Изображение не загружено: {{alt}}]"
     },
     "retrieval": {
       "startPrompt": "Начните поиск, введя ваш запрос ниже",
