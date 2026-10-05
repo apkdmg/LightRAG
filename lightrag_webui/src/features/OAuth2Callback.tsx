@@ -1,7 +1,7 @@
 import { useEffect, useState, useRef } from 'react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
 import { useAuthStore } from '@/stores/state'
-import { useSettingsStore } from '@/stores/settings'
+import { handleSignedInUser } from '@/services/navigation'
 import { toast } from 'sonner'
 import { useTranslation } from 'react-i18next'
 import { Card, CardContent, CardHeader } from '@/components/ui/Card'
@@ -77,18 +77,8 @@ const OAuth2Callback = () => {
           throw new Error('Missing username in authentication data')
         }
 
-        // Get previous username for comparison
-        const previousUsername = localStorage.getItem('LIGHTRAG-PREVIOUS-USER')
-        const isSameUser = previousUsername === username
-
-        // Clear chat history if different user
-        if (!isSameUser) {
-          console.log('Different user logging in via SSO, clearing chat history')
-          useSettingsStore.getState().setRetrievalHistory([])
-        }
-
-        // Update previous username
-        localStorage.setItem('LIGHTRAG-PREVIOUS-USER', username)
+        // Clear the previous user's data if someone else is signing in
+        handleSignedInUser(username)
 
         // Login with SSO mode flag
         // Note: Token is stored in HTTP-only cookie and sent automatically with requests

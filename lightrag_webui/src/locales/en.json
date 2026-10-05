@@ -478,7 +478,8 @@
       "copyManualInstruction": "Please select and copy the text manually",
       "thinking": "Thinking...",
       "thinkingTime": "Thinking time {{time}}s",
-      "thinkingInProgress": "Thinking in progress..."
+      "thinkingInProgress": "Thinking in progress...",
+      "imageNotLoaded": "[Image not loaded: {{alt}}]"
     },
     "retrieval": {
       "startPrompt": "Start a retrieval by typing your query below",

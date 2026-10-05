@@ -403,7 +403,8 @@
       "copyManualInstruction": "テキストを手動で選択してコピーしてください",
       "thinking": "思考中...",
       "thinkingTime": "思考時間 {{time}}秒",
-      "thinkingInProgress": "思考中..."
+      "thinkingInProgress": "思考中...",
+      "imageNotLoaded": "[画像は読み込まれていません: {{alt}}]"
     },
     "retrieval": {
       "startPrompt": "下にクエリを入力して検索を開始",

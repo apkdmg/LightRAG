@@ -411,7 +411,8 @@
       "copyManualInstruction": "Veuillez sélectionner et copier le texte manuellement",
       "thinking": "Réflexion en cours...",
       "thinkingTime": "Temps de réflexion {{time}}s",
-      "thinkingInProgress": "Réflexion en cours..."
+      "thinkingInProgress": "Réflexion en cours...",
+      "imageNotLoaded": "[Image non chargée : {{alt}}]"
     },
     "retrieval": {
       "startPrompt": "Démarrez une récupération en tapant votre requête ci-dessous",

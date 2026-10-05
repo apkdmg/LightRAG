@@ -8,6 +8,31 @@ type Theme = 'dark' | 'light' | 'system'
 type Language = 'en' | 'zh' | 'fr' | 'ar' | 'zh_TW' | 'ru' | 'ja' | 'de' | 'uk' | 'ko' | 'vi'
 type Tab = 'documents' | 'knowledge-graph' | 'retrieval' | 'api' | 'providers'
 
+// The shared API key is kept in sessionStorage only: it is never written to
+// localStorage, so it does not outlive the browser tab and is not left behind
+// for the next person using the same browser.
+const API_KEY_SESSION_KEY = 'LIGHTRAG-API-KEY'
+
+const readSessionApiKey = (): string | null => {
+  try {
+    return sessionStorage.getItem(API_KEY_SESSION_KEY)
+  } catch {
+    return null
+  }
+}
+
+const writeSessionApiKey = (apiKey: string | null) => {
+  try {
+    if (apiKey) {
+      sessionStorage.setItem(API_KEY_SESSION_KEY, apiKey)
+    } else {
+      sessionStorage.removeItem(API_KEY_SESSION_KEY)
+    }
+  } catch {
+    // Storage unavailable (private mode, blocked site data): keep it in memory only.
+  }
+}
+
 interface SettingsState {
   // Document manager settings
   showFileName: boolean
@@ -66,6 +91,13 @@ interface SettingsState {
   apiKey: string | null
   setApiKey: (key: string | null) => void
 
+  /**
+   * Remove everything tied to the signed-in user: chat history, prompt
+   * history, query label and the API key. Used on logout and when a
+   * different user signs in on the same browser.
+   */
+  clearUserData: () => void
+
   // App settings
   theme: Theme
   setTheme: (theme: Theme) => void
@@ -112,7 +144,7 @@ const useSettingsStoreBase = create<SettingsState>()(
 
       enableHealthCheck: true,
 
-      apiKey: null,
+      apiKey: readSessionApiKey(),
 
       currentTab: 'documents',
       showFileName: false,
@@ -182,7 +214,21 @@ const useSettingsStoreBase = create<SettingsState>()(
 
       setEnableHealthCheck: (enable: boolean) => set({ enableHealthCheck: enable }),
 
-      setApiKey: (apiKey: string | null) => set({ apiKey }),
+      setApiKey: (apiKey: string | null) => {
+        writeSessionApiKey(apiKey)
+        set({ apiKey })
+      },
+
+      clearUserData: () => {
+        writeSessionApiKey(null)
+        set((state) => ({
+          retrievalHistory: [],
+          userPromptHistory: [],
+          queryLabel: defaultQueryLabel,
+          apiKey: null,
+          querySettings: { ...state.querySettings, user_prompt: '' }
+        }))
+      },
 
       setCurrentTab: (tab: Tab) => set({ currentTab: tab }),
 
@@ -238,7 +284,13 @@ const useSettingsStoreBase = create<SettingsState>()(
     {
       name: 'settings-storage',
       storage: createJSONStorage(() => localStorage),
-      version: 19,
+      version: 20,
+      // Never persist the API key to localStorage (see API_KEY_SESSION_KEY).
+      partialize: (state) => {
+        const persisted: Partial<SettingsState> = { ...state }
+        delete persisted.apiKey
+        return persisted
+      },
       migrate: (state: any, version: number) => {
         if (version < 2) {
           state.showEdgeLabel = false
@@ -340,6 +392,10 @@ const useSettingsStoreBase = create<SettingsState>()(
           if (state.querySettings) {
             delete state.querySettings.response_type
           }
+        }
+        if (version < 20) {
+          // The API key moved to sessionStorage; drop the copy left in localStorage.
+          delete state.apiKey
         }
         return state
       }

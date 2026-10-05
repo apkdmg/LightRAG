@@ -411,7 +411,8 @@
       "copyManualInstruction": "يرجى تحديد ونسخ النص يدوياً",
       "thinking": "جاري التفكير...",
       "thinkingTime": "وقت التفكير {{time}} ثانية",
-      "thinkingInProgress": "التفكير قيد التقدم..."
+      "thinkingInProgress": "التفكير قيد التقدم...",
+      "imageNotLoaded": "[لم يتم تحميل الصورة: {{alt}}]"
     },
     "retrieval": {
       "startPrompt": "ابدأ الاسترجاع بكتابة استفسارك أدناه",

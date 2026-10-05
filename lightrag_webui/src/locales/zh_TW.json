@@ -411,7 +411,8 @@
       "copyManualInstruction": "請手動選取並複製文字",
       "thinking": "正在思考...",
       "thinkingTime": "思考用時 {{time}} 秒",
-      "thinkingInProgress": "思考進行中..."
+      "thinkingInProgress": "思考進行中...",
+      "imageNotLoaded": "[未載入圖片：{{alt}}]"
     },
     "retrieval": {
       "startPrompt": "輸入查詢開始檢索",

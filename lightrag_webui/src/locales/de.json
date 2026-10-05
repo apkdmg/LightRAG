@@ -403,7 +403,8 @@
       "copyManualInstruction": "Bitte wählen Sie den Text manuell aus und kopieren Sie ihn",
       "thinking": "Denken...",
       "thinkingTime": "Denkzeit {{time}}s",
-      "thinkingInProgress": "Denken läuft..."
+      "thinkingInProgress": "Denken läuft...",
+      "imageNotLoaded": "[Bild nicht geladen: {{alt}}]"
     },
     "retrieval": {
       "startPrompt": "Starten Sie eine Abfrage, indem Sie Ihre Frage unten eingeben",
