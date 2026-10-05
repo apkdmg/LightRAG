@@ -793,6 +793,16 @@ def parse_args() -> argparse.Namespace:
             f'Invalid OAUTH2_COOKIE_SAMESITE="{args.oauth2_cookie_samesite}"; '
             f"expected one of {', '.join(OAUTH2_COOKIE_SAMESITE_VALUES)}."
         )
+    # The email address becomes the user's identity and workspace, so only
+    # accept it when the identity provider has verified it.
+    args.oauth2_require_verified_email = get_env_value(
+        "OAUTH2_REQUIRE_VERIFIED_EMAIL", True, bool
+    )
+    # Keycloak access tokens are accepted only when issued to this server's
+    # client (azp/aud = OAUTH2_CLIENT_ID) or to a client listed here or in the
+    # OBO allowlist. Comma-separated client IDs / audiences.
+    args.oauth2_allowed_clients = get_env_value("OAUTH2_ALLOWED_CLIENTS", "", str)
+    args.oauth2_allowed_audiences = get_env_value("OAUTH2_ALLOWED_AUDIENCES", "", str)
     # DEPRECATED: use OBO_ADMIN_CLIENTS in the .obo_allowlist file instead
     # (hot-reloaded, single place alongside the workspace OBO config). This arg
     # is still parsed for backward compatibility and is consumed only as a
@@ -810,6 +820,13 @@ def parse_args() -> argparse.Namespace:
     # Token auto-renewal configuration (sliding window expiration)
     args.token_auto_renew = get_env_value("TOKEN_AUTO_RENEW", True, bool)
     args.token_renew_threshold = get_env_value("TOKEN_RENEW_THRESHOLD", 0.5, float)
+    # Absolute session lifetime: auto-renewal stops once a session is older
+    # than this, so the user must sign in again. 0 disables the cap.
+    args.token_max_session_hours = get_env_value("TOKEN_MAX_SESSION_HOURS", 168, float)
+
+    # Password login throttling (per username, per worker process).
+    args.login_max_failed_attempts = get_env_value("LOGIN_MAX_FAILED_ATTEMPTS", 5, int)
+    args.login_lockout_minutes = get_env_value("LOGIN_LOCKOUT_MINUTES", 15, float)
 
     # Rerank model configuration
     args.rerank_model = get_env_value("RERANK_MODEL", None)

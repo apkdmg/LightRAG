@@ -107,6 +107,71 @@ whitelist_patterns = parse_whitelist_patterns(global_args.whitelist_paths)
 auth_configured = auth_handler.login_required
 
 
+def _renew_token_if_due(token_info: dict) -> Optional[str]:
+    """Return a renewed LightRAG token, or None when no renewal is due or allowed.
+
+    Renewal keeps the token's workspace and original session start, never
+    extends admin impersonation tokens, and stops once the session is older
+    than TOKEN_MAX_SESSION_HOURS so users must sign in again.
+    """
+    from datetime import datetime, timezone
+
+    expire_time = token_info.get("exp")
+    if not expire_time:
+        return None  # Not a LightRAG token (e.g. a Keycloak access token)
+
+    metadata = token_info.get("metadata") or {}
+    if metadata.get("impersonation"):
+        return None  # Impersonation tokens keep their short fixed lifetime
+
+    username = token_info["username"]
+    role = token_info.get("role", "user")
+    now = datetime.now(timezone.utc)
+    remaining_seconds = (expire_time - now).total_seconds()
+    total_hours = (
+        auth_handler.guest_expire_hours
+        if role == "guest"
+        else auth_handler.expire_hours
+    )
+    if remaining_seconds >= total_hours * 3600 * global_args.token_renew_threshold:
+        return None
+
+    session_started_at = token_info.get("session_started_at")
+    max_session_hours = getattr(global_args, "token_max_session_hours", 0) or 0
+    if session_started_at and max_session_hours > 0:
+        session_age_hours = (now.timestamp() - session_started_at) / 3600
+        if session_age_hours >= max_session_hours:
+            logger.debug(
+                f"Token renewal refused for {username}: session age "
+                f"{session_age_hours:.1f}h exceeds {max_session_hours}h"
+            )
+            return None
+
+    # ========== Rate Limiting Check ==========
+    current_time = time.time()
+    last_renewal = _token_renewal_cache.get(username, 0)
+    if current_time - last_renewal < _RENEWAL_MIN_INTERVAL:
+        logger.debug(
+            f"Token renewal skipped for {username} "
+            f"(rate limit: last renewal {current_time - last_renewal:.0f}s ago)"
+        )
+        return None
+
+    new_token = auth_handler.create_token(
+        username=username,
+        role=role,
+        metadata=metadata,
+        workspace_id=token_info.get("workspace_id"),
+        session_started_at=session_started_at,
+    )
+    _token_renewal_cache[username] = current_time
+    logger.info(
+        f"Token auto-renewed for user {username} "
+        f"(role: {role}, remaining: {remaining_seconds:.0f}s)"
+    )
+    return new_token
+
+
 def get_combined_auth_dependency(api_key: Optional[str] = None):
     """
     Create a combined authentication dependency that implements authentication logic
@@ -187,8 +252,6 @@ def get_combined_auth_dependency(api_key: Optional[str] = None):
                 # re-import here would shadow it as a function-local for the
                 # whole function and break code paths that don't reach this
                 # branch (UnboundLocalError in the X-API-Key path below).
-                from datetime import datetime, timezone
-
                 if global_args.token_auto_renew:
                     # Check if current path should skip token renewal
                     skip_renewal = any(
@@ -200,59 +263,9 @@ def get_combined_auth_dependency(api_key: Optional[str] = None):
                         logger.debug(f"Token auto-renewal skipped for path: {path}")
                     else:
                         try:
-                            expire_time = token_info.get("exp")
-                            if expire_time:
-                                # Calculate remaining time ratio
-                                now = datetime.now(timezone.utc)
-                                remaining_seconds = (expire_time - now).total_seconds()
-
-                                # Get original token expiration duration
-                                role = token_info.get("role", "user")
-                                total_hours = (
-                                    auth_handler.guest_expire_hours
-                                    if role == "guest"
-                                    else auth_handler.expire_hours
-                                )
-                                total_seconds = total_hours * 3600
-
-                                # Issue new token if remaining time < threshold
-                                if (
-                                    remaining_seconds
-                                    < total_seconds * global_args.token_renew_threshold
-                                ):
-                                    # ========== Rate Limiting Check ==========
-                                    username = token_info["username"]
-                                    current_time = time.time()
-                                    last_renewal = _token_renewal_cache.get(username, 0)
-                                    time_since_last_renewal = (
-                                        current_time - last_renewal
-                                    )
-
-                                    # Only renew if enough time has passed since last renewal
-                                    if time_since_last_renewal >= _RENEWAL_MIN_INTERVAL:
-                                        new_token = auth_handler.create_token(
-                                            username=username,
-                                            role=role,
-                                            metadata=token_info.get("metadata", {}),
-                                        )
-                                        # Return new token via response header
-                                        response.headers["X-New-Token"] = new_token
-
-                                        # Update renewal cache
-                                        _token_renewal_cache[username] = current_time
-
-                                        # Optional: log renewal
-                                        logger.info(
-                                            f"Token auto-renewed for user {username} "
-                                            f"(role: {role}, remaining: {remaining_seconds:.0f}s)"
-                                        )
-                                    else:
-                                        # Log skip due to rate limit
-                                        logger.debug(
-                                            f"Token renewal skipped for {username} "
-                                            f"(rate limit: last renewal {time_since_last_renewal:.0f}s ago)"
-                                        )
-                                    # ========== End of Rate Limiting Check ==========
+                            new_token = _renew_token_if_due(token_info)
+                            if new_token:
+                                response.headers["X-New-Token"] = new_token
                         except Exception as e:
                             # Renewal failure should not affect normal request, just log
                             logger.warning(f"Token auto-renew failed: {e}")

@@ -396,6 +396,13 @@ class OBOAllowlistManager:
         config = self.get_config()
         return bool(client_id) and client_id in config.admin_clients
 
+    def is_known_client(self, client_id: str) -> bool:
+        """True if the client appears in the OBO allowlist or the admin allowlist."""
+        if not client_id:
+            return False
+        config = self.get_config()
+        return client_id in config.clients or client_id in config.admin_clients
+
     def reload(self) -> None:
         """Force reload config."""
         self._ensure_initialized()
@@ -440,6 +447,19 @@ def check_admin_client(client_id: str) -> bool:
         True if the client is in the admin allowlist, False otherwise.
     """
     return get_manager().is_admin_client(client_id)
+
+
+def is_known_client(client_id: str) -> bool:
+    """
+    Check if a client_id is configured in the OBO or admin allowlist.
+
+    Args:
+        client_id: The OAuth2 client_id (azp/clientId)
+
+    Returns:
+        True if the client is listed in either allowlist.
+    """
+    return get_manager().is_known_client(client_id)
 
 
 def reload_config() -> None:
