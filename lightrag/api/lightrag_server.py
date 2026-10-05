@@ -72,6 +72,13 @@ from fastapi.security import OAuth2PasswordRequestForm
 from lightrag.api.auth import auth_handler, _is_admin_user
 from lightrag.api.security_headers import SecurityHeadersMiddleware, build_webui_csp
 from lightrag.api.login_throttle import LoginThrottle
+from lightrag.api.workspace_registry import (
+    WorkspaceOwnershipError,
+    create_workspace_registry,
+    local_identity,
+    resolve_workspace,
+    sso_identity,
+)
 
 # use the .env that is inside the current folder
 # allows to use different .env file for each lightrag instance
@@ -490,11 +497,21 @@ def create_app(args):
             # Data migration regardless of storage implementation
             await rag.check_and_migrate_data()
 
+            # Workspace ownership registry (multi-tenant mode). Initialized
+            # after the storages so it reuses the shared database pool.
+            registry = getattr(app.state, "workspace_registry", None)
+            if registry is not None:
+                await registry.initialize()
+
             ASCIIColors.green("\nServer is ready to accept connections! 🚀\n")
 
             yield
 
         finally:
+            registry = getattr(app.state, "workspace_registry", None)
+            if registry is not None:
+                await registry.finalize()
+
             # Clean up database connections
             await rag.finalize_storages()
 
@@ -1751,8 +1768,22 @@ def create_app(args):
             f"(max_instances={args.max_workspace_instances}, "
             f"ttl_minutes={args.workspace_ttl_minutes})"
         )
+        # Records which identity owns each workspace (see workspace_registry).
+        app.state.workspace_registry = create_workspace_registry(args)
     else:
         app.state.workspace_manager = None
+        app.state.workspace_registry = None
+
+    async def _registry_workspace(identity: str, email, source: str):
+        """Resolve the signed-in identity's workspace via the ownership
+        registry; None when multi-tenancy (and so the registry) is off."""
+        registry = getattr(app.state, "workspace_registry", None)
+        if registry is None:
+            return None
+        try:
+            return await resolve_workspace(registry, identity, email, source)
+        except WorkspaceOwnershipError as e:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
 
     # Add routes
     # root_path is set on the app for reverse proxy support;
@@ -1920,8 +1951,14 @@ def create_app(args):
         # consistent across /login, SSO, and Keycloak-direct auth paths.
         role = "admin" if _is_admin_user(username) else "user"
 
+        workspace_id = await _registry_workspace(
+            local_identity(username), None, username
+        )
         user_token = auth_handler.create_token(
-            username=username, role=role, metadata={"auth_mode": "enabled"}
+            username=username,
+            role=role,
+            metadata={"auth_mode": "enabled"},
+            workspace_id=workspace_id,
         )
         return {
             "access_token": user_token,
@@ -2085,10 +2122,17 @@ def create_app(args):
             else "user"
         )
 
+        workspace_id = None
+        if user_info.get("sub"):
+            workspace_id = await _registry_workspace(
+                sso_identity(user_info["sub"]), user_info.get("email"), username
+            )
+
         # Create local JWT token
         user_token = auth_handler.create_token(
             username=username,
             role=role,
+            workspace_id=workspace_id,
             metadata={
                 "auth_mode": "sso",
                 "sso_provider": "keycloak",
@@ -2230,6 +2274,10 @@ def create_app(args):
             response = RedirectResponse(url=f"/webui/#/oauth2/callback?{error_params}")
             # Clear the single-use PKCE state cookie on failure as well.
             response.delete_cookie("oauth2_pkce", path="/")
+            # A refused sign-in also ends any earlier session in this browser,
+            # so it cannot carry on under a previous login.
+            response.delete_cookie("lightrag_token", path="/")
+            response.delete_cookie("lightrag_user", path="/")
             return response
 
     @app.get("/oauth2/logout")

@@ -443,6 +443,7 @@ def validate_any_token(token: str) -> dict:
                 "metadata": {
                     "auth_mode": "keycloak_direct",
                     "email": email,
+                    "keycloak_sub": payload.get("sub"),
                 },
             }
         except HTTPException:

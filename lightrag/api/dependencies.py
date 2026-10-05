@@ -271,6 +271,38 @@ async def _resolve_user(
     workspace_id = payload.get("workspace_id") or sanitize_workspace_id(username)
     metadata = payload.get("metadata", {})
 
+    # Keycloak access tokens sent directly (not a LightRAG session) carry no
+    # workspace of ours: resolve it through the ownership registry so the
+    # same rules as sign-in apply.
+    registry = (
+        getattr(request.app.state, "workspace_registry", None) if request else None
+    )
+    if (
+        registry is not None
+        and metadata.get("auth_mode") == "keycloak_direct"
+        and metadata.get("keycloak_sub")
+    ):
+        from .workspace_registry import (
+            WorkspaceOwnershipError,
+            resolve_workspace,
+            sso_identity,
+        )
+
+        identity = sso_identity(metadata["keycloak_sub"])
+        cached = await registry.cached_workspace_for(identity)
+        if cached:
+            workspace_id = cached
+        else:
+            email = metadata.get("email")
+            try:
+                workspace_id = await resolve_workspace(
+                    registry, identity, email, email or username
+                )
+            except WorkspaceOwnershipError as e:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN, detail=str(e)
+                )
+
     return UserInfo(
         username=username,
         role=role,
