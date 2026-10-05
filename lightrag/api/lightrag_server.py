@@ -36,6 +36,7 @@ from .config import (
     get_default_host,
     resolve_asymmetric_embedding_opt_in,
     PREFIX_ASYMMETRIC_EMBEDDING_BINDINGS,
+    resolve_cors_settings,
 )
 from lightrag.utils import get_env_value
 from lightrag import LightRAG, ROLES, RoleLLMConfig, __version__ as core_version
@@ -80,7 +81,7 @@ webui_title = os.getenv("WEBUI_TITLE")
 webui_description = os.getenv("WEBUI_DESCRIPTION")
 
 # Global authentication configuration
-auth_configured = bool(auth_handler.accounts)
+auth_configured = auth_handler.login_required
 
 
 # Fixed WebUI mount path. Used as `app.mount(WEBUI_PATH, ...)` and as the
@@ -584,20 +585,21 @@ def create_app(args):
             # For other endpoints, return the default FastAPI validation error
             return JSONResponse(status_code=422, content={"detail": exc.errors()})
 
-    def get_cors_origins():
-        """Get allowed origins from global_args
-        Returns a list of allowed origins, defaults to ["*"] if not set
-        """
-        origins_str = global_args.cors_origins
-        if origins_str == "*":
-            return ["*"]
-        return [origin.strip() for origin in origins_str.split(",")]
-
-    # Add CORS middleware
+    # Add CORS middleware. Cookies are only honoured cross-origin for an
+    # explicit CORS_ORIGINS list — never together with the "*" wildcard.
+    cors_origins, cors_allow_credentials = resolve_cors_settings(
+        global_args.cors_origins
+    )
+    if not cors_allow_credentials:
+        logger.info(
+            "CORS_ORIGINS allows any origin; cross-origin requests cannot use "
+            "the session cookie. Set CORS_ORIGINS to explicit origins if a "
+            "WebUI hosted on another origin must authenticate with cookies."
+        )
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=get_cors_origins(),
-        allow_credentials=True,
+        allow_origins=cors_origins,
+        allow_credentials=cors_allow_credentials,
         allow_methods=["*"],
         allow_headers=["*"],
         expose_headers=[
@@ -1725,6 +1727,13 @@ def create_app(args):
 
     # Multi-tenancy: wire the factory-based WorkspaceManager when enabled.
     if args.enable_multi_tenancy:
+        if not auth_handler.login_required:
+            logger.warning(
+                "ENABLE_MULTI_TENANCY is on but no user authentication is "
+                "configured (AUTH_ACCOUNTS is empty and OAuth2/SSO has no client "
+                "credentials): every caller shares the single 'guest' workspace. "
+                "Configure AUTH_ACCOUNTS or OAuth2 to isolate users."
+            )
         from lightrag.api.workspace_manager import WorkspaceManager
 
         app.state.workspace_manager = WorkspaceManager(
@@ -1838,7 +1847,7 @@ def create_app(args):
             "oauth2_provider": "keycloak" if global_args.oauth2_enabled else None,
         }
 
-        if not auth_handler.accounts:
+        if not auth_handler.login_required:
             # Authentication not configured, return guest token
             guest_token = auth_handler.create_token(
                 username="guest", role="guest", metadata={"auth_mode": "disabled"}
@@ -1868,7 +1877,7 @@ def create_app(args):
 
     @app.post("/login")
     async def login(form_data: OAuth2PasswordRequestForm = Depends()):
-        if not auth_handler.accounts:
+        if not auth_handler.login_required:
             # Authentication not configured, return guest token
             guest_token = auth_handler.create_token(
                 username="guest", role="guest", metadata={"auth_mode": "disabled"}
@@ -2117,8 +2126,18 @@ def create_app(args):
                 or is_forwarded_ssl
             )
 
-            # Determine samesite attribute - use "none" for cross-site OAuth2 flow when secure
-            samesite_value = "none" if is_secure else "lax"
+            # SameSite defaults to "lax": the cookie is still set by this
+            # top-level redirect from the identity provider and sent on every
+            # same-site request, but not on cross-site subrequests (CSRF /
+            # cross-origin reads). "none" is opt-in via OAUTH2_COOKIE_SAMESITE
+            # and browsers only accept it on a Secure cookie.
+            samesite_value = getattr(global_args, "oauth2_cookie_samesite", "lax")
+            if samesite_value == "none" and not is_secure:
+                logger.warning(
+                    "OAUTH2_COOKIE_SAMESITE=none requires HTTPS; using 'lax' "
+                    "for this non-secure request."
+                )
+                samesite_value = "lax"
 
             logger.info(
                 f"OAuth2 callback: Setting cookies with secure={is_secure}, samesite={samesite_value} "
@@ -2133,7 +2152,7 @@ def create_app(args):
                 value=token_data["access_token"],
                 httponly=True,  # Prevents JavaScript access (XSS protection)
                 secure=is_secure,  # Only send over HTTPS in production
-                samesite=samesite_value,  # "none" for cross-site, "lax" for same-site
+                samesite=samesite_value,
                 max_age=int(global_args.token_expire_hours * 3600),
                 path="/",
             )
@@ -2224,49 +2243,6 @@ def create_app(args):
 
         logger.info("SSO logout initiated, redirecting to Keycloak logout")
         return response
-
-    @app.get("/debug/auth")
-    async def debug_auth(request: Request):
-        """
-        Debug endpoint to check what auth info the server receives.
-        This helps diagnose cookie/header issues.
-        """
-        # Get all cookies
-        cookies = dict(request.cookies)
-        # Mask token values for security (show first/last 10 chars)
-        masked_cookies = {}
-        for key, value in cookies.items():
-            if len(value) > 30:
-                masked_cookies[key] = f"{value[:10]}...{value[-10:]} (len={len(value)})"
-            else:
-                masked_cookies[key] = value
-
-        # Get authorization header
-        auth_header = request.headers.get("authorization", "")
-        if auth_header:
-            if len(auth_header) > 30:
-                auth_header = (
-                    f"{auth_header[:20]}...{auth_header[-10:]} (len={len(auth_header)})"
-                )
-
-        # Get relevant headers
-        relevant_headers = {
-            "x-forwarded-proto": request.headers.get("x-forwarded-proto", "(not set)"),
-            "x-forwarded-ssl": request.headers.get("x-forwarded-ssl", "(not set)"),
-            "x-forwarded-for": request.headers.get("x-forwarded-for", "(not set)"),
-            "host": request.headers.get("host", "(not set)"),
-            "origin": request.headers.get("origin", "(not set)"),
-        }
-
-        return {
-            "cookies_received": masked_cookies,
-            "cookie_keys": list(cookies.keys()),
-            "has_lightrag_token": "lightrag_token" in cookies,
-            "authorization_header": auth_header or "(not set)",
-            "request_scheme": request.url.scheme,
-            "relevant_headers": relevant_headers,
-            "client_host": request.client.host if request.client else "(unknown)",
-        }
 
     @app.get(
         "/health",

@@ -389,10 +389,10 @@ Open WebUI 使用 LLM 来执行会话标题和会话关键词生成任务。因�
 
 ```
 LIGHTRAG_API_KEY=your-secure-api-key-here
-WHITELIST_PATHS=/health,/api/*
+WHITELIST_PATHS=/health
 ```
 
-> 健康检查和 Ollama 模拟端点默认不进行 API 密钥检查。为了安全原因，如果不需要提供Ollama服务，应该把`/api/*`从WHITELIST_PATHS中移除。
+> 默认只有健康检查端点不进行身份验证。Ollama 模拟端点（`/api/*`）与其他路由一样需要凭证；只有在确实需要免认证访问时才把 `/api/*` 加入 `WHITELIST_PATHS`，这会让任何能访问服务器的人都可以对知识库进行对话/生成。
 
 API Key使用的请求头是 `X-API-Key` 。以下是使用API访问LightRAG Server的一个例子：
 
@@ -705,8 +705,7 @@ EMBEDDING_BINDING_HOST=http://localhost:11434
 # TOKEN_EXPIRE_HOURS=48
 
 # LIGHTRAG_API_KEY=your-secure-api-key-here-123
-# WHITELIST_PATHS=/api/*
-# WHITELIST_PATHS=/health,/api/*
+# WHITELIST_PATHS=/health
 ```
 
 ## 文档和块处理逻辑说明

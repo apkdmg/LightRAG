@@ -6,6 +6,7 @@ import os
 import re
 import argparse
 import logging
+from typing import Any, Mapping
 from dotenv import load_dotenv
 from lightrag import ROLES
 from lightrag.utils import get_env_value, logger
@@ -156,21 +157,29 @@ def get_embedding_prefix_config(env_key: str) -> tuple[str | None, bool]:
     return value, True
 
 
+def is_oauth2_usable(args: Any) -> bool:
+    """Return True when OAuth2/SSO is enabled AND its client credentials are set.
+
+    Only a usable OAuth2 configuration can log anyone in, so this (not the bare
+    OAUTH2_ENABLED flag, which defaults to true) is what counts as "SSO is on".
+    """
+    return bool(
+        getattr(args, "oauth2_enabled", False)
+        and (getattr(args, "oauth2_client_id", "") or "").strip()
+        and (getattr(args, "oauth2_client_secret", "") or "").strip()
+    )
+
+
 def validate_auth_configuration(args: argparse.Namespace) -> None:
     """Reject insecure JWT auth settings before the API starts."""
     auth_accounts = (getattr(args, "auth_accounts", "") or "").strip()
     token_secret = (getattr(args, "token_secret", "") or "").strip()
 
-    # OAuth2/SSO is "usable" only when it is enabled AND its client credentials
-    # are configured. In that case the local TOKEN_SECRET signs the LightRAG
+    # When OAuth2/SSO is usable the local TOKEN_SECRET signs the LightRAG
     # session JWT minted after a successful SSO login, so a strong secret is
     # mandatory — otherwise admin-token forgery against the public default
     # secret becomes possible even with no AUTH_ACCOUNTS configured.
-    oauth2_usable = bool(
-        getattr(args, "oauth2_enabled", False)
-        and (getattr(args, "oauth2_client_id", "") or "").strip()
-        and (getattr(args, "oauth2_client_secret", "") or "").strip()
-    )
+    oauth2_usable = is_oauth2_usable(args)
 
     secret_required = bool(auth_accounts) or oauth2_usable
 
@@ -184,6 +193,65 @@ def validate_auth_configuration(args: argparse.Namespace) -> None:
             "is enabled (OAUTH2_ENABLED=true with OAUTH2_CLIENT_ID and OAUTH2_CLIENT_SECRET set). "
             "The default secret is public and would allow admin-token forgery."
         )
+
+
+# Backend-specific workspace overrides. Each one takes priority over the
+# workspace a storage instance is constructed with, so in multi-tenant mode a
+# single value here silently puts every user in the same workspace.
+STORAGE_WORKSPACE_OVERRIDE_ENV_VARS = (
+    "POSTGRES_WORKSPACE",
+    "MILVUS_WORKSPACE",
+    "NEO4J_WORKSPACE",
+    "QDRANT_WORKSPACE",
+    "MONGODB_WORKSPACE",
+    "REDIS_WORKSPACE",
+    "OPENSEARCH_WORKSPACE",
+    "MEMGRAPH_WORKSPACE",
+)
+
+OAUTH2_COOKIE_SAMESITE_VALUES = ("lax", "strict", "none")
+
+
+def validate_tenant_isolation_configuration(
+    args: argparse.Namespace, environ: Mapping[str, str] | None = None
+) -> None:
+    """Reject settings that defeat per-user workspace isolation.
+
+    Raises ValueError when multi-tenancy is enabled while a backend-specific
+    ``*_WORKSPACE`` override is set: the override wins over the per-user
+    workspace, merging all tenants' documents, vectors, graph and LLM cache.
+    """
+    if not getattr(args, "enable_multi_tenancy", False):
+        return
+    environ = os.environ if environ is None else environ
+    conflicting = [
+        name
+        for name in STORAGE_WORKSPACE_OVERRIDE_ENV_VARS
+        if (environ.get(name) or "").strip()
+    ]
+    if conflicting:
+        raise ValueError(
+            f"{', '.join(conflicting)} must not be set when ENABLE_MULTI_TENANCY=true: "
+            "a storage workspace override takes priority over the per-user workspace "
+            "and would store every user's data in one shared workspace. Remove the "
+            "variable(s), or set ENABLE_MULTI_TENANCY=false for a single-workspace server."
+        )
+
+
+def resolve_cors_settings(origins_str: str | None) -> tuple[list[str], bool]:
+    """Return ``(allow_origins, allow_credentials)`` for the CORS middleware.
+
+    Credentialed cross-origin requests (cookies) are only allowed for an
+    explicit origin list. With a wildcard, Starlette echoes back whatever
+    Origin the browser sends, so combining ``*`` with credentials would let any
+    website read API responses using a logged-in user's session cookie.
+    Bearer-token and API-key clients are unaffected: those headers are not
+    CORS credentials.
+    """
+    origins = [o.strip() for o in (origins_str or "*").split(",") if o.strip()]
+    if not origins or "*" in origins:
+        return ["*"], False
+    return origins, True
 
 
 def _is_set(value: str | None) -> bool:
@@ -676,7 +744,7 @@ def parse_args() -> argparse.Namespace:
     # Add environment variables that were previously read directly
     args.cors_origins = get_env_value("CORS_ORIGINS", "*")
     args.summary_language = get_env_value("SUMMARY_LANGUAGE", DEFAULT_SUMMARY_LANGUAGE)
-    args.whitelist_paths = get_env_value("WHITELIST_PATHS", "/health,/api/*")
+    args.whitelist_paths = get_env_value("WHITELIST_PATHS", "/health")
 
     # For JWT Auth
     args.auth_accounts = get_env_value("AUTH_ACCOUNTS", "")
@@ -714,6 +782,17 @@ def parse_args() -> argparse.Namespace:
         "OAUTH2_REDIRECT_URI", "http://localhost:8020/oauth2/callback"
     )
     args.oauth2_scopes = get_env_value("OAUTH2_SCOPES", "openid profile email")
+    # SameSite attribute of the SSO session cookie. "lax" (default) keeps the
+    # cookie off cross-site subrequests; use "none" only when the WebUI is
+    # served from a different site than the API (requires HTTPS).
+    args.oauth2_cookie_samesite = (
+        get_env_value("OAUTH2_COOKIE_SAMESITE", "lax", str).strip().lower()
+    )
+    if args.oauth2_cookie_samesite not in OAUTH2_COOKIE_SAMESITE_VALUES:
+        raise ValueError(
+            f'Invalid OAUTH2_COOKIE_SAMESITE="{args.oauth2_cookie_samesite}"; '
+            f"expected one of {', '.join(OAUTH2_COOKIE_SAMESITE_VALUES)}."
+        )
     # DEPRECATED: use OBO_ADMIN_CLIENTS in the .obo_allowlist file instead
     # (hot-reloaded, single place alongside the workspace OBO config). This arg
     # is still parsed for backward compatibility and is consumed only as a
@@ -852,6 +931,7 @@ def parse_args() -> argparse.Namespace:
             args.workspace = sanitized
 
     validate_auth_configuration(args)
+    validate_tenant_isolation_configuration(args)
     validate_bedrock_auth_configuration(args)
     return args
 
@@ -906,6 +986,7 @@ def initialize_config(args=None, force=False):
 
     resolved_args = args if args is not None else parse_args()
     validate_auth_configuration(resolved_args)
+    validate_tenant_isolation_configuration(resolved_args)
     validate_bedrock_auth_configuration(resolved_args)
     _global_args = resolved_args
     _initialized = True

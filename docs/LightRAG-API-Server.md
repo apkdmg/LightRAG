@@ -378,10 +378,10 @@ By default, the LightRAG Server can be accessed without any authentication. We c
 
 ```
 LIGHTRAG_API_KEY=your-secure-api-key-here
-WHITELIST_PATHS=/health,/api/*
+WHITELIST_PATHS=/health
 ```
 
-> Health check and Ollama emulation endpoints are excluded from API Key check by default. For security reasons, remove `/api/*` from `WHITELIST_PATHS` if the Ollama service is not required.
+> Only the health check is excluded from authentication by default. The Ollama emulation endpoints (`/api/*`) require credentials like every other route; add `/api/*` to `WHITELIST_PATHS` only if they must be reachable without authentication, which exposes chat/generate over your knowledge base to anyone who can reach the server.
 
 The API key is passed using the request header `X-API-Key`. Below is an example of accessing the LightRAG Server via API:
 
@@ -693,8 +693,7 @@ EMBEDDING_BINDING_HOST=http://localhost:11434
 # TOKEN_EXPIRE_HOURS=48
 
 # LIGHTRAG_API_KEY=your-secure-api-key-here-123
-# WHITELIST_PATHS=/api/*
-# WHITELIST_PATHS=/health,/api/*
+# WHITELIST_PATHS=/health
 ```
 
 ## Document and Chunk Processing
