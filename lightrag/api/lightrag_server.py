@@ -71,6 +71,7 @@ from lightrag.kg.shared_storage import (
 from fastapi.security import OAuth2PasswordRequestForm
 from lightrag.api.auth import auth_handler, _is_admin_user
 from lightrag.api.security_headers import SecurityHeadersMiddleware, build_webui_csp
+from lightrag.api.login_throttle import LoginThrottle
 
 # use the .env that is inside the current folder
 # allows to use different .env file for each lightrag instance
@@ -1878,6 +1879,11 @@ def create_app(args):
             **oauth2_info,
         }
 
+    login_throttle = LoginThrottle(
+        max_failures=getattr(args, "login_max_failed_attempts", 5),
+        window_seconds=getattr(args, "login_lockout_minutes", 15) * 60,
+    )
+
     @app.post("/login")
     async def login(form_data: OAuth2PasswordRequestForm = Depends()):
         if not auth_handler.login_required:
@@ -1896,8 +1902,18 @@ def create_app(args):
                 "webui_description": webui_description,
             }
         username = form_data.username
+        retry_after = login_throttle.retry_after(username)
+        if retry_after:
+            logger.warning(f"Login throttled for user '{username}'")
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail="Too many failed login attempts. Try again later.",
+                headers={"Retry-After": str(retry_after)},
+            )
         if not auth_handler.verify_password(username, form_data.password):
+            login_throttle.record_failure(username)
             raise HTTPException(status_code=401, detail="Incorrect credentials")
+        login_throttle.reset(username)
 
         # Determine the user role based on ADMIN_ACCOUNTS configuration.
         # Uses the shared, case-insensitive matcher so admin status is
@@ -2028,6 +2044,20 @@ def create_app(args):
         # Validate ID token using JWKS
         token_payload = keycloak.validate_id_token(id_token)
         user_info = keycloak.extract_user_info(token_payload)
+
+        # The email becomes the user's identity and workspace, so refuse an
+        # address the identity provider has not verified (an unverified email
+        # could be set to another user's address).
+        if (
+            user_info.get("email")
+            and getattr(global_args, "oauth2_require_verified_email", True)
+            and user_info.get("email_verified") is not True
+        ):
+            logger.warning("SSO login refused: email address not verified")
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Your email address is not verified by the identity provider.",
+            )
 
         # Get username (prefer email, fallback to preferred_username or sub)
         username = (

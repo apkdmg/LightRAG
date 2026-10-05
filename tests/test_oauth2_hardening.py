@@ -106,6 +106,10 @@ def auth_env(monkeypatch):
         auth_accounts="",
         admin_accounts="",
         oauth2_service_account_admin_clients="",
+        oauth2_client_id="lightrag-server",
+        oauth2_allowed_clients="",
+        oauth2_allowed_audiences="",
+        oauth2_require_verified_email=True,
     )
     monkeypatch.setattr(config, "global_args", mock_global_args)
 
@@ -151,9 +155,11 @@ def _point_manager_at_file(monkeypatch, tmp_path, contents: str):
 
 
 def test_service_account_not_in_allowlist_is_user(auth_env, monkeypatch):
-    """A service-account token whose client_id is NOT in any admin config => user."""
+    """A trusted service-account client NOT in any admin config => user."""
     payload = {"clientId": "some-svc", "azp": "some-svc", "scope": "openid"}
     _patch_keycloak(monkeypatch, payload, is_service=True)
+    # Trusted via OAUTH2_ALLOWED_CLIENTS, but not an admin client.
+    auth_env.args.oauth2_allowed_clients = "some-svc"
     # auth_env baseline already cleared all admin env vars and the file => no admin.
 
     info = auth_env.auth.validate_any_token("not-a-local-jwt")
@@ -205,6 +211,8 @@ def test_service_account_file_key_wins_over_deprecated_env(
     _point_manager_at_file(monkeypatch, tmp_path, "OBO_ADMIN_CLIENTS=other-svc\n")
     monkeypatch.setenv("OAUTH2_SERVICE_ACCOUNT_ADMIN_CLIENTS", "some-svc")
     _reset_obo_manager()
+    # Trusted via OAUTH2_ALLOWED_CLIENTS so the token is accepted at all.
+    auth_env.args.oauth2_allowed_clients = "some-svc"
 
     info = auth_env.auth.validate_any_token("not-a-local-jwt")
 
@@ -252,7 +260,9 @@ def test_regular_user_token_resolves_via_admin_accounts(auth_env, monkeypatch):
     payload = {
         "preferred_username": "alice",
         "email": "alice@example.com",
+        "email_verified": True,
         "sub": "u1",
+        "azp": "lightrag-server",
     }
     _patch_keycloak(monkeypatch, payload, is_service=False)
     auth_env.args.oauth2_service_account_admin_clients = ""
