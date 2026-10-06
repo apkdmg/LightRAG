@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import re
+
 from pathlib import Path
 
 import pytest
@@ -937,11 +939,11 @@ set -euo pipefail
 source "{REPO_ROOT}/scripts/setup/setup.sh"
 REPO_ROOT="{case_dir}"
 
-{case['prompt_choice']}
+{case["prompt_choice"]}
 prompt_with_default() {{ printf '%s' "$2"; }}
 prompt_until_valid() {{ printf '%s' "$2"; }}
 prompt_secret_with_default() {{ printf '%s' "$2"; }}
-{case['prompt_secret']}
+{case["prompt_secret"]}
 confirm_default_no() {{
   case "$1" in
     "Run embedding model locally via Docker (vLLM)?") return 1 ;;
@@ -1933,11 +1935,12 @@ printf 'PROMPT_LOG=%s\\n' "$(paste -sd '|' "$PROMPT_LOG_FILE")\"
         encoding="utf-8"
     )
     assert "POSTGRES_USER=rag" in generated_env
-    assert "POSTGRES_PASSWORD=rag" in generated_env
+    assert re.search(r"^POSTGRES_PASSWORD=[0-9a-f]{32}$", generated_env, re.M)
     assert "POSTGRES_DATABASE=rag" in generated_env
-    assert 'POSTGRES_USER: "rag"' in generated_compose
-    assert 'POSTGRES_PASSWORD: "rag"' in generated_compose
-    assert 'POSTGRES_DB: "rag"' in generated_compose
+    # Credentials are referenced from .env, never copied into the compose file.
+    assert "POSTGRES_USER: ${POSTGRES_USER:?missing}" in generated_compose
+    assert "POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?missing}" in generated_compose
+    assert "POSTGRES_DB: ${POSTGRES_DATABASE:?missing}" in generated_compose
 
 
 def test_env_storage_flow_preserves_existing_postgres_image_during_rewrite(
@@ -1988,8 +1991,8 @@ env_storage_flow
 """)
     result = (tmp_path / "docker-compose.final.yml").read_text(encoding="utf-8")
     assert "image: registry.example.com/postgres-for-rag:patched" in result
-    assert 'POSTGRES_USER: "updated-user"' in result
-    assert 'POSTGRES_DB: "rag"' in result
+    assert "POSTGRES_USER: ${POSTGRES_USER:?missing}" in result
+    assert "POSTGRES_DB: ${POSTGRES_DATABASE:?missing}" in result
 
 
 def test_env_storage_flow_preserves_existing_neo4j_image_during_rewrite(
@@ -2104,7 +2107,7 @@ env_storage_flow
     result = (tmp_path / "docker-compose.final.yml").read_text(encoding="utf-8")
     assert "image: registry.example.com/postgres-for-rag:patched" in result
     assert "image: registry.example.com/neo4j:custom" in result
-    assert 'POSTGRES_USER: "updated-user"' in result
+    assert "POSTGRES_USER: ${POSTGRES_USER:?missing}" in result
     assert 'NEO4J_dbms_default__database: "updated-database"' in result
 
 
@@ -2157,7 +2160,7 @@ env_storage_flow
 """)
     result = (tmp_path / "docker-compose.final.yml").read_text(encoding="utf-8")
     assert "image: gzdaniel/postgres-for-rag:16.6" in result
-    assert 'POSTGRES_USER: "updated-user"' in result
+    assert "POSTGRES_USER: ${POSTGRES_USER:?missing}" in result
 
 
 def test_env_storage_flow_force_rewrite_drops_preserved_storage_images(

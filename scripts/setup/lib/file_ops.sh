@@ -1278,10 +1278,11 @@ generate_docker_compose() {
 
     case "$service" in
       postgres)
+        # Credentials stay in .env; the compose file only references them.
         inject_service_environment_overrides "$service_blocks_file" "postgres" \
-          "POSTGRES_USER=${ENV_VALUES[POSTGRES_USER]:-}" \
-          "POSTGRES_PASSWORD=${ENV_VALUES[POSTGRES_PASSWORD]:-}" \
-          "POSTGRES_DB=${ENV_VALUES[POSTGRES_DATABASE]:-}"
+          "POSTGRES_USER=${_COMPOSE_RAW_VALUE_PREFIX}\${POSTGRES_USER:?missing}" \
+          "POSTGRES_PASSWORD=${_COMPOSE_RAW_VALUE_PREFIX}\${POSTGRES_PASSWORD:?missing}" \
+          "POSTGRES_DB=${_COMPOSE_RAW_VALUE_PREFIX}\${POSTGRES_DATABASE:?missing}"
         ;;
       neo4j)
         inject_service_environment_overrides "$service_blocks_file" "neo4j" \

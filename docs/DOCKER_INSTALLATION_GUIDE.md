@@ -275,13 +275,13 @@ production-grade graph + vector + reranker stack: PostgreSQL, Neo4j, Milvus
 | Service | Image | Port | Role | GPU? |
 |---------|-------|------|------|------|
 | `lightrag` | `ghcr.io/apkdmg/lightrag:latest` | **9621** (exposed) | API + WebUI | No |
-| `vllm-embed` | `vllm/vllm-openai:latest` | 8001 (exposed) | Embedding model server — `BAAI/bge-m3` | **Yes** |
-| `vllm-rerank` | `vllm/vllm-openai:latest` | 8000 (exposed) | Reranker — `BAAI/bge-reranker-v2-m3` | **Yes** |
+| `vllm-embed` | `vllm/vllm-openai:latest` | 8001 (localhost only) | Embedding model server — `BAAI/bge-m3` | **Yes** |
+| `vllm-rerank` | `vllm/vllm-openai:latest` | 8000 (localhost only) | Reranker — `BAAI/bge-reranker-v2-m3` | **Yes** |
 | `postgres` | `pgvector/pgvector:pg18` | 5432 (internal) | KV + vector storage (pgvector) | No |
 | `neo4j` | `neo4j:5-community` | 7474, 7687 (internal) | Graph storage | No |
-| `milvus` | `milvusdb/milvus:v2.6.11-gpu` | 19530 (internal) | Alternative vector storage | **Yes** |
+| `milvus` | `milvusdb/milvus:v2.6.11-gpu` | 19530 (internal, authentication on) | Alternative vector storage | **Yes** |
 | `milvus-etcd` | `quay.io/coreos/etcd:v3.5.25` | — | Milvus metadata sidecar | No |
-| `milvus-minio` | `minio/minio` | — | Milvus object-store sidecar | No |
+| `milvus-minio` | `milvusdb/minio` (override with `MILVUS_MINIO_IMAGE`) | — | Milvus object-store sidecar | No |
 
 Services communicate over the compose network by hostname (`postgres`,
 `neo4j`, `milvus`, `vllm-embed`, `vllm-rerank`).
@@ -304,6 +304,10 @@ Compose fails fast if the secrets below are missing. Export them in your shell
 or place them in a top-level `.env` (Compose reads it automatically):
 
 ```bash
+# PostgreSQL authentication (also used by LightRAG)
+POSTGRES_USER=rag
+POSTGRES_PASSWORD=your-strong-password
+
 # Neo4j authentication
 NEO4J_USERNAME=neo4j
 NEO4J_PASSWORD=your-strong-password
@@ -311,6 +315,13 @@ NEO4J_PASSWORD=your-strong-password
 # Milvus object store (MinIO)
 MINIO_ACCESS_KEY_ID=your-minio-key
 MINIO_SECRET_ACCESS_KEY=your-minio-secret
+
+# Milvus authentication: LightRAG connects as MILVUS_USER. On first start it
+# rotates Milvus's default root password to MILVUS_ROOT_PASSWORD and creates
+# MILVUS_USER with access to MILVUS_DB_NAME only.
+MILVUS_USER=lightrag
+MILVUS_PASSWORD=your-strong-password
+MILVUS_ROOT_PASSWORD=another-strong-password
 
 # vLLM API keys (must match the matching *_BINDING_API_KEY in LightRAG's .env)
 VLLM_EMBED_API_KEY=any-shared-token
@@ -425,6 +436,17 @@ Milvus instead of pgvector for the vector store, set
 `MILVUS_URI=http://milvus:19530` from the compose env block. Milvus depends on
 its `milvus-etcd` (metadata) and `milvus-minio` (object store) sidecars — both
 come up automatically.
+
+Milvus runs with authentication enabled. On LightRAG's first start,
+`MILVUS_ROOT_PASSWORD` is used once to replace Milvus's factory root password
+and to create `MILVUS_USER` with access to `MILVUS_DB_NAME` only; LightRAG then
+connects as that user. Keep the root password in a password manager; it can be
+removed from `.env` after the first start.
+
+The community `minio/minio` images are no longer published, so the stack uses
+`milvusdb/minio`, the copy Milvus maintains for its own compose files. An
+existing install should keep the MinIO image it already runs (set
+`MILVUS_MINIO_IMAGE`) rather than move to an older MinIO release.
 
 #### vLLM embedding / rerank
 

@@ -1438,9 +1438,12 @@ generate_docker_compose "$REPO_ROOT/docker-compose.generated.yml\"
         'MONGO_URI: "mongodb://user:p$$HOME@host.docker.internal:27017/"'
         in generated_compose
     )
-    assert 'POSTGRES_USER: "user$$ID"' in generated_compose
-    assert 'POSTGRES_PASSWORD: "pass$$HOME"' in generated_compose
-    assert 'POSTGRES_DB: "db$$NAME"' in generated_compose
+    # Postgres credentials are referenced from .env (where "$" values are
+    # single-quoted, so Compose does not expand them), not copied here.
+    assert "POSTGRES_USER: ${POSTGRES_USER:?missing}" in generated_compose
+    assert "POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?missing}" in generated_compose
+    assert "POSTGRES_DB: ${POSTGRES_DATABASE:?missing}" in generated_compose
+    assert "pass$HOME" not in generated_compose
     assert (
         "NEO4J_AUTH: ${NEO4J_USERNAME:?missing}/${NEO4J_PASSWORD:?missing}"
         in generated_compose
