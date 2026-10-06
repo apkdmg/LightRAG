@@ -14,6 +14,7 @@ if not pm.is_installed("pymilvus"):
 
 import configparser
 from pymilvus import MilvusClient, DataType, CollectionSchema, FieldSchema  # type: ignore
+from .milvus_auth import ensure_milvus_app_user
 from packaging import version
 
 config = configparser.ConfigParser()
@@ -377,10 +378,20 @@ class MilvusVectorDBStorage(BaseVectorStorage):
 
     def _create_milvus_client(self) -> MilvusClient:
         """Create a Milvus client and ensure the configured database exists."""
-        client = MilvusClient(
-            **self._get_milvus_connection_kwargs(include_db_name=False)
-        )
+        connection_kwargs = self._get_milvus_connection_kwargs(include_db_name=False)
         db_name = self._get_milvus_db_name()
+
+        # First start with authentication: create the least-privilege app user
+        # (and database) when MILVUS_ROOT_PASSWORD is provided. No-op otherwise.
+        ensure_milvus_app_user(
+            uri=str(connection_kwargs["uri"]),
+            app_user=connection_kwargs.get("user"),
+            app_password=connection_kwargs.get("password"),
+            root_password=os.environ.get("MILVUS_ROOT_PASSWORD"),
+            db_name=db_name,
+        )
+
+        client = MilvusClient(**connection_kwargs)
 
         if not db_name:
             return client
@@ -392,16 +403,21 @@ class MilvusVectorDBStorage(BaseVectorStorage):
             )
             client.create_database(db_name)
 
+        # use_database() describes the target database from the `default`
+        # database's context, which a least-privilege user scoped to db_name
+        # is not allowed to do; such users connect with db_name directly.
+        least_privilege_user = connection_kwargs.get("user") not in (None, "", "root")
         use_database = getattr(client, "use_database", None) or getattr(
             client, "using_database", None
         )
-        if callable(use_database):
+        if callable(use_database) and not least_privilege_user:
             use_database(db_name)
             logger.debug(
                 f"[{self.workspace}] Using Milvus database '{db_name}' for namespace '{self.namespace}'"
             )
             return client
 
+        client.close()
         return MilvusClient(**self._get_milvus_connection_kwargs(include_db_name=True))
 
     def _create_schema_for_namespace(self) -> CollectionSchema:
