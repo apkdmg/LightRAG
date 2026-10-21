@@ -488,5 +488,23 @@
     "prevPage": "Page précédente",
     "nextPage": "Page suivante",
     "lastPage": "Dernière page"
+  },
+  "workspaceSettings": {
+    "delete": {
+      "cardTitle": "Supprimer l'espace de travail",
+      "cardDescription": "Supprimer définitivement votre espace de travail « {{workspace}} » et tout son contenu.",
+      "button": "Supprimer l'espace de travail",
+      "title": "Supprimer cet espace de travail ?",
+      "description": "Cette action supprime définitivement l'espace de travail « {{workspace}} » : tous les documents, fichiers importés, le graphe de connaissances, les réponses en cache, les clés API et les paramètres de fournisseur. Vous serez déconnecté.",
+      "warning": "Cette action est irréversible.",
+      "confirmPrompt": "Saisissez {{phrase}} pour confirmer :",
+      "confirmButton": "Supprimer définitivement",
+      "deleting": "Suppression...",
+      "signInAgain": "Par sécurité, reconnectez-vous avant de supprimer votre espace de travail, puis revenez ici dans les 15 minutes.",
+      "signInButton": "Se reconnecter",
+      "success": "Votre espace de travail a été supprimé.",
+      "busy": "L'espace de travail traite des documents. Réessayez une fois le traitement terminé.",
+      "error": "Échec de la suppression de l'espace de travail : {{error}}"
+    }
   }
 }

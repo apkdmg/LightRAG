@@ -1448,3 +1448,30 @@ export const listAdminWorkspaces = async (
   })
   return response.data
 }
+
+/** The signed-in user's own workspace, and whether they may delete it now. */
+export type OwnWorkspace = {
+  workspace_id: string
+  can_delete: boolean
+  /** Seconds left before deleting requires signing in again; 0 = sign in again now. */
+  sign_in_seconds_left: number
+}
+
+/** Phrase the server requires to confirm deleting a workspace. */
+export const DELETE_WORKSPACE_CONFIRMATION = 'DELETE MY WORKSPACE'
+
+export const getOwnWorkspace = async (): Promise<OwnWorkspace> => {
+  const response = await axiosInstance.get('/workspace')
+  return response.data
+}
+
+/**
+ * Permanently delete the caller's own workspace and all its data. The server
+ * takes the workspace from the session; no workspace ID is sent.
+ */
+export const deleteOwnWorkspace = async (): Promise<{ status: string; message: string }> => {
+  const response = await axiosInstance.delete('/workspace', {
+    data: { confirm: DELETE_WORKSPACE_CONFIRMATION }
+  })
+  return response.data
+}

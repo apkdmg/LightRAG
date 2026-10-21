@@ -17,6 +17,8 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
+from fastapi import HTTPException, status
+
 from lightrag import LightRAG
 
 logger = logging.getLogger("lightrag.api.workspace_manager")
@@ -43,6 +45,16 @@ class WorkspaceInfo:
 
     is_active: bool
     """Whether the workspace is currently loaded in memory."""
+
+
+class WorkspaceDeletionInProgress(HTTPException):
+    """Raised for requests to a workspace that is being deleted."""
+
+    def __init__(self, workspace_id: str):
+        super().__init__(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Workspace '{workspace_id}' is being deleted",
+        )
 
 
 def sanitize_workspace_id(username: str) -> str:
@@ -91,6 +103,7 @@ class WorkspaceManager:
         max_instances: int = 100,
         ttl_minutes: int = 60,
         on_instance_ready: Optional[Callable[[LightRAG, str], Awaitable[None]]] = None,
+        instance_is_stale: Optional[Callable[[str, float], Awaitable[bool]]] = None,
     ):
         """
         Initialize the WorkspaceManager.
@@ -106,11 +119,16 @@ class WorkspaceManager:
                 ``(rag, workspace_id)`` right after ``initialize_storages()``,
                 before the instance is served. Used to apply per-workspace
                 provider overrides; kept generic so the manager stays decoupled.
+            instance_is_stale: Optional async check ``(workspace_id,
+                created_at) -> bool`` run on a cache hit. True rebuilds the
+                instance; used to drop instances of a workspace another worker
+                deleted after they were built.
         """
         self._instance_factory = instance_factory
         self._max_instances = max_instances
         self._ttl_minutes = ttl_minutes
         self._on_instance_ready = on_instance_ready
+        self._instance_is_stale = instance_is_stale
 
         # LRU cache: workspace_id -> (LightRAG, created_at, last_accessed, access_count)
         self._instances: OrderedDict[str, Tuple[LightRAG, float, float, int]] = (
@@ -120,6 +138,9 @@ class WorkspaceManager:
 
         # Track workspace metadata (persists even after eviction)
         self._workspace_metadata: Dict[str, Dict[str, Any]] = {}
+
+        # Workspaces being deleted: no instance is served or rebuilt for them
+        self._deleting: set[str] = set()
 
         logger.info(
             f"WorkspaceManager initialized with max_instances={max_instances}, "
@@ -195,6 +216,19 @@ class WorkspaceManager:
             The LightRAG instance for the workspace.
         """
         async with self._lock:
+            if workspace_id in self._deleting:
+                raise WorkspaceDeletionInProgress(workspace_id)
+
+            if workspace_id in self._instances and self._instance_is_stale:
+                created_at = self._instances[workspace_id][1]
+                if await self._instance_is_stale(workspace_id, created_at):
+                    logger.info(
+                        f"Rebuilding stale instance for workspace: {workspace_id}"
+                    )
+                    await self._finalize(
+                        self._instances.pop(workspace_id)[0], workspace_id
+                    )
+
             if workspace_id in self._instances:
                 # Move to end (most recently used) and update access time
                 rag, created_at, _, count = self._instances.pop(workspace_id)
@@ -299,34 +333,44 @@ class WorkspaceManager:
             is_active=True,
         )
 
-    async def delete_workspace(self, workspace_id: str) -> bool:
-        """
-        Delete a workspace, finalizing and removing its instance (admin API).
+    def is_known(self, workspace_id: str) -> bool:
+        """Whether this process has served or created the workspace."""
+        return workspace_id in self._workspace_metadata
 
-        Args:
-            workspace_id: The workspace identifier to delete.
+    async def begin_deletion(self, workspace_id: str) -> LightRAG:
+        """Mark a workspace as being deleted and return its instance.
 
-        Returns:
-            True if the workspace was found and deleted, False otherwise.
+        Until :meth:`end_deletion`, requests for the workspace get HTTP 409 and
+        no new instance is built, so nothing recreates storage mid-purge. The
+        returned instance is the one the purge drops storages through; once
+        they are dropped, :meth:`discard_instance` closes it.
         """
+        rag = await self.get_instance(workspace_id)
         async with self._lock:
-            # Remove from active instances if present
-            if workspace_id in self._instances:
-                rag, _, _, _ = self._instances.pop(workspace_id)
-                try:
-                    await rag.finalize_storages()
-                except Exception as e:
-                    logger.error(
-                        f"Error finalizing storage during deletion for {workspace_id}: {e}"
-                    )
+            if workspace_id in self._deleting:
+                raise WorkspaceDeletionInProgress(workspace_id)
+            self._deleting.add(workspace_id)
+        return rag
 
-            # Remove metadata
-            if workspace_id in self._workspace_metadata:
-                del self._workspace_metadata[workspace_id]
-                logger.info(f"Deleted workspace: {workspace_id}")
-                return True
+    async def discard_instance(self, workspace_id: str) -> None:
+        """Finalize and forget a deleted workspace's instance and metadata."""
+        async with self._lock:
+            entry = self._instances.pop(workspace_id, None)
+            if entry is not None:
+                await self._finalize(entry[0], workspace_id)
+            self._workspace_metadata.pop(workspace_id, None)
 
-            return False
+    async def end_deletion(self, workspace_id: str) -> None:
+        """Serve the workspace again (after a purge, a fresh, empty one)."""
+        async with self._lock:
+            self._deleting.discard(workspace_id)
+
+    @staticmethod
+    async def _finalize(rag: LightRAG, workspace_id: str) -> None:
+        try:
+            await rag.finalize_storages()
+        except Exception as e:
+            logger.error(f"Error finalizing storage for workspace {workspace_id}: {e}")
 
     def list_workspaces(
         self, page: int = 1, page_size: int = 50

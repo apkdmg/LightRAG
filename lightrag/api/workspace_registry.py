@@ -18,6 +18,12 @@ different identity (a reassigned address), so an administrator decides.
 Existing workspaces keep their names: each is bound to its owner on that
 person's first sign-in after this feature is deployed.
 
+Deleting a workspace (``retire``) unbinds it and leaves a tombstone holding
+only hashes of the workspace ID and former owner, plus the deletion time.
+Sessions that began before that time are refused for the workspace, and only
+the former owner may claim the same ID again; anyone else whose name maps to
+it gets a distinct ID, as in a collision.
+
 Backends: a Postgres table when Postgres is the KV storage, otherwise a JSON
 file protected by an exclusive file lock (safe across Gunicorn workers).
 """
@@ -32,6 +38,7 @@ import os
 import re
 import time
 from abc import ABC, abstractmethod
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Optional
@@ -55,6 +62,14 @@ class WorkspaceOwner:
     email: Optional[str]
     created_at: float
     last_login_at: float
+
+
+@dataclass
+class WorkspaceTombstone:
+    """A deleted workspace. Holds hashes only, so no name or email remains."""
+
+    identity_hash: Optional[str]
+    deleted_at: float
 
 
 class WorkspaceOwnershipError(Exception):
@@ -95,6 +110,10 @@ def _identity_suffix(identity: str) -> str:
     return hashlib.sha256(identity.encode("utf-8")).hexdigest()[:8]
 
 
+def _digest(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
 def _same_email(a: Optional[str], b: Optional[str]) -> bool:
     return bool(a and b and a.strip().lower() == b.strip().lower())
 
@@ -106,6 +125,9 @@ class WorkspaceRegistry(ABC):
 
     def __init__(self) -> None:
         self._cache: dict[str, tuple[str, float]] = {}
+        self._tombstone_cache: dict[
+            str, tuple[Optional[WorkspaceTombstone], float]
+        ] = {}
 
     async def initialize(self) -> None:  # pragma: no cover - default no-op
         return None
@@ -141,8 +163,30 @@ class WorkspaceRegistry(ABC):
     @abstractmethod
     async def list_owners(self) -> list[WorkspaceOwner]: ...
 
+    @abstractmethod
+    async def retire(self, workspace_id: str, identity: Optional[str]) -> None:
+        """Unbind a deleted workspace and record its tombstone. ``identity``
+        is the former owner (None when the workspace was never bound)."""
+
+    @abstractmethod
+    async def get_tombstone(
+        self, workspace_id: str
+    ) -> Optional[WorkspaceTombstone]: ...
+
     def invalidate_cache(self) -> None:
         self._cache.clear()
+        self._tombstone_cache.clear()
+
+    async def cached_tombstone(self, workspace_id: str) -> Optional[WorkspaceTombstone]:
+        """Tombstone lookup for the per-request session check. Other workers
+        see a deletion within ``_CACHE_TTL_SECONDS``."""
+        hit = self._tombstone_cache.get(workspace_id)
+        now = time.monotonic()
+        if hit and now - hit[1] < _CACHE_TTL_SECONDS:
+            return hit[0]
+        tombstone = await self.get_tombstone(workspace_id)
+        self._tombstone_cache[workspace_id] = (tombstone, now)
+        return tombstone
 
     async def cached_workspace_for(self, identity: str) -> Optional[str]:
         hit = self._cache.get(identity)
@@ -177,34 +221,41 @@ async def resolve_workspace(
     for _ in range(3):  # retry if a concurrent sign-in wins a claim race
         current = await registry.get_by_workspace(candidate)
         if current is None:
-            if await registry.claim(candidate, identity, email):
-                logger.info(f"Workspace '{candidate}' bound to {identity}")
+            tombstone = await registry.get_tombstone(candidate)
+            if tombstone is None or tombstone.identity_hash == _digest(identity):
+                if await registry.claim(candidate, identity, email):
+                    logger.info(f"Workspace '{candidate}' bound to {identity}")
+                    return candidate
+                continue
+            # A deleted workspace's ID goes back only to its former owner, so
+            # sessions issued for the old workspace never reach a new one.
+            taken_by = "a deleted workspace of another account"
+        else:
+            if current.identity == identity:
                 return candidate
-            continue
 
-        if current.identity == identity:
-            return candidate
-
-        if _same_email(current.email, email):
-            # Same email address, different person (or a re-created account):
-            # never hand over the previous owner's data automatically.
-            logger.warning(
-                f"Refused workspace '{candidate}' for {identity}: it belongs to "
-                f"{current.identity} with the same email address"
-            )
-            raise WorkspaceOwnershipError(
-                "This account does not match the owner of its workspace. "
-                "Ask an administrator to review it.",
-                workspace_id=candidate,
-                identity=identity,
-            )
+            if _same_email(current.email, email):
+                # Same email address, different person (or a re-created
+                # account): never hand over the previous owner's data
+                # automatically.
+                logger.warning(
+                    f"Refused workspace '{candidate}' for {identity}: it belongs to "
+                    f"{current.identity} with the same email address"
+                )
+                raise WorkspaceOwnershipError(
+                    "This account does not match the owner of its workspace. "
+                    "Ask an administrator to review it.",
+                    workspace_id=candidate,
+                    identity=identity,
+                )
+            taken_by = current.identity
 
         # Different person whose name maps to the same ID: give them their own.
         distinct = f"{storage_safe_workspace_id(source)}_{_identity_suffix(identity)}"
         if candidate == distinct:
             break
         logger.warning(
-            f"Workspace ID '{candidate}' already belongs to {current.identity}; "
+            f"Workspace ID '{candidate}' is taken by {taken_by}; "
             f"assigning '{distinct}' to {identity}"
         )
         candidate = distinct
@@ -234,26 +285,41 @@ class JsonWorkspaceRegistry(WorkspaceRegistry):
     def __init__(self, working_dir: str | os.PathLike[str]):
         super().__init__()
         self._path = Path(working_dir) / ".workspace_owners.json"
+        self._tombstones_path = Path(working_dir) / ".workspace_tombstones.json"
         self._lock_path = Path(working_dir) / ".workspace_owners.lock"
 
-    def _locked(self, mutate):
+    @contextmanager
+    def _flock(self):
         self._path.parent.mkdir(parents=True, exist_ok=True)
         with open(self._lock_path, "a+") as lock_file:
             if fcntl is not None:
                 fcntl.flock(lock_file, fcntl.LOCK_EX)
             try:
-                data: dict[str, dict[str, Any]] = {}
-                if self._path.exists():
-                    data = json.loads(self._path.read_text(encoding="utf-8") or "{}")
-                result, changed = mutate(data)
-                if changed:
-                    tmp = self._path.with_suffix(".json.tmp")
-                    tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
-                    os.replace(tmp, self._path)
-                return result
+                yield
             finally:
                 if fcntl is not None:
                     fcntl.flock(lock_file, fcntl.LOCK_UN)
+
+    @staticmethod
+    def _read(path: Path) -> dict[str, dict[str, Any]]:
+        if path.exists():
+            return json.loads(path.read_text(encoding="utf-8") or "{}")
+        return {}
+
+    @staticmethod
+    def _write(path: Path, data: dict[str, dict[str, Any]]) -> None:
+        tmp = path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        os.replace(tmp, path)
+
+    def _locked(self, mutate, path: Optional[Path] = None):
+        path = path or self._path
+        with self._flock():
+            data = self._read(path)
+            result, changed = mutate(data)
+            if changed:
+                self._write(path, data)
+            return result
 
     async def _run(self, mutate):
         return await asyncio.to_thread(self._locked, mutate)
@@ -347,12 +413,35 @@ class JsonWorkspaceRegistry(WorkspaceRegistry):
 
         return await self._run(read)
 
+    def _retire_locked(self, workspace_id: str, identity: Optional[str]) -> None:
+        with self._flock():
+            tombstones = self._read(self._tombstones_path)
+            tombstones[_digest(workspace_id)] = asdict(
+                WorkspaceTombstone(_digest(identity) if identity else None, time.time())
+            )
+            self._write(self._tombstones_path, tombstones)
+            owners = self._read(self._path)
+            if owners.pop(workspace_id, None) is not None:
+                self._write(self._path, owners)
+
+    async def retire(self, workspace_id: str, identity: Optional[str]) -> None:
+        await asyncio.to_thread(self._retire_locked, workspace_id, identity)
+        self.invalidate_cache()
+
+    async def get_tombstone(self, workspace_id: str) -> Optional[WorkspaceTombstone]:
+        def read(data):
+            entry = data.get(_digest(workspace_id))
+            return (WorkspaceTombstone(**entry) if entry else None), False
+
+        return await asyncio.to_thread(self._locked, read, self._tombstones_path)
+
 
 # ---------------------------------------------------------------------------
 # Postgres backend
 # ---------------------------------------------------------------------------
 
 _PG_TABLE = "LIGHTRAG_WORKSPACE_OWNERS"
+_PG_TOMBSTONES_TABLE = "LIGHTRAG_WORKSPACE_TOMBSTONES"
 
 
 class PostgresWorkspaceRegistry(WorkspaceRegistry):
@@ -378,6 +467,13 @@ class PostgresWorkspaceRegistry(WorkspaceRegistry):
                 email VARCHAR(512),
                 created_at DOUBLE PRECISION NOT NULL,
                 last_login_at DOUBLE PRECISION NOT NULL
+            )"""
+        )
+        await self._db.execute(
+            f"""CREATE TABLE IF NOT EXISTS {_PG_TOMBSTONES_TABLE} (
+                workspace_hash CHAR(64) PRIMARY KEY,
+                identity_hash CHAR(64),
+                deleted_at DOUBLE PRECISION NOT NULL
             )"""
         )
 
@@ -473,6 +569,40 @@ class PostgresWorkspaceRegistry(WorkspaceRegistry):
             f"SELECT * FROM {_PG_TABLE} ORDER BY workspace_id", multirows=True
         )
         return [self._owner(r) for r in rows or []]
+
+    async def retire(self, workspace_id: str, identity: Optional[str]) -> None:
+        # Tombstone first: if the unbind then fails, old sessions are already
+        # refused and the former owner can still sign in and retry.
+        await self._db.execute(
+            f"""INSERT INTO {_PG_TOMBSTONES_TABLE}
+                (workspace_hash, identity_hash, deleted_at)
+                VALUES ($1, $2, $3)
+                ON CONFLICT (workspace_hash) DO UPDATE
+                SET identity_hash = EXCLUDED.identity_hash,
+                    deleted_at = EXCLUDED.deleted_at""",
+            {
+                "workspace_hash": _digest(workspace_id),
+                "identity_hash": _digest(identity) if identity else None,
+                "deleted_at": time.time(),
+            },
+        )
+        await self._db.execute(
+            f"DELETE FROM {_PG_TABLE} WHERE workspace_id = $1",
+            {"workspace_id": workspace_id},
+        )
+        self.invalidate_cache()
+
+    async def get_tombstone(self, workspace_id: str) -> Optional[WorkspaceTombstone]:
+        row = await self._db.query(
+            f"SELECT * FROM {_PG_TOMBSTONES_TABLE} WHERE workspace_hash = $1",
+            [_digest(workspace_id)],
+        )
+        if not row:
+            return None
+        return WorkspaceTombstone(
+            identity_hash=row["identity_hash"],
+            deleted_at=float(row["deleted_at"]),
+        )
 
 
 def create_workspace_registry(args: Any) -> WorkspaceRegistry:

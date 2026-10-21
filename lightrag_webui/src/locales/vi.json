@@ -480,5 +480,23 @@
     "prevPage": "Trang Trước",
     "nextPage": "Trang Tiếp",
     "lastPage": "Trang Cuối"
+  },
+  "workspaceSettings": {
+    "delete": {
+      "cardTitle": "Xóa không gian làm việc",
+      "cardDescription": "Xóa vĩnh viễn không gian làm việc \"{{workspace}}\" và mọi nội dung trong đó.",
+      "button": "Xóa không gian làm việc",
+      "title": "Xóa không gian làm việc này?",
+      "description": "Thao tác này xóa vĩnh viễn không gian làm việc \"{{workspace}}\": tất cả tài liệu, tệp đã tải lên, đồ thị tri thức, câu trả lời đã lưu đệm, khóa API và cài đặt nhà cung cấp. Bạn sẽ bị đăng xuất.",
+      "warning": "Không thể hoàn tác thao tác này.",
+      "confirmPrompt": "Nhập {{phrase}} để xác nhận:",
+      "confirmButton": "Xóa vĩnh viễn",
+      "deleting": "Đang xóa...",
+      "signInAgain": "Để bảo mật, hãy đăng nhập lại trước khi xóa không gian làm việc, rồi quay lại đây trong vòng 15 phút.",
+      "signInButton": "Đăng nhập lại",
+      "success": "Không gian làm việc của bạn đã bị xóa.",
+      "busy": "Không gian làm việc đang xử lý tài liệu. Hãy thử lại khi xử lý xong.",
+      "error": "Xóa không gian làm việc thất bại: {{error}}"
+    }
   }
 }

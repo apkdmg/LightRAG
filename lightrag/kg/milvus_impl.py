@@ -1851,6 +1851,22 @@ class MilvusVectorDBStorage(BaseVectorStorage):
             )
             return {}
 
+    async def drop_workspace_schema(self) -> None:
+        """Remove this workspace's collection for good (workspace deletion).
+
+        ``drop`` recreates an empty collection so the instance stays usable;
+        a deleted workspace should leave no collection named after it.
+        """
+        if not self.workspace:
+            raise RuntimeError(
+                "Refusing to remove the collection of the default workspace"
+            )
+        if self._client.has_collection(self.final_namespace):
+            self._client.drop_collection(self.final_namespace)
+        logger.info(
+            f"[{self.workspace}] Removed Milvus collection {self.final_namespace}"
+        )
+
     async def drop(self) -> dict[str, str]:
         """Drop all vector data from storage and clean up resources
 

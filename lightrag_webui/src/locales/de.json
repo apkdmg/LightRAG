@@ -480,5 +480,23 @@
     "prevPage": "Vorherige Seite",
     "nextPage": "Nächste Seite",
     "lastPage": "Letzte Seite"
+  },
+  "workspaceSettings": {
+    "delete": {
+      "cardTitle": "Arbeitsbereich löschen",
+      "cardDescription": "Ihren Arbeitsbereich „{{workspace}}“ und seinen gesamten Inhalt dauerhaft löschen.",
+      "button": "Arbeitsbereich löschen",
+      "title": "Diesen Arbeitsbereich löschen?",
+      "description": "Dadurch wird der Arbeitsbereich „{{workspace}}“ dauerhaft gelöscht: alle Dokumente, hochgeladenen Dateien, der Wissensgraph, zwischengespeicherte Antworten, API-Schlüssel und Anbietereinstellungen. Sie werden abgemeldet.",
+      "warning": "Dies kann nicht rückgängig gemacht werden.",
+      "confirmPrompt": "Geben Sie zur Bestätigung {{phrase}} ein:",
+      "confirmButton": "Endgültig löschen",
+      "deleting": "Wird gelöscht...",
+      "signInAgain": "Melden Sie sich zu Ihrer Sicherheit vor dem Löschen erneut an und kehren Sie innerhalb von 15 Minuten hierher zurück.",
+      "signInButton": "Erneut anmelden",
+      "success": "Ihr Arbeitsbereich wurde gelöscht.",
+      "busy": "Der Arbeitsbereich verarbeitet gerade Dokumente. Versuchen Sie es nach Abschluss erneut.",
+      "error": "Arbeitsbereich konnte nicht gelöscht werden: {{error}}"
+    }
   }
 }
