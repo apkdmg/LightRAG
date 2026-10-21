@@ -79,3 +79,20 @@ not loaded and with no directories) and 400 for the server's default workspace.
   workspace ID and the former owner's identity, plus the deletion time
   (`WORKING_DIR/.workspace_tombstones.json`, or the Postgres table
   `LIGHTRAG_WORKSPACE_TOMBSTONES`).
+
+## Testing against live backends
+
+`tests/test_workspace_deletion_live.py` fills two workspaces through the real
+insert pipeline on Postgres, Neo4j and Milvus, purges one, and queries the
+databases directly to check that no rows, nodes, indexes or collections of it
+remain while the other is untouched. It is skipped unless configured:
+
+```bash
+LIGHTRAG_RUN_INTEGRATION=true \
+POSTGRES_HOST=… POSTGRES_PORT=… POSTGRES_USER=… POSTGRES_PASSWORD=… POSTGRES_DATABASE=… \
+NEO4J_URI=… NEO4J_USERNAME=… NEO4J_PASSWORD=… \
+MILVUS_URI=… MILVUS_DB_NAME=default \
+./scripts/test.sh tests/test_workspace_deletion_live.py --run-integration
+```
+
+Use disposable databases: the test creates and deletes its own workspaces.
