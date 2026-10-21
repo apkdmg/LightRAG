@@ -1757,11 +1757,19 @@ def create_app(args):
             )
         from lightrag.api.workspace_manager import WorkspaceManager
 
+        async def _instance_is_stale(workspace_id: str, created_at: float) -> bool:
+            # Another worker deleted the workspace after this instance was built
+            tombstone = await app.state.workspace_registry.cached_tombstone(
+                workspace_id
+            )
+            return tombstone is not None and tombstone.deleted_at > created_at
+
         app.state.workspace_manager = WorkspaceManager(
             instance_factory=build_rag,
             max_instances=args.max_workspace_instances,
             ttl_minutes=args.workspace_ttl_minutes,
             on_instance_ready=_on_instance_ready,
+            instance_is_stale=_instance_is_stale,
         )
         logger.info(
             "Multi-tenancy enabled: WorkspaceManager active "
@@ -1815,6 +1823,11 @@ def create_app(args):
     if args.enable_multi_tenancy:
         app.include_router(create_admin_routes())
         logger.info("Admin routes enabled for multi-tenancy management")
+
+        from lightrag.api.routers.workspace_routes import create_workspace_routes
+
+        app.include_router(create_workspace_routes(api_key=api_key))
+        logger.info("Owner workspace deletion route enabled (DELETE /workspace)")
 
     # Per-workspace BYO provider routes (multi-tenancy + feature flag).
     if args.enable_multi_tenancy and args.enable_workspace_providers:

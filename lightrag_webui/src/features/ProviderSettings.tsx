@@ -31,6 +31,7 @@ import {
   type EffectiveRolesResponse,
   type AdminWorkspace
 } from '@/api/lightrag'
+import DeleteWorkspaceCard from '@/components/DeleteWorkspaceCard'
 import { useProvidersStore } from '@/stores/providers'
 import { useAuthStore } from '@/stores/state'
 import {
@@ -494,6 +495,9 @@ export default function ProviderSettings() {
       {loading && (
         <p className="text-sm text-muted-foreground">{t('providerSettings.loading')}</p>
       )}
+
+      {/* Owner-only and never for a workspace an admin is managing */}
+      {targetWorkspace === null && <DeleteWorkspaceCard />}
     </div>
   )
 }

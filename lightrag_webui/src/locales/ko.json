@@ -480,5 +480,23 @@
     "prevPage": "이전 페이지",
     "nextPage": "다음 페이지",
     "lastPage": "마지막 페이지"
+  },
+  "workspaceSettings": {
+    "delete": {
+      "cardTitle": "워크스페이스 삭제",
+      "cardDescription": "워크스페이스 \"{{workspace}}\"와 그 안의 모든 내용을 영구적으로 삭제합니다.",
+      "button": "워크스페이스 삭제",
+      "title": "이 워크스페이스를 삭제할까요?",
+      "description": "워크스페이스 \"{{workspace}}\"를 영구적으로 삭제합니다: 모든 문서, 업로드한 파일, 지식 그래프, 캐시된 답변, API 키 및 공급자 설정. 삭제 후 로그아웃됩니다.",
+      "warning": "이 작업은 되돌릴 수 없습니다.",
+      "confirmPrompt": "확인하려면 {{phrase}}를 입력하세요:",
+      "confirmButton": "영구 삭제",
+      "deleting": "삭제 중...",
+      "signInAgain": "보안을 위해 워크스페이스를 삭제하기 전에 다시 로그인한 뒤 15분 이내에 이곳으로 돌아오세요.",
+      "signInButton": "다시 로그인",
+      "success": "워크스페이스가 삭제되었습니다.",
+      "busy": "워크스페이스가 문서를 처리하는 중입니다. 처리가 끝난 후 다시 시도하세요.",
+      "error": "워크스페이스 삭제 실패: {{error}}"
+    }
   }
 }

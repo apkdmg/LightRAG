@@ -133,6 +133,11 @@ def register_workspace_hash(workspace_id: str) -> None:
     logger.debug(f"Registered workspace hash: {workspace_hash} -> {workspace_id}")
 
 
+def forget_workspace_keys(workspace_id: str) -> None:
+    """Drop a deleted workspace from the in-memory key lookup."""
+    _workspace_hash_registry.pop(_hash_workspace_id(workspace_id), None)
+
+
 def lookup_workspace_by_hash(workspace_hash: str) -> Optional[str]:
     """
     Look up a workspace ID by its hash.

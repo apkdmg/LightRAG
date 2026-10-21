@@ -39,6 +39,7 @@ an OpenAI-compatible API, and email ingestion.
 | [KEYCLOAK_SSO_SETUP.md](./KEYCLOAK_SSO_SETUP.md) | Setting up OAuth2 / Keycloak SSO |
 | [OAuth2-SSO-Authentication.md](./OAuth2-SSO-Authentication.md) | SSO architecture, token flows, and automation |
 | [PER_USER_API_KEYS.md](./PER_USER_API_KEYS.md) | Per-user API keys (`sk-lightrag-…`) |
+| [WORKSPACE_DELETION.md](./WORKSPACE_DELETION.md) | Owner and admin deletion of a workspace and all its data |
 | [OPENAI_COMPATIBLE_API.md](./OPENAI_COMPATIBLE_API.md) | The OpenAI-compatible `/v1` API |
 | [EMAIL_INGESTION.md](./EMAIL_INGESTION.md) | Ingesting `.eml` emails into the knowledge graph |
 

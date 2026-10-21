@@ -53,3 +53,5 @@ account, a valid SSO identity, or the API key) rather than relying on the role.
 
 - [OBO_ALLOWLIST.md](OBO_ALLOWLIST.md) — service-account / API-key OBO allowlist,
   admin-client grants, and hot-reload behaviour.
+- [WORKSPACE_DELETION.md](../../docs/WORKSPACE_DELETION.md) — who may delete a
+  workspace (`DELETE /workspace` is owner-session only) and what is removed.

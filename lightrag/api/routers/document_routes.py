@@ -2635,7 +2635,9 @@ def create_document_routes(
         from ..dependencies import resolve_workspace_from_request
 
         workspace = await resolve_workspace_from_request(http_request)
-        if workspace not in _workspace_doc_managers:
+        cached = _workspace_doc_managers.get(workspace)
+        # A deleted workspace's input directory is gone; start afresh.
+        if cached is None or not cached.input_dir.exists():
             _workspace_doc_managers[workspace] = DocumentManager(
                 doc_manager.base_input_dir,
                 workspace=workspace,

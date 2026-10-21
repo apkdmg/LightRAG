@@ -16,6 +16,11 @@ from lightrag.api.dependencies import (
     require_admin,
     UserInfo,
 )
+from lightrag.api.workspace_deletion import (
+    WorkspaceBusyError,
+    purge_app_workspace,
+    workspace_exists,
+)
 from lightrag.api.workspace_manager import WorkspaceManager, sanitize_workspace_id
 from lightrag.api.auth import auth_handler
 
@@ -186,12 +191,16 @@ def create_admin_routes():
     )
     async def delete_workspace(
         workspace_id: str,
+        request: Request,
+        admin_user: UserInfo = Depends(require_admin),
         workspace_manager: WorkspaceManager = Depends(get_workspace_manager),
     ):
         """
-        Delete a workspace and all its data.
+        Permanently delete a workspace and all of its data.
 
-        WARNING: This permanently deletes all data in the workspace.
+        Removes every document, chunk, entity, relation, vector, graph node,
+        cached LLM response, uploaded file, API key and provider credential of
+        the workspace, and releases its ownership. This cannot be undone.
 
         Args:
             workspace_id: The workspace identifier to delete.
@@ -199,33 +208,41 @@ def create_admin_routes():
         Returns:
             DeleteWorkspaceResponse: Status of the deletion.
         """
-        try:
-            # Sanitize the workspace_id
-            sanitized_id = sanitize_workspace_id(workspace_id)
+        from lightrag.api.config import global_args
 
-            deleted = await workspace_manager.delete_workspace(sanitized_id)
-
-            if not deleted:
-                raise HTTPException(
-                    status_code=status.HTTP_404_NOT_FOUND,
-                    detail=f"Workspace not found: {workspace_id}",
-                )
-
-            logger.info(f"Admin deleted workspace: {sanitized_id}")
-
-            return DeleteWorkspaceResponse(
-                status="success",
-                message=f"Workspace '{sanitized_id}' deleted successfully",
-                workspace_id=sanitized_id,
+        sanitized_id = sanitize_workspace_id(workspace_id)
+        if sanitized_id == (global_args.workspace or ""):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="The server's default workspace cannot be deleted",
             )
-        except HTTPException:
-            raise
-        except Exception as e:
-            logger.error(f"Error deleting workspace: {e}")
+        if not await workspace_exists(request.app, sanitized_id):
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Workspace not found: {workspace_id}",
+            )
+
+        logger.warning(
+            f"Admin '{admin_user.username}' is deleting workspace '{sanitized_id}'"
+        )
+        try:
+            result = await purge_app_workspace(request.app, sanitized_id)
+        except WorkspaceBusyError as e:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
+        except ValueError as e:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+        if not result.ok:
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail=f"Failed to delete workspace: {str(e)}",
+                detail=f"Deleting workspace '{sanitized_id}' did not finish: "
+                + "; ".join(result.errors),
             )
+
+        return DeleteWorkspaceResponse(
+            status="success",
+            message=f"Workspace '{sanitized_id}' and all its data deleted",
+            workspace_id=sanitized_id,
+        )
 
     @router.get(
         "/workspaces",

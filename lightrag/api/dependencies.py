@@ -39,6 +39,9 @@ class UserInfo:
     metadata: dict
     """Additional metadata from the token."""
 
+    session_started_at: Optional[float] = None
+    """When the sign-in behind a LightRAG session token happened."""
+
 
 def get_workspace_manager(request: Request) -> WorkspaceManager:
     """
@@ -270,6 +273,7 @@ async def _resolve_user(
     role = payload.get("role", "user")
     workspace_id = payload.get("workspace_id") or sanitize_workspace_id(username)
     metadata = payload.get("metadata", {})
+    session_started_at = payload.get("session_started_at")
 
     # Keycloak access tokens sent directly (not a LightRAG session) carry no
     # workspace of ours: resolve it through the ownership registry so the
@@ -303,11 +307,22 @@ async def _resolve_user(
                     status_code=status.HTTP_403_FORBIDDEN, detail=str(e)
                 )
 
+    # A session that began before its workspace was deleted has ended.
+    if registry is not None and session_started_at:
+        tombstone = await registry.cached_tombstone(workspace_id)
+        if tombstone is not None and session_started_at <= tombstone.deleted_at:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="This workspace has been deleted. Sign in again.",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+
     return UserInfo(
         username=username,
         role=role,
         workspace_id=workspace_id,
         metadata=metadata,
+        session_started_at=session_started_at,
     )
 
 

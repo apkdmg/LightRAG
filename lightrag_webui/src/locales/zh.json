@@ -488,5 +488,23 @@
     "prevPage": "上一页",
     "nextPage": "下一页",
     "lastPage": "末页"
+  },
+  "workspaceSettings": {
+    "delete": {
+      "cardTitle": "删除工作区",
+      "cardDescription": "永久删除你的工作区“{{workspace}}”及其中的全部内容。",
+      "button": "删除工作区",
+      "title": "删除此工作区？",
+      "description": "这将永久删除工作区“{{workspace}}”：所有文档、上传的文件、知识图谱、缓存的回答、API 密钥和提供商设置。你将被登出。",
+      "warning": "此操作无法撤销。",
+      "confirmPrompt": "输入 {{phrase}} 以确认：",
+      "confirmButton": "永久删除",
+      "deleting": "正在删除...",
+      "signInAgain": "为了安全，删除工作区前请重新登录，并在 15 分钟内回到此处。",
+      "signInButton": "重新登录",
+      "success": "你的工作区已删除。",
+      "busy": "工作区正在处理文档，请在处理完成后重试。",
+      "error": "删除工作区失败：{{error}}"
+    }
   }
 }

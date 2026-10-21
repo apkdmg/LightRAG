@@ -1987,6 +1987,31 @@ class Neo4JStorage(BaseGraphStorage):
                 )
                 return labels
 
+    async def drop_workspace_schema(self) -> None:
+        """Remove this workspace's indexes (workspace deletion).
+
+        ``drop`` deletes the workspace's nodes but leaves its B-tree and
+        full-text indexes, which are named after the workspace label.
+        """
+        label = self.workspace.strip()
+        if not label:
+            raise RuntimeError(
+                "Refusing to remove the indexes of the default workspace"
+            )
+        async with self._driver.session(database=self._DATABASE) as session:
+            result = await session.run(
+                "SHOW INDEXES YIELD name, labelsOrTypes "
+                "WHERE $label IN labelsOrTypes RETURN name",
+                label=label,
+            )
+            names = [record["name"] for record in await result.data()]
+            await result.consume()
+            for name in names:
+                escaped = name.replace("`", "``")
+                result = await session.run(f"DROP INDEX `{escaped}` IF EXISTS")
+                await result.consume()
+        logger.info(f"[{self.workspace}] Removed Neo4j indexes: {names}")
+
     async def drop(self) -> dict[str, str]:
         """Drop all data from current workspace storage and clean up resources
 

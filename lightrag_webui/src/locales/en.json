@@ -86,6 +86,24 @@
       "loadFailed": "Failed to load provider settings"
     }
   },
+  "workspaceSettings": {
+    "delete": {
+      "cardTitle": "Delete workspace",
+      "cardDescription": "Permanently delete your workspace \"{{workspace}}\" and everything in it.",
+      "button": "Delete workspace",
+      "title": "Delete this workspace?",
+      "description": "This permanently deletes workspace \"{{workspace}}\": all documents, uploaded files, the knowledge graph, cached answers, API keys and provider settings. You will be signed out.",
+      "warning": "This cannot be undone.",
+      "confirmPrompt": "Type {{phrase}} to confirm:",
+      "confirmButton": "Delete permanently",
+      "deleting": "Deleting...",
+      "signInAgain": "For your security, sign in again before deleting your workspace, then return here within 15 minutes.",
+      "signInButton": "Sign in again",
+      "success": "Your workspace has been deleted.",
+      "busy": "The workspace is busy processing documents. Try again when it has finished.",
+      "error": "Failed to delete workspace: {{error}}"
+    }
+  },
   "login": {
     "description": "Please enter your account and password to log in to the system",
     "username": "Username",
