@@ -1344,7 +1344,8 @@ collect_postgres_config() {
   existing_database="${ORIGINAL_ENV_VALUES[POSTGRES_DATABASE]-${ENV_VALUES[POSTGRES_DATABASE]:-}}"
   if [[ "$use_docker" == "yes" && -z "$existing_user" && -z "$existing_password" ]]; then
     user="rag"
-    password="rag"
+    password="$(generate_service_secret)"
+    log_info "Generated a random PostgreSQL password and saved it to .env."
   else
     user="$(prompt_with_default "PostgreSQL user" "${existing_user:-rag}")"
     password="$(prompt_secret_with_default "PostgreSQL password: " "${existing_password:-rag}")"
@@ -1360,6 +1361,11 @@ collect_postgres_config() {
   ENV_VALUES["POSTGRES_USER"]="$user"
   ENV_VALUES["POSTGRES_PASSWORD"]="$password"
   ENV_VALUES["POSTGRES_DATABASE"]="$database"
+}
+
+# Random credential for wizard-managed Docker services: 32 hex characters.
+generate_service_secret() {
+  openssl rand -hex 16 2>/dev/null || LC_ALL=C tr -dc 'a-f0-9' < /dev/urandom | head -c 32
 }
 
 collect_neo4j_config() {
@@ -1394,7 +1400,10 @@ collect_neo4j_config() {
   existing_database="${ORIGINAL_ENV_VALUES[NEO4J_DATABASE]-${ENV_VALUES[NEO4J_DATABASE]:-}}"
   if [[ "$use_docker" == "yes" ]]; then
     username="$(prompt_until_valid "Neo4j username" "${existing_username:-neo4j}" validate_non_empty)"
-    password="$(prompt_secret_until_valid_with_default "Neo4j password: " "${existing_password:-neo4j_password}" validate_non_empty)"
+    if [[ -z "$existing_password" ]]; then
+      existing_password="$(generate_service_secret)"
+    fi
+    password="$(prompt_secret_until_valid_with_default "Neo4j password (Enter keeps a generated one): " "$existing_password" validate_non_empty)"
     if [[ -n "$existing_database" ]]; then
       database="$(prompt_with_default "Neo4j database" "$existing_database")"
     else
@@ -1541,10 +1550,21 @@ collect_milvus_config() {
     uri="$(prompt_until_valid "Milvus URI" "$uri" validate_uri milvus)"
     uri="$(normalize_milvus_uri_for_local_service "$uri")"
     if [[ -z "${ENV_VALUES[MINIO_ACCESS_KEY_ID]:-}" ]]; then
-      ENV_VALUES["MINIO_ACCESS_KEY_ID"]="minioadmin"
+      ENV_VALUES["MINIO_ACCESS_KEY_ID"]="minio-$(generate_service_secret | head -c 8)"
     fi
     if [[ -z "${ENV_VALUES[MINIO_SECRET_ACCESS_KEY]:-}" ]]; then
-      ENV_VALUES["MINIO_SECRET_ACCESS_KEY"]="minioadmin"
+      ENV_VALUES["MINIO_SECRET_ACCESS_KEY"]="$(generate_service_secret)"
+    fi
+    # The bundled Milvus requires authentication; LightRAG creates this
+    # least-privilege user on first start using MILVUS_ROOT_PASSWORD.
+    if [[ -z "${ENV_VALUES[MILVUS_USER]:-}" ]]; then
+      ENV_VALUES["MILVUS_USER"]="lightrag"
+    fi
+    if [[ -z "${ENV_VALUES[MILVUS_PASSWORD]:-}" ]]; then
+      ENV_VALUES["MILVUS_PASSWORD"]="$(generate_service_secret)"
+    fi
+    if [[ -z "${ENV_VALUES[MILVUS_ROOT_PASSWORD]:-}" ]]; then
+      ENV_VALUES["MILVUS_ROOT_PASSWORD"]="$(generate_service_secret)"
     fi
   else
     uri="$(prompt_until_valid "Milvus URI" "$uri" validate_uri milvus)"

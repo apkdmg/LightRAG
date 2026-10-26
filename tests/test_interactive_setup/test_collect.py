@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import re
+
 from pathlib import Path
 
 import pytest
@@ -90,7 +92,8 @@ printf 'POSTGRES_DATABASE=%s\\n' "${{ENV_VALUES[POSTGRES_DATABASE]}}"
 printf 'PROMPT_LOG=%s\\n' "$(paste -sd '|' "$PROMPT_LOG_FILE")\"
 """)
     assert values["POSTGRES_USER"] == "rag"
-    assert values["POSTGRES_PASSWORD"] == "rag"
+    # A random password is generated instead of the old "rag" default.
+    assert re.fullmatch(r"[0-9a-f]{32}", values["POSTGRES_PASSWORD"])
     assert values["POSTGRES_DATABASE"] == "rag"
     assert values["PROMPT_LOG"] == "PostgreSQL host"
 
@@ -1010,7 +1013,7 @@ printf 'MILVUS_DB_NAME=%s\\n' "${{ENV_VALUES[MILVUS_DB_NAME]}}\"
 def test_collect_milvus_config_initializes_minio_credentials_for_local_docker(
     tmp_path: Path,
 ) -> None:
-    """Local Docker Milvus should write default MinIO credentials when none exist yet."""
+    """Local Docker Milvus should generate MinIO and Milvus credentials when none exist yet."""
     env_file = tmp_path / ".env"
     env_example = tmp_path / "env.example"
     env_example.write_text((REPO_ROOT / "env.example").read_text(encoding="utf-8"))
@@ -1036,8 +1039,12 @@ generate_env_file "$REPO_ROOT/env.example" "$REPO_ROOT/.env\"
         cwd=tmp_path,
     )
     env_text = env_file.read_text(encoding="utf-8")
-    assert "MINIO_ACCESS_KEY_ID=minioadmin" in env_text
-    assert "MINIO_SECRET_ACCESS_KEY=minioadmin" in env_text
+    assert "minioadmin" not in re.findall(r"^MINIO_[A-Z_]+=(.*)$", env_text, re.M)
+    assert re.search(r"^MINIO_ACCESS_KEY_ID=minio-[0-9a-f]{8}$", env_text, re.M)
+    assert re.search(r"^MINIO_SECRET_ACCESS_KEY=[0-9a-f]{32}$", env_text, re.M)
+    assert re.search(r"^MILVUS_USER=lightrag$", env_text, re.M)
+    assert re.search(r"^MILVUS_PASSWORD=[0-9a-f]{32}$", env_text, re.M)
+    assert re.search(r"^MILVUS_ROOT_PASSWORD=[0-9a-f]{32}$", env_text, re.M)
 
 
 @pytest.mark.parametrize(
