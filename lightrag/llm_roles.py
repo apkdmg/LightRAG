@@ -14,14 +14,24 @@ import asyncio
 import inspect
 from copy import deepcopy
 from dataclasses import dataclass, field
-from functools import partial
+from functools import partial, wraps
 from typing import Any, Callable, Mapping
 
+from lightrag.provider_rejection import (
+    ProviderRejectionEvent,
+    classify_provider_rejection,
+    emit_provider_rejection,
+)
 from lightrag.utils import (
     get_env_value,
     logger,
     priority_limit_async_func_call,
 )
+
+# Roles called only at query time. Their provider rejections are reported
+# here; the ingestion roles (extract, vlm) are reported by the pipeline, which
+# also pauses ingestion.
+_QUERY_TIME_ROLES = frozenset({"query", "keyword"})
 
 
 def _optional_env_int(env_key: str) -> int | None:
@@ -181,7 +191,7 @@ class _RoleLLMMixin:
         model_kwargs: dict[str, Any],
     ) -> Callable[..., object]:
         spec = ROLES_BY_NAME[role_name]
-        return priority_limit_async_func_call(
+        wrapped = priority_limit_async_func_call(
             max_async,
             llm_timeout=timeout,
             queue_name=spec.queue_name,
@@ -192,6 +202,38 @@ class _RoleLLMMixin:
                 **model_kwargs,
             )
         )
+        if role_name in _QUERY_TIME_ROLES:
+            return self._report_provider_rejections(role_name, wrapped)
+        return wrapped
+
+    def _report_provider_rejections(
+        self, role_name: str, func: Callable[..., object]
+    ) -> Callable[..., object]:
+        """Report a rejected key / exhausted budget, then re-raise.
+
+        ``wraps`` carries the queue's ``shutdown`` attribute over.
+        """
+
+        @wraps(func)
+        async def reporting(*args, **kwargs):
+            try:
+                return await func(*args, **kwargs)
+            except Exception as e:
+                rejection = classify_provider_rejection(e)
+                if rejection is not None:
+                    config = self.get_llm_role_config(role_name)
+                    await emit_provider_rejection(
+                        ProviderRejectionEvent(
+                            workspace=self.workspace,
+                            role=role_name,
+                            rejection=rejection,
+                            host=config.get("host"),
+                            model=config.get("model"),
+                        )
+                    )
+                raise
+
+        return reporting
 
     def _rebuild_role_llm_funcs(self) -> None:
         """Wrap each role's raw_func with its own priority queue.

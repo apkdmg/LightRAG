@@ -503,11 +503,27 @@ def create_app(args):
             if registry is not None:
                 await registry.initialize()
 
+            resync_queue = getattr(app.state, "email_resync_queue", None)
+            if resync_queue is not None:
+                await resync_queue.start()
+
             ASCIIColors.green("\nServer is ready to accept connections! 🚀\n")
 
             yield
 
         finally:
+            notifier = getattr(app.state, "provider_rejection_notifier", None)
+            if notifier is not None:
+                from lightrag.provider_rejection import (
+                    remove_provider_rejection_listener,
+                )
+
+                remove_provider_rejection_listener(notifier)
+
+            resync_queue = getattr(app.state, "email_resync_queue", None)
+            if resync_queue is not None:
+                await resync_queue.stop()
+
             registry = getattr(app.state, "workspace_registry", None)
             if registry is not None:
                 await registry.finalize()
@@ -1782,6 +1798,16 @@ def create_app(args):
         app.state.workspace_manager = None
         app.state.workspace_registry = None
 
+    # Email admins (and, for BYO keys, the workspace owner) when an LLM
+    # provider rejects a key or a spend limit is hit; ingestion pauses itself.
+    from lightrag.api.provider_alerts import create_provider_rejection_notifier
+    from lightrag.provider_rejection import add_provider_rejection_listener
+
+    app.state.provider_rejection_notifier = create_provider_rejection_notifier(
+        app.state
+    )
+    add_provider_rejection_listener(app.state.provider_rejection_notifier)
+
     async def _registry_workspace(identity: str, email, source: str):
         """Resolve the signed-in identity's workspace via the ownership
         registry; None when multi-tenancy (and so the registry) is off."""
@@ -1816,7 +1842,27 @@ def create_app(args):
     else:
         email_vision_func = None
 
-    app.include_router(create_email_routes(rag, email_vision_func, api_key))
+    # Email re-syncs that find the pipeline busy wait here (on disk) instead
+    # of being dropped; drained whenever the workspace's pipeline is free.
+    from lightrag.api.email_resync_queue import DeferredResyncQueue
+
+    async def _resync_queue_rag(workspace: str):
+        manager = getattr(app.state, "workspace_manager", None)
+        if manager is not None and workspace and workspace != rag.workspace:
+            return await manager.get_lightrag_instance(workspace)
+        return rag
+
+    app.state.email_resync_queue = DeferredResyncQueue(
+        args.working_dir, _resync_queue_rag
+    )
+    app.include_router(
+        create_email_routes(
+            rag,
+            email_vision_func,
+            api_key,
+            resync_queue=app.state.email_resync_queue,
+        )
+    )
     logger.info("Email ingestion routes enabled")
 
     # Admin routes for multi-tenancy management

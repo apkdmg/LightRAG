@@ -29,7 +29,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from lightrag.base import DocProcessingStatus, DocStatus
+from lightrag.base import DocProcessingStatus, DocStatus, StoragesStatus
 from lightrag.constants import (
     FULL_DOCS_FORMAT_LIGHTRAG,
     FULL_DOCS_FORMAT_PENDING_PARSE,
@@ -39,9 +39,20 @@ from lightrag.constants import (
     PARSER_ENGINE_MINERU,
     PARSER_ENGINE_NATIVE,
 )
-from lightrag.exceptions import MultimodalAnalysisError, PipelineCancelledException
+from lightrag.exceptions import (
+    EnqueueRefusedError,
+    MultimodalAnalysisError,
+    PipelineCancelledException,
+)
 from lightrag.kg.shared_storage import get_namespace_data, get_namespace_lock
 from lightrag.operate import merge_nodes_and_edges
+from lightrag.provider_rejection import (
+    EXTRACT_ROLE,
+    VISION_ROLE,
+    ProviderRejectionEvent,
+    classify_provider_rejection,
+    emit_provider_rejection,
+)
 from lightrag.parser_routing import (
     resolve_file_parser_directives,
     resolve_stored_document_parser_engine,
@@ -98,6 +109,12 @@ _INFLIGHT_DOC_STATUSES = (
     DocStatus.PARSING,
     DocStatus.ANALYZING,
 )
+
+# pipeline_status key holding the active provider-rejection pause, if any.
+# Shared across workers (and LightRAG instances) of the workspace, so a pause
+# survives an instance rebuild until the key is changed or a probe succeeds.
+PROVIDER_PAUSE_KEY = "provider_rejection"
+DEFAULT_PROVIDER_REJECTION_RETRY_MINUTES = 30
 
 
 def _call_source_file_resolver(
@@ -189,6 +206,8 @@ class _BatchRunContext:
     q_analyze: asyncio.Queue
     q_process: asyncio.Queue
     processed_count: int = 0
+    # Documents set aside this batch because the provider pause is active.
+    paused_skips: int = 0
 
 
 class _PipelineMixin:
@@ -301,13 +320,13 @@ class _PipelineMixin:
         )
         async with pipeline_status_lock:
             if not from_scan and pipeline_status.get("scanning_exclusive"):
-                raise RuntimeError(
+                raise EnqueueRefusedError(
                     "Cannot enqueue while scan is classifying files; "
                     "wait for the classification phase to finish "
                     "before retrying."
                 )
             if pipeline_status.get("destructive_busy"):
-                raise RuntimeError(
+                raise EnqueueRefusedError(
                     "Cannot enqueue while pipeline is clearing or "
                     "deleting documents; wait for the running job to "
                     "finish before retrying."
@@ -1006,6 +1025,13 @@ class _PipelineMixin:
             "pipeline_status", workspace=self.workspace
         )
 
+        if await self._provider_pause_blocks_run(pipeline_status, pipeline_status_lock):
+            logger.info(
+                "Ingestion is paused after an LLM provider rejection; "
+                "documents stay pending until the retry window or a key update"
+            )
+            return
+
         async with pipeline_status_lock:
             # Ensure only one worker is processing documents
             if not pipeline_status.get("busy", False):
@@ -1070,6 +1096,18 @@ class _PipelineMixin:
                         # Exit directly, skipping request_pending check
                         return
 
+                # A provider rejection paused ingestion: stop without
+                # touching the remaining documents (they stay pending and
+                # resume on the retry timer or a provider-config update).
+                if await self._provider_pause_blocks_run(
+                    pipeline_status, pipeline_status_lock
+                ):
+                    async with pipeline_status_lock:
+                        pipeline_status["busy"] = False
+                        pipeline_status["request_pending"] = False
+                    busy_released_in_loop = True
+                    break
+
                 if not to_process_docs:
                     log_message = "All enqueued documents have been processed"
                     logger.info(log_message)
@@ -1115,11 +1153,21 @@ class _PipelineMixin:
                 pipeline_status["latest_message"] = log_message
                 pipeline_status["history_messages"].append(log_message)
 
-                await self._run_pipeline_batch(
+                paused_skips = await self._run_pipeline_batch(
                     to_process_docs,
                     pipeline_status=pipeline_status,
                     pipeline_status_lock=pipeline_status_lock,
                 )
+
+                # A probe document cleared the provider pause mid-batch:
+                # pick up the documents that were set aside meanwhile.
+                if paused_skips and not await self._provider_pause_blocks_run(
+                    pipeline_status, pipeline_status_lock
+                ):
+                    to_process_docs = await self.doc_status.get_docs_by_statuses(
+                        list(_INFLIGHT_DOC_STATUSES)
+                    )
+                    continue
 
                 # Atomic exit handoff: if request_pending was set during
                 # this batch (e.g. a concurrent enqueue while busy=True),
@@ -1169,9 +1217,12 @@ class _PipelineMixin:
         *,
         pipeline_status: dict,
         pipeline_status_lock,
-    ) -> None:
+    ) -> int:
         """Run one batch of pending documents through the parse → analyze →
         process queues.
+
+        Returns the number of documents set aside because a provider
+        rejection paused ingestion during the batch.
 
         Three cascading layers of queues:
           - Layer 1: Content Parsing  (parse_native / parse_mineru / parse_docling)
@@ -1236,6 +1287,7 @@ class _PipelineMixin:
         for w in workers:
             w.cancel()
         await asyncio.gather(*workers, return_exceptions=True)
+        return ctx.paused_skips
 
     async def _validate_and_fix_document_consistency(
         self,
@@ -1451,6 +1503,8 @@ class _PipelineMixin:
             try:
                 doc_id_w, status_doc_w = item
                 file_path_w = getattr(status_doc_w, "file_path", "unknown_source")
+                if await self._provider_pause_gate(doc_id_w, ctx):
+                    continue
                 content_data_w = await self.full_docs.get_by_id(doc_id_w)
                 if not content_data_w:
                     raise Exception(
@@ -1571,6 +1625,11 @@ class _PipelineMixin:
             try:
                 doc_id_w, status_doc_w, parsed_data_w = item
                 file_path_w = getattr(status_doc_w, "file_path", "unknown_source")
+                if await self._provider_pause_gate(doc_id_w, ctx):
+                    await self._park_doc_for_provider_pause(
+                        doc_id_w, status_doc_w, file_path_w
+                    )
+                    continue
                 refreshed_content_w = parsed_data_w.get("content", "") or ""
                 refreshed_summary_w = get_content_summary(refreshed_content_w)
                 refreshed_length_w = len(refreshed_content_w)
@@ -1601,6 +1660,9 @@ class _PipelineMixin:
                 # the new hard-failure contract) would leave the doc stuck in
                 # ANALYZING forever.
                 logger.error(f"Analyze worker failed: {e}")
+                await self._pause_for_provider_rejection(
+                    e, role=VISION_ROLE, doc_id=doc_id_w, ctx=ctx
+                )
                 try:
                     await self._upsert_doc_status_transition(
                         doc_id=doc_id_w,
@@ -1687,6 +1749,12 @@ class _PipelineMixin:
                 await self._raise_if_cancelled(
                     ctx.pipeline_status, ctx.pipeline_status_lock
                 )
+
+                if await self._provider_pause_gate(doc_id, ctx):
+                    await self._park_doc_for_provider_pause(
+                        doc_id, status_doc, file_path
+                    )
+                    return
 
                 async with ctx.pipeline_status_lock:
                     ctx.processed_count += 1
@@ -2060,8 +2128,12 @@ class _PipelineMixin:
                     )
                     chunk_results = await entity_relation_task
                 file_extraction_stage_ok = True
+                await self._clear_provider_pause(ctx)
 
             except Exception as e:
+                await self._pause_for_provider_rejection(
+                    e, role=EXTRACT_ROLE, doc_id=doc_id, ctx=ctx
+                )
                 pending_tasks = first_stage_tasks + (
                     [entity_relation_task] if entity_relation_task else []
                 )
@@ -2146,6 +2218,9 @@ class _PipelineMixin:
                         ctx.pipeline_status["history_messages"].append(log_message)
 
                 except Exception as e:
+                    await self._pause_for_provider_rejection(
+                        e, role=EXTRACT_ROLE, doc_id=doc_id, ctx=ctx
+                    )
                     await self._finalize_doc_failure(
                         doc_id=doc_id,
                         status_doc=status_doc,
@@ -2295,6 +2370,172 @@ class _PipelineMixin:
             if pipeline_status.get("cancellation_requested", False):
                 raise PipelineCancelledException("User cancelled")
 
+    # ============================================================
+    # Provider rejection pause
+    # ============================================================
+    #
+    # A rejected key or exhausted budget fails every LLM call, so after the
+    # first rejection the workspace's ingestion pauses: remaining documents
+    # stay pending and no further provider calls are made.  Once the retry
+    # window elapses a single "probe" document is let through; its success
+    # clears the pause, another rejection re-arms it.  Saving new provider
+    # credentials clears the pause immediately (see provider_routes).
+
+    @staticmethod
+    def _provider_retry_seconds() -> int:
+        minutes = get_env_value(
+            "PROVIDER_REJECTION_RETRY_MINUTES",
+            DEFAULT_PROVIDER_REJECTION_RETRY_MINUTES,
+            int,
+        )
+        return max(1, minutes) * 60
+
+    async def _provider_pause_blocks_run(
+        self, pipeline_status: dict, pipeline_status_lock
+    ) -> bool:
+        """True while a pause is active and its retry window has not elapsed."""
+        async with pipeline_status_lock:
+            pause = pipeline_status.get(PROVIDER_PAUSE_KEY)
+            return bool(pause) and time.time() < pause.get("retry_at", 0)
+
+    async def _provider_pause_gate(self, doc_id: str, ctx: _BatchRunContext) -> bool:
+        """True when ``doc_id`` must wait for the provider pause to lift.
+
+        After the retry window the first document to reach a gate becomes the
+        probe; it passes every later gate, while the window is pushed forward
+        for all other documents.
+        """
+        async with ctx.pipeline_status_lock:
+            pause = ctx.pipeline_status.get(PROVIDER_PAUSE_KEY)
+            if not pause or pause.get("probe_doc") == doc_id:
+                return False
+            now = time.time()
+            if now < pause.get("retry_at", 0):
+                ctx.paused_skips += 1
+                return True
+            # Replace the whole dict: nested mutation is not propagated by
+            # Manager-backed shared state in multi-process mode.
+            ctx.pipeline_status[PROVIDER_PAUSE_KEY] = {
+                **pause,
+                "probe_doc": doc_id,
+                "retry_at": now + self._provider_retry_seconds(),
+            }
+        logger.info(f"Provider pause: retrying the provider with {doc_id}")
+        return False
+
+    async def _park_doc_for_provider_pause(
+        self, doc_id: str, status_doc: DocProcessingStatus, file_path: str
+    ) -> None:
+        """Return a document already moved past PENDING back to PENDING."""
+        try:
+            await self._upsert_doc_status_transition(
+                doc_id=doc_id,
+                status=DocStatus.PENDING,
+                status_doc=status_doc,
+                file_path=file_path,
+            )
+        except Exception as e:
+            logger.error(f"Failed to park {doc_id} during provider pause: {e}")
+
+    async def _clear_provider_pause(self, ctx: _BatchRunContext) -> None:
+        async with ctx.pipeline_status_lock:
+            pause = ctx.pipeline_status.pop(PROVIDER_PAUSE_KEY, None)
+            if pause:
+                log_message = "LLM provider accepted requests again; ingestion resumed"
+                ctx.pipeline_status["latest_message"] = log_message
+                ctx.pipeline_status["history_messages"].append(log_message)
+        if pause:
+            logger.info(log_message)
+
+    async def _pause_for_provider_rejection(
+        self,
+        error: BaseException,
+        *,
+        role: str,
+        doc_id: str,
+        ctx: _BatchRunContext,
+    ) -> bool:
+        """Pause ingestion if ``error`` is a provider rejection.
+
+        Only the document that trips (or re-trips, as the probe) the pause
+        reports it, so a batch of concurrent failures yields one event.
+        Returns True when ``error`` was a rejection.
+        """
+        rejection = classify_provider_rejection(error)
+        if rejection is None:
+            return False
+        retry_seconds = self._provider_retry_seconds()
+        now = time.time()
+        async with ctx.pipeline_status_lock:
+            previous = ctx.pipeline_status.get(PROVIDER_PAUSE_KEY)
+            report = previous is None or previous.get("probe_doc") == doc_id
+            if report:
+                ctx.pipeline_status[PROVIDER_PAUSE_KEY] = {
+                    "role": role,
+                    "kind": rejection.kind,
+                    "status_code": rejection.status_code,
+                    "message": rejection.message,
+                    "since": previous.get("since", now) if previous else now,
+                    "retry_at": now + retry_seconds,
+                    "probe_doc": None,
+                }
+                retry_at = datetime.fromtimestamp(now + retry_seconds, timezone.utc)
+                log_message = (
+                    f"Ingestion paused: the LLM provider rejected the {role} "
+                    f"request (HTTP {rejection.status_code}: {rejection.message}). "
+                    f"Documents stay pending; retrying at "
+                    f"{retry_at:%H:%M} UTC or as soon as the key is updated."
+                )
+                ctx.pipeline_status["latest_message"] = log_message
+                ctx.pipeline_status["history_messages"].append(log_message)
+        if not report:
+            return True
+
+        logger.warning(log_message)
+        self._schedule_provider_resume(retry_seconds)
+        host = model = None
+        try:
+            role_cfg = self.get_llm_role_config(role)
+            host, model = role_cfg.get("host"), role_cfg.get("model")
+        except Exception:
+            pass
+        await emit_provider_rejection(
+            ProviderRejectionEvent(
+                workspace=self.workspace,
+                role=role,
+                rejection=rejection,
+                host=host,
+                model=model,
+                paused=True,
+                retry_after_minutes=retry_seconds // 60,
+            )
+        )
+        return True
+
+    def _schedule_provider_resume(self, delay_seconds: int) -> None:
+        """Re-run the pipeline after the retry window, even with no new uploads."""
+        previous = getattr(self, "_provider_resume_task", None)
+        if previous is not None and not previous.done():
+            previous.cancel()
+
+        async def _resume() -> None:
+            await asyncio.sleep(delay_seconds + 1)
+            # Skip if this instance was finalized (rebuilt after a key update
+            # or evicted) or the pause was already cleared.
+            if self._storages_status != StoragesStatus.INITIALIZED:
+                return
+            try:
+                pipeline_status = await get_namespace_data(
+                    "pipeline_status", workspace=self.workspace
+                )
+                if not pipeline_status.get(PROVIDER_PAUSE_KEY):
+                    return
+                await self.apipeline_process_enqueue_documents()
+            except Exception as e:
+                logger.error(f"Provider pause retry failed to start: {e}")
+
+        self._provider_resume_task = asyncio.create_task(_resume())
+
     async def _finalize_doc_failure(
         self,
         *,
@@ -2438,9 +2679,9 @@ class _PipelineMixin:
             parsed_dir = parsed_artifact_dir_for(document_name, parent_hint=p.parent)
             asset_dir = parsed_dir / f"{base_name}.blocks.assets"
 
-            def _extract_blocks_sync() -> (
-                tuple[list[dict[str, Any]], dict[str, Any], dict[str, Any]]
-            ):
+            def _extract_blocks_sync() -> tuple[
+                list[dict[str, Any]], dict[str, Any], dict[str, Any]
+            ]:
                 # Pre-clean parsed_dir and pre-create the asset dir so the
                 # drawing extractor can write image bytes BEFORE write_sidecar
                 # runs (which is then called with clean_parsed_dir=False to
@@ -3784,8 +4025,7 @@ class _PipelineMixin:
                 ):
                     return (
                         _skipped_result(
-                            f"image width or height is smaller than "
-                            f"{min_image_pixel}px"
+                            f"image width or height is smaller than {min_image_pixel}px"
                         ),
                         None,
                     )

@@ -109,6 +109,14 @@ class PipelineCancelledException(Exception):
         self.message = message
 
 
+class EnqueueRefusedError(RuntimeError):
+    """Raised when the pipeline cannot accept new documents right now.
+
+    A scan is classifying files or a clear/delete job holds the workspace's
+    exclusive slot. Nothing was written; the caller may retry later.
+    """
+
+
 class ChunkTokenLimitExceededError(ValueError):
     """Raised when a chunk exceeds the configured token limit."""
 
