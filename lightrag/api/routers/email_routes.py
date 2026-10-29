@@ -48,6 +48,13 @@ from pydantic import BaseModel, Field
 
 from lightrag.api.dependencies import resolve_workspace_from_request
 from lightrag.api.utils_api import get_combined_auth_dependency
+from lightrag.exceptions import EnqueueRefusedError
+from lightrag.provider_rejection import (
+    VISION_ROLE,
+    ProviderRejectionEvent,
+    classify_provider_rejection,
+    emit_provider_rejection,
+)
 from lightrag.utils import generate_track_id
 
 logger = logging.getLogger("lightrag.api.email")
@@ -220,6 +227,9 @@ def _html_to_text(html_body: Optional[str]) -> str:
     return "\n".join(out).strip()
 
 
+# Linear backoff base for acquiring the destructive slot on re-sync.
+_OVERWRITE_RETRY_BASE_SECONDS = 2.0
+
 # Per-bundle in-process serialization for the delete→enqueue window.
 _bundle_locks: Dict[str, asyncio.Lock] = {}
 _bundle_locks_guard = asyncio.Lock()
@@ -239,6 +249,11 @@ async def _enumerate_bundle_doc_ids(rag: Any, prefix: str) -> List[str]:
     from lightrag.base import DocStatus
 
     docs = await rag.doc_status.get_docs_by_statuses(list(DocStatus))
+    return _bundle_doc_ids(docs, prefix)
+
+
+def _bundle_doc_ids(docs: Dict[str, Any], prefix: str) -> List[str]:
+    """Filter a doc_status snapshot down to one bundle's doc_ids."""
     result: List[str] = []
     for did, st in docs.items():
         fp = getattr(st, "file_path", None)
@@ -557,7 +572,7 @@ async def stream_upload_to_temp_file(
                     os.unlink(temp_path)
                     raise HTTPException(
                         status_code=413,
-                        detail=f"File size exceeds maximum allowed size of {max_size // (1024*1024)}MB",
+                        detail=f"File size exceeds maximum allowed size of {max_size // (1024 * 1024)}MB",
                     )
 
                 await temp_file.write(chunk)
@@ -662,16 +677,24 @@ async def _read_upload_capped(
 class EmailIngestionService:
     """Handles email ingestion with relationship preservation using LightRAG."""
 
-    def __init__(self, rag_instance: Any, vision_model_func: Optional[Any] = None):
+    def __init__(
+        self,
+        rag_instance: Any,
+        vision_model_func: Optional[Any] = None,
+        resync_queue: Optional[Any] = None,
+    ):
         """
         Initialize the email ingestion service.
 
         Args:
             rag_instance: The LightRAG instance.
             vision_model_func: Optional vision model for image description.
+            resync_queue: Optional ``DeferredResyncQueue``; re-syncs that find
+                the pipeline busy are queued there instead of being dropped.
         """
         self.rag = rag_instance
         self.vision_model_func = vision_model_func
+        self.resync_queue = resync_queue
 
     async def ingest_email(
         self,
@@ -807,14 +830,32 @@ class EmailIngestionService:
             )
 
         # 4. Overwrite-on-resync + single batched insert under one track_id.
-        lock = await _get_bundle_lock(f"{self.rag.workspace}:{prefix_base}")
+        #    If an older re-sync of this bundle is still queued, queue this
+        #    one behind it so the versions apply in order.
+        queue = self.resync_queue
+        workspace = self.rag.workspace
+        lock = await _get_bundle_lock(f"{workspace}:{prefix_base}")
         async with lock:
-            await self._overwrite_bundle(prefix_base)
-            await self.rag.ainsert(
-                input=[content for content, _ in components],
-                file_paths=[fp for _, fp in components],
-                track_id=track_id,
-            )
+            deferred = queue is not None and queue.has_pending(workspace, prefix_base)
+            if not deferred:
+                deferred = not await self._overwrite_bundle(
+                    prefix_base, can_defer=queue is not None
+                )
+            if not deferred:
+                try:
+                    await self.rag.ainsert(
+                        input=[content for content, _ in components],
+                        file_paths=[fp for _, fp in components],
+                        track_id=track_id,
+                    )
+                except EnqueueRefusedError:
+                    # Another bundle's overwrite (or a scan) holds the slot;
+                    # nothing was written, so keep the email for later.
+                    if queue is None:
+                        raise
+                    deferred = True
+            if deferred:
+                await queue.defer(workspace, prefix_base, track_id, components)
 
         inline_ok = sum(
             1 for o in outcomes if o["kind"] == "inline_image" and o["status"] == "ok"
@@ -825,6 +866,7 @@ class EmailIngestionService:
         return {
             "bundle_id": bundle_id,
             "track_id": track_id,
+            "deferred": deferred,
             "documents_created": len(components),
             "email_subject": parsed_email.subject,
             "attachments_processed": att_ok,
@@ -832,12 +874,16 @@ class EmailIngestionService:
             "components": outcomes,
         }
 
-    async def _overwrite_bundle(self, prefix_base: str) -> None:
+    async def _overwrite_bundle(self, prefix_base: str, *, can_defer: bool) -> bool:
         """Delete all prior docs for this bundle so a re-sync overwrites cleanly.
 
         Cheap O(1) precheck via the deterministic master doc_id: only re-syncs
         (existing master) pay the full prefix scan + destructive reservation;
         first-time ingests return immediately and go straight to enqueue.
+
+        Returns False when the destructive slot stayed unavailable and
+        ``can_defer`` is set (the caller queues the re-sync); without a queue
+        that case raises, as there is nowhere to keep the update.
         """
         from lightrag.utils import compute_mdhash_id
         from lightrag.utils_pipeline import normalize_document_file_path
@@ -848,7 +894,7 @@ class EmailIngestionService:
             normalize_document_file_path(master_fp), prefix="doc-"
         )
         if await rag.doc_status.get_by_id(master_id) is None:
-            return  # first-time ingest: nothing to overwrite
+            return True  # first-time ingest: nothing to overwrite
 
         # Lazy import avoids app-factory circular-import ordering issues.
         from lightrag.api.routers.document_routes import (
@@ -857,16 +903,20 @@ class EmailIngestionService:
         )
 
         prefix = f"{prefix_base}__"
-        # Bounded retry: a concurrent non-deletion pipeline job can refuse the
-        # destructive slot; back off and retry rather than dropping the email.
+        # Short bounded retry rides out brief contention (another upload's
+        # enqueue); a processing run can hold the slot for much longer, in
+        # which case the caller queues the re-sync instead.
         acquired = False
         reason: Optional[str] = None
-        for attempt in range(5):
+        attempts = 3 if can_defer else 5
+        for attempt in range(attempts):
             acquired, reason = await _acquire_destructive_busy(rag)
             if acquired:
                 break
-            await asyncio.sleep(2.0 * (attempt + 1))
+            await asyncio.sleep(_OVERWRITE_RETRY_BASE_SECONDS * (attempt + 1))
         if not acquired:
+            if can_defer:
+                return False
             raise RuntimeError(f"Cannot overwrite email bundle {prefix_base}: {reason}")
         try:
             existing = await _enumerate_bundle_doc_ids(rag, prefix)
@@ -882,6 +932,7 @@ class EmailIngestionService:
                         )
         finally:
             await _release_destructive_busy(rag)
+        return True
 
     @staticmethod
     def _email_body_text(email: ParsedEmail) -> str:
@@ -923,7 +974,7 @@ class EmailIngestionService:
         return f"""Email: {subject}
 Bundle-ID: {bundle_id}
 Message-ID: {email.message_id}
-Thread-ID: {email.thread_id or 'N/A'}
+Thread-ID: {email.thread_id or "N/A"}
 
 From: {email.from_address}
 To: {to_list}
@@ -965,7 +1016,7 @@ Attachments ({len(all_attachments)} files):
 Bundle-ID: {bundle_id}
 Image {index + 1} of {len(email.inline_images)}: {image.filename}
 Content-Type: {image.content_type}
-Content-ID: {image.content_id or 'N/A'}
+Content-ID: {image.content_id or "N/A"}
 Size: {len(image.content)} bytes
 
 Parent Email: {subject}
@@ -1036,6 +1087,17 @@ Content:
             return ExtractionResult(None, "empty", "empty vision response")
         except Exception as e:
             logger.warning(f"Vision model failed for {image.filename}: {e}")
+            rejection = classify_provider_rejection(e)
+            if rejection is not None:
+                # Inline images use the server's vlm role, i.e. the system key.
+                await emit_provider_rejection(
+                    ProviderRejectionEvent(
+                        workspace=self.rag.workspace,
+                        role=VISION_ROLE,
+                        rejection=rejection,
+                        byo_key=False,
+                    )
+                )
             return ExtractionResult(None, "failed", "vision error")
 
     async def _extract_attachment_content(
@@ -1266,7 +1328,12 @@ async def get_lightrag_for_request(request: Request, rag_instance=None):
 # ============================================================================
 
 
-def create_email_routes(rag, vision_model_func=None, api_key: Optional[str] = None):
+def create_email_routes(
+    rag,
+    vision_model_func=None,
+    api_key: Optional[str] = None,
+    resync_queue: Optional[Any] = None,
+):
     """
     Create email ingestion routes.
 
@@ -1275,6 +1342,8 @@ def create_email_routes(rag, vision_model_func=None, api_key: Optional[str] = No
         vision_model_func: Optional native vision function for inline-image
             description; called as ``vision_model_func(prompt, image_data=<base64>)``.
         api_key: Optional API key for authentication.
+        resync_queue: Optional ``DeferredResyncQueue`` for re-syncs that find
+            the pipeline busy.
 
     Returns:
         The configured router.
@@ -1394,7 +1463,9 @@ the LightRAG knowledge graph under the shared Bundle ID.
             # Resolve the per-workspace LightRAG instance and run the email
             # ingestion service with native inline-image vision description.
             rag_instance = await get_lightrag_for_request(http_request, _default_rag)
-            service = EmailIngestionService(rag_instance, _vision_model_func)
+            service = EmailIngestionService(
+                rag_instance, _vision_model_func, resync_queue=resync_queue
+            )
             logger.info("Using LightRAG email ingestion service")
 
             # Parse email based on input mode
@@ -1409,7 +1480,7 @@ the LightRAG knowledge graph under the shared Bundle ID.
                         email_file, max_size=MAX_EMAIL_SIZE_BYTES
                     )
                     logger.info(
-                        f"Uploaded {file_size / (1024*1024):.2f}MB to temp file"
+                        f"Uploaded {file_size / (1024 * 1024):.2f}MB to temp file"
                     )
 
                     # Parse in thread pool to avoid blocking
@@ -1540,6 +1611,12 @@ the LightRAG knowledge graph under the shared Bundle ID.
                     result = await svc.ingest_email(
                         email, bundle_id=b_id, track_id=t_id, source_override=src
                     )
+                    if result.get("deferred"):
+                        logger.info(
+                            f"[{t_id}] Email re-sync queued until the pipeline "
+                            f"is free: {result['documents_created']} documents"
+                        )
+                        return
                     logger.info(
                         f"[{t_id}] Email ingestion completed: {result['documents_created']} documents, "
                         f"{result['attachments_processed']} attachments, "
@@ -1625,8 +1702,8 @@ the LightRAG knowledge graph under the shared Bundle ID.
                 "DOCX (.docx) extraction uses python-docx; legacy .doc is recorded as a metadata stub (not extracted)",
                 "Unsupported/failed extractions are skipped, not ingested as placeholder content",
                 "All documents include linking metadata for relationship preservation",
-                f"Maximum .eml file size: {MAX_EMAIL_SIZE_BYTES // (1024*1024)}MB; "
-                f"Mode-2 per-file cap: {MAX_ATTACHMENT_SIZE_BYTES // (1024*1024)}MB",
+                f"Maximum .eml file size: {MAX_EMAIL_SIZE_BYTES // (1024 * 1024)}MB; "
+                f"Mode-2 per-file cap: {MAX_ATTACHMENT_SIZE_BYTES // (1024 * 1024)}MB",
                 "Large files are streamed to disk and parsed in background threads",
             ],
         }

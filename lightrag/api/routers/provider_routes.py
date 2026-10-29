@@ -21,6 +21,7 @@ Registered only when both multi-tenancy and ``ENABLE_WORKSPACE_PROVIDERS`` are
 enabled. Fork-only and self-contained.
 """
 
+import asyncio
 import logging
 from datetime import datetime, timezone
 from typing import Optional
@@ -51,6 +52,45 @@ from lightrag.api.workspace_providers import (
 )
 
 logger = logging.getLogger("lightrag.api.provider_routes")
+
+# Strong references to resume tasks so they are not garbage-collected mid-run.
+_resume_tasks: set[asyncio.Task] = set()
+
+
+async def _resume_paused_ingestion(workspace_manager, workspace: str) -> None:
+    """Lift a provider-rejection pause after new credentials are saved.
+
+    The pause lives in the workspace's shared pipeline_status, so it outlives
+    the instance rebuild; clear it and restart the pipeline on the fresh
+    instance so the waiting documents go through with the new key.
+    """
+    from lightrag.exceptions import PipelineNotInitializedError
+    from lightrag.kg.shared_storage import get_namespace_data, get_namespace_lock
+    from lightrag.pipeline import PROVIDER_PAUSE_KEY
+
+    try:
+        pipeline_status = await get_namespace_data(
+            "pipeline_status", workspace=workspace
+        )
+    except PipelineNotInitializedError:
+        return
+    async with get_namespace_lock("pipeline_status", workspace=workspace):
+        pause = pipeline_status.pop(PROVIDER_PAUSE_KEY, None)
+    if not pause:
+        return
+    logger.info(
+        f"Provider config changed for workspace '{workspace}': lifting the "
+        f"ingestion pause and resuming pending documents"
+    )
+    try:
+        rag = await workspace_manager.get_lightrag_instance(workspace)
+    except Exception as e:
+        logger.error(f"Could not resume ingestion for '{workspace}': {e}")
+        return
+    task = asyncio.create_task(rag.apipeline_process_enqueue_documents())
+    _resume_tasks.add(task)
+    task.add_done_callback(_resume_tasks.discard)
+
 
 # Representative role used to surface each slot's effective config.
 _SLOT_REPRESENTATIVE_ROLE = {
@@ -273,6 +313,7 @@ def create_provider_routes(api_key: Optional[str] = None) -> APIRouter:
             )
 
         await workspace_manager.invalidate(workspace)
+        await _resume_paused_ingestion(workspace_manager, workspace)
         logger.info(
             f"Provider config updated for workspace '{workspace}' by "
             f"'{user.username}' (slots: {list(provided)})"
@@ -296,6 +337,7 @@ def create_provider_routes(api_key: Optional[str] = None) -> APIRouter:
         store = _get_store(request)
         removed = store.delete(workspace, which=slot)
         await workspace_manager.invalidate(workspace)
+        await _resume_paused_ingestion(workspace_manager, workspace)
         logger.info(
             f"Provider config slot '{slot}' cleared for workspace '{workspace}' "
             f"by '{user.username}' (removed={removed})"
