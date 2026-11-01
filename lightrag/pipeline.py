@@ -3907,8 +3907,8 @@ class _PipelineMixin:
                 global_config.get("enable_llm_cache_for_entity_extract")
             )
 
-            use_vlm_func = self.role_llm_funcs.get("vlm")
-            use_extract_func = self.role_llm_funcs.get("extract")
+            use_vlm_func = global_config["role_llm_funcs"].get("vlm")
+            use_extract_func = global_config["role_llm_funcs"].get("extract")
             vlm_cache_identity = get_llm_cache_identity(global_config, role="vlm")
             extract_cache_identity = get_llm_cache_identity(
                 global_config, role="extract"

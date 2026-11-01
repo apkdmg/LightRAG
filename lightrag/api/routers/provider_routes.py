@@ -58,12 +58,13 @@ logger = logging.getLogger("lightrag.api.provider_routes")
 _resume_tasks: set[asyncio.Task] = set()
 
 
-async def _resume_paused_ingestion(workspace_manager, workspace: str) -> None:
+async def _resume_paused_ingestion(workspace_manager, workspace: str, rag=None) -> None:
     """Lift a provider-rejection pause after new credentials are saved.
 
     The pause lives in the workspace's shared pipeline_status, so it outlives
     the instance rebuild; clear it and restart the pipeline on the fresh
-    instance so the waiting documents go through with the new key.
+    instance so the waiting documents go through with the new key. Pass ``rag``
+    to run on that instance instead of the workspace manager's.
     """
     from lightrag.exceptions import PipelineNotInitializedError
     from lightrag.kg.shared_storage import get_namespace_data, get_namespace_lock
@@ -84,7 +85,8 @@ async def _resume_paused_ingestion(workspace_manager, workspace: str) -> None:
         f"ingestion pause and resuming pending documents"
     )
     try:
-        rag = await workspace_manager.get_lightrag_instance(workspace)
+        if rag is None:
+            rag = await workspace_manager.get_lightrag_instance(workspace)
     except Exception as e:
         logger.error(f"Could not resume ingestion for '{workspace}': {e}")
         return

@@ -214,7 +214,7 @@ def build_alert_message(
     whose = (
         "the workspace's own key (set on its Providers page)"
         if byo
-        else "the system key from the server configuration (.env)"
+        else "the system key (Providers > Server default, or the server .env)"
     )
     if byo:
         fix = (
@@ -224,9 +224,9 @@ def build_alert_message(
         )
     else:
         fix = (
-            "An administrator should replace the LLM API key (or raise its spend "
-            "limit with the provider) in the server .env and restart the "
-            "LightRAG container."
+            "An administrator should raise the spend limit with the provider, or "
+            "replace the key under Providers > Server default in the WebUI. "
+            "Ingestion resumes as soon as it is saved."
         )
     effect = (
         f"Document ingestion in this workspace is paused, so no further calls "
@@ -265,6 +265,60 @@ next {repeat_hours} hour(s) unless the error changes.
 """
     )
     return msg
+
+
+def build_system_provider_change_message(
+    sender: str,
+    recipients: list[str],
+    actor: str,
+    changes: dict[str, dict[str, dict[str, Optional[str]]]],
+) -> EmailMessage:
+    """Email about a server default change. ``changes`` never holds an API key."""
+    lines = [
+        f"{slot}:\n"
+        f"  Before: {change['old'].get('host')} / {change['old'].get('model')}\n"
+        f"  After:  {change['new'].get('host')} / {change['new'].get('model')}"
+        for slot, change in changes.items()
+    ]
+    body = "\n\n".join(lines)
+    msg = EmailMessage()
+    msg["Subject"] = (
+        f"{ALERT_SUBJECT_TAG} Server default LLM provider changed by {actor}"
+    )
+    msg["From"] = formataddr(("LightRAG alerts", sender))
+    msg["To"] = ", ".join(recipients)
+    msg["Message-ID"] = make_msgid(domain=sender.split("@")[-1] or None)
+    msg.set_content(
+        f"""{actor} changed the server default LLM provider in the WebUI.
+
+{body}
+
+This decides where document text is sent for every workspace without its own
+provider. If you did not expect this change, review it under Providers > Server
+default.
+"""
+    )
+    return msg
+
+
+async def email_system_provider_change(
+    actor: str,
+    changes: dict[str, dict[str, dict[str, Optional[str]]]],
+    *,
+    send: Callable[[SmtpSettings, list[str], EmailMessage], None] = send_email_sync,
+) -> None:
+    """Tell the admins about a server default change, if email is configured."""
+    settings = SmtpSettings.from_env()
+    recipients = list(settings.admin_recipients)
+    if not settings.enabled or not recipients:
+        return
+    msg = build_system_provider_change_message(
+        settings.sender, recipients, actor, changes
+    )
+    try:
+        await asyncio.to_thread(send, settings, recipients, msg)
+    except Exception as e:
+        logger.error(f"Server default change email failed: {e}")
 
 
 def create_provider_rejection_notifier(

@@ -28,10 +28,16 @@ Design notes (fork-only, self-contained to keep upstream merges trivial):
   any caller.
 - Overrides are applied purely via the public ``rag.aupdate_llm_role_config``
   API (no core LightRAG code is modified).
+
+An admin can also set the **server default**, stored in the same encrypted store
+under :data:`SYSTEM_RECORD_ID`. For each slot, the order of precedence is: the
+workspace's own provider, then the server default, then ``.env``. Unlike a
+workspace's provider, the server default is billed as a system cost.
 """
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import json
@@ -44,7 +50,7 @@ from typing import Any, Callable, Optional
 from cryptography.fernet import Fernet, InvalidToken
 from pydantic import BaseModel, Field, SecretStr
 
-from lightrag.usage import BYO_BILLING
+from lightrag.usage import BYO_BILLING, SYSTEM_BILLING
 
 logger = logging.getLogger("lightrag.api.workspace_providers")
 
@@ -69,6 +75,10 @@ REASONING_EFFORTS = ("none", "low", "medium", "high")
 
 _SUBDIR = ".workspace_providers"
 _ENV_SECRET = "WORKSPACE_PROVIDER_SECRET"
+
+# Store record for the server default. Sanitized workspace ids can't contain a
+# dot, so no workspace, and no X-Target-Workspace header, can reach it.
+SYSTEM_RECORD_ID = ".system"
 
 
 class WorkspaceProviderError(Exception):
@@ -174,6 +184,33 @@ class WorkspaceProviderStore:
     # -- paths -----------------------------------------------------------
     def _path(self, workspace_id: str) -> Path:
         return self._base_dir / f"{workspace_id}.json"
+
+    def record_mtime(self, workspace_id: str) -> Optional[float]:
+        """When a record last changed, or None if there isn't one."""
+        try:
+            return self._path(workspace_id).stat().st_mtime
+        except OSError:
+            return None
+
+    def is_unreadable(self, workspace_id: str) -> bool:
+        """True when a record exists but can't be used (e.g. the secret changed)."""
+        return self._path(workspace_id).exists() and self.get(workspace_id) is None
+
+    def workspaces_with_own_provider(self) -> dict[str, list[str]]:
+        """Slot name -> ids of the workspaces with their own provider for it."""
+        result: dict[str, list[str]] = {name: [] for name in SLOT_ROLES}
+        if not self._base_dir.exists():
+            return result
+        for path in sorted(self._base_dir.glob("*.json")):
+            if path.name.startswith("."):
+                continue
+            config = self.get(path.stem)
+            if config is None:
+                continue
+            for name in SLOT_ROLES:
+                if config.slot(name).is_active():
+                    result[name].append(path.stem)
+        return result
 
     # -- read ------------------------------------------------------------
     def get(self, workspace_id: str) -> Optional[WorkspaceProviderConfig]:
@@ -366,6 +403,150 @@ async def apply_workspace_provider_overrides(
     if config.vision.is_active():
         await _apply_slot(rag, (VISION_LLM_ROLE,), config.vision)
         logger.info(f"Applied BYO vision provider for workspace '{workspace_id}'")
+
+
+def _system_role_target(
+    slot: Optional[ProviderSlot], env: dict[str, Any]
+) -> dict[str, Any]:
+    """The settings a role should run with when no workspace provider applies.
+
+    Always built from the ``.env`` settings rather than the role's current ones,
+    so that clearing a value restores what ``.env`` says.
+    """
+    if slot is None:
+        return {
+            "binding": env["binding"],
+            "model": env["model"],
+            "host": env["host"],
+            # Empty, not None: None would leave a stale key on the role, and
+            # the Bedrock binding refuses to build with a key.
+            "api_key": env["api_key"] or "",
+            "provider_options": env["provider_options"] or {},
+        }
+    # Options for another binding don't apply to an OpenAI-compatible provider.
+    same_binding = env["binding"] == OVERRIDE_BINDING
+    options = dict(env["provider_options"] or {}) if same_binding else {}
+    if slot.reasoning_effort:
+        options["reasoning_effort"] = slot.reasoning_effort
+    return {
+        "binding": OVERRIDE_BINDING,
+        "model": slot.model,
+        "host": slot.base_url,
+        "api_key": slot.api_key.get_secret_value(),
+        "provider_options": options,
+    }
+
+
+def reconcile_system_provider(
+    rag: Any,
+    workspace_id: Optional[str],
+    store: WorkspaceProviderStore,
+    env_settings: Callable[[str], dict[str, Any]],
+) -> list[str]:
+    """Put a LightRAG instance on the server default, or back on ``.env``.
+
+    Roles covered by the workspace's own provider are left alone. Pass
+    ``workspace_id=None`` for the server's default instance, which never uses a
+    workspace's provider because email images must stay on the system key.
+
+    Swaps wrappers in place instead of rebuilding the instance, so a running
+    pipeline keeps going: calls already sent finish on the old provider, and
+    later ones use the new one. Returns the roles that changed.
+    """
+    system = store.get(SYSTEM_RECORD_ID)
+    own = store.get(workspace_id) if workspace_id is not None else None
+    changed: list[str] = []
+    for slot_name, roles in SLOT_ROLES.items():
+        if own is not None and own.slot(slot_name).is_active():
+            continue
+        slot = system.slot(slot_name) if system is not None else None
+        if slot is not None and not slot.is_active():
+            slot = None
+        for role in roles:
+            try:
+                target = _system_role_target(slot, env_settings(role))
+                if rag.role_llm_config_matches(role, **target):
+                    continue
+                rag.update_llm_role_config(role, **target)
+                rag.set_role_llm_metadata(role, billing=SYSTEM_BILLING)
+                changed.append(role)
+            except Exception as e:
+                # One role failing to build must not stop the others.
+                logger.error(
+                    f"Could not apply the server default to role '{role}' "
+                    f"of workspace '{workspace_id}': {e}"
+                )
+    return changed
+
+
+def reconcile_loaded_instances(
+    default_rag: Any,
+    workspace_manager: Any,
+    store: WorkspaceProviderStore,
+    env_settings: Callable[[str], dict[str, Any]],
+) -> None:
+    """Reconcile the default instance and every workspace instance in memory.
+
+    Instances built later pick up the server default as they are created.
+    """
+    reconcile_system_provider(default_rag, None, store, env_settings)
+    for rag in workspace_manager.loaded_instances():
+        reconcile_system_provider(rag, rag.workspace, store, env_settings)
+
+
+async def watch_system_provider(
+    default_rag: Any,
+    workspace_manager: Any,
+    store: WorkspaceProviderStore,
+    env_settings: Callable[[str], dict[str, Any]],
+    interval_seconds: float = 10.0,
+) -> None:
+    """Keep this process on the current server default.
+
+    The record is shared on disk, so this is how a save handled by one Gunicorn
+    worker reaches the others. In the worker that handled it, nothing is left to
+    do by the time this notices.
+    """
+    last_seen: Optional[float] = None
+    while True:
+        await asyncio.sleep(interval_seconds)
+        mtime = store.record_mtime(SYSTEM_RECORD_ID)
+        if mtime == last_seen:
+            continue
+        last_seen = mtime
+        try:
+            reconcile_loaded_instances(
+                default_rag, workspace_manager, store, env_settings
+            )
+        except Exception as e:
+            logger.error(f"Could not apply the server default: {e}")
+
+
+def resolve_server_slot_key(
+    slot_name: str,
+    base_url: str,
+    config: WorkspaceProviderConfig,
+    env_settings: Callable[[str], dict[str, Any]],
+) -> Optional[SecretStr]:
+    """Find the key already in use for this base URL, for a blank key field.
+
+    Admins may never have seen the ``.env`` key, so they can change a model
+    without retyping it. A key is only reused for the base URL it belongs to, so
+    it can't be sent to a different host.
+    """
+
+    def same_host(url: Optional[str]) -> bool:
+        return (url or "").rstrip("/") == base_url.rstrip("/")
+
+    for name in (slot_name, *(n for n in SLOT_ROLES if n != slot_name)):
+        slot = config.slot(name)
+        if slot.is_active() and same_host(slot.base_url):
+            return slot.api_key
+    for name in (slot_name, *(n for n in SLOT_ROLES if n != slot_name)):
+        env = env_settings(SLOT_ROLES[name][0])
+        if env["api_key"] and same_host(env["host"]):
+            return SecretStr(env["api_key"])
+    return None
 
 
 def slot_effective_view(role_cfg: dict[str, Any], active: bool) -> dict[str, Any]:
