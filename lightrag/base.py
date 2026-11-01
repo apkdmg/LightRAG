@@ -867,6 +867,16 @@ class DocStatusStorage(BaseKVStorage, ABC):
     ) -> dict[str, DocProcessingStatus]:
         """Get all documents matching any of the given statuses"""
 
+    async def list_workspaces_with_statuses(
+        self, statuses: list[DocStatus]
+    ) -> list[str] | None:
+        """List every workspace in this backend holding documents in ``statuses``.
+
+        Unlike the other methods this is not limited to ``self.workspace``.
+        Returns None when the backend cannot enumerate workspaces.
+        """
+        return None
+
     @abstractmethod
     async def get_docs_by_track_id(
         self, track_id: str
