@@ -29,6 +29,7 @@ from lightrag.api.workspace_providers import (
     WorkspaceProviderConfig,
     WorkspaceProviderStore,
     apply_workspace_provider_overrides,
+    reconcile_loaded_instances,
     reconcile_system_provider,
     resolve_server_slot_key,
     watch_system_provider,
@@ -298,6 +299,7 @@ def app(store, monkeypatch):
     app.state.workspace_manager = SimpleNamespace(
         loaded_instances=lambda: [loaded],
         list_workspaces=lambda page, page_size, persisted: ([], 42),
+        max_instances=10000,
     )
     app.state.loaded_rag = loaded
 
@@ -354,7 +356,8 @@ def test_view_reports_env_as_the_source_and_never_a_full_key(app, store):
     assert data["query"]["env"]["api_key_preview"] == "...1234"
     assert data["impact"] == {
         "total_workspaces": 42,
-        "own_provider": {"extraction": [], "query": ["ws1"], "vision": []},
+        "own_provider_by_slot": {"extraction": 0, "query": 1, "vision": 0},
+        "own_provider_total": 1,
     }
 
 
@@ -496,36 +499,157 @@ def paused_app(app, store, monkeypatch):
 
     monkeypatch.setattr(routes, "get_namespace_data", namespace_data)
     store.set("ws2", WorkspaceProviderConfig(extraction=_slot()))
-    app.state.resumed = []
+    app.state.lifted = []
 
-    async def record_resume(manager, workspace, rag=None):
-        app.state.resumed.append(workspace)
+    async def record_lift(workspace):
+        app.state.lifted.append(workspace)
+        return True
 
-    monkeypatch.setattr(routes, "_resume_paused_ingestion", record_resume)
+    app.state.ran = []
+
+    async def record_runs(app_state, workspaces):
+        app.state.ran.append(workspaces)
+
+    monkeypatch.setattr(routes, "_lift_provider_pause", record_lift)
+    monkeypatch.setattr(routes, "_run_resumed_pipelines", record_runs)
     return app
 
 
-def test_view_lists_only_pauses_the_server_default_controls(paused_app):
+def test_view_sums_up_only_pauses_the_server_default_controls(paused_app):
     data = TestClient(paused_app).get("/admin/system-provider").json()
-    assert [(p["workspace"], p["slot"]) for p in data["paused"]] == [
-        ("ws1", "extraction"),
-        ("ws3", "vision"),
-    ]
+    assert data["paused"] == {
+        "total": 2,
+        "by_slot": {"extraction": 1, "query": 0, "vision": 1},
+        "reasons": [{"kind": "budget_exhausted", "status_code": 412, "count": 2}],
+        "since": 1000.0,
+    }
 
 
 def test_saving_resumes_only_ingestion_paused_on_that_slot(paused_app):
-    response = TestClient(paused_app).put(
-        "/admin/system-provider",
-        json={"extraction": {"base_url": ENV_HOST, "model": "m"}},
-    )
+    with TestClient(paused_app) as client:
+        response = client.put(
+            "/admin/system-provider",
+            json={"extraction": {"base_url": ENV_HOST, "model": "m"}},
+        )
     assert response.json()["resumed"] == 1
-    assert paused_app.state.resumed == ["ws1"]
+    assert paused_app.state.lifted == ["ws1"]
+    assert paused_app.state.ran == [["ws1"]]
 
 
 def test_returning_to_env_also_resumes(paused_app):
-    response = TestClient(paused_app).delete("/admin/system-provider")
+    with TestClient(paused_app) as client:
+        response = client.delete("/admin/system-provider")
     assert response.json()["resumed"] == 2
-    assert paused_app.state.resumed == ["ws1", "ws3"]
+    assert paused_app.state.lifted == ["ws1", "ws3"]
+
+
+async def test_an_outage_ending_restarts_pipelines_a_few_at_a_time():
+    """Thousands of workspaces can be paused when a spend limit is raised."""
+    running = 0
+    peak = 0
+    done = []
+
+    class _Rag:
+        def __init__(self, workspace):
+            self.workspace = workspace
+
+        async def apipeline_process_enqueue_documents(self):
+            nonlocal running, peak
+            running += 1
+            peak = max(peak, running)
+            await asyncio.sleep(0)
+            running -= 1
+            done.append(self.workspace)
+
+    async def get_instance(workspace):
+        return _Rag(workspace)
+
+    app_state = SimpleNamespace(
+        default_rag=_Rag("default"),
+        workspace_manager=SimpleNamespace(
+            get_lightrag_instance=get_instance, max_instances=10000
+        ),
+    )
+    workspaces = [f"ws{i}" for i in range(3000)] + [""]
+    await routes._run_resumed_pipelines(app_state, workspaces)
+
+    assert peak == routes.MAX_CONCURRENT_RESUMES
+    assert len(done) == 3001
+    assert "default" in done  # the unnamed workspace runs on the default instance
+
+
+async def test_one_workspace_failing_to_resume_does_not_stop_the_others():
+    done = []
+
+    async def get_instance(workspace):
+        if workspace == "bad":
+            raise ValueError("no instance")
+
+        async def run():
+            done.append(workspace)
+
+        return SimpleNamespace(apipeline_process_enqueue_documents=run)
+
+    app_state = SimpleNamespace(
+        default_rag=None,
+        workspace_manager=SimpleNamespace(
+            get_lightrag_instance=get_instance, max_instances=10000
+        ),
+    )
+    await routes._run_resumed_pipelines(app_state, ["a", "bad", "b"])
+    assert sorted(done) == ["a", "b"]
+
+
+# ----------------------------- thousands of workspaces -----------------------------
+def test_availability_check_does_not_scan_workspaces(app):
+    def fail(**kwargs):
+        raise AssertionError("must stay cheap")
+
+    app.state.workspace_manager.list_workspaces = fail
+    response = TestClient(app).get("/admin/system-provider/status")
+    assert response.json() == {"available": True}
+
+
+def test_view_size_does_not_grow_with_the_number_of_workspaces(app, store):
+    for i in range(50):
+        store.set(f"ws{i}", WorkspaceProviderConfig(query=_slot()))
+    response = TestClient(app).get("/admin/system-provider")
+    assert "ws1" not in response.text
+    assert response.json()["impact"]["own_provider_total"] == 50
+
+
+def test_own_provider_list_is_paged_and_searchable(app, store):
+    for i in range(45):
+        store.set(f"ws{i:02}", WorkspaceProviderConfig(query=_slot()))
+    store.set(
+        "Special-1",
+        WorkspaceProviderConfig(query=_slot(), vision=_slot()),
+    )
+    client = TestClient(app)
+
+    first = client.get("/admin/system-provider/own-providers").json()
+    assert first["total"] == 46
+    assert len(first["workspaces"]) == 20
+
+    last = client.get(
+        "/admin/system-provider/own-providers", params={"page": 3, "page_size": 20}
+    ).json()
+    assert len(last["workspaces"]) == 6
+
+    found = client.get(
+        "/admin/system-provider/own-providers", params={"search": "special"}
+    ).json()
+    assert found["total"] == 1
+    assert found["workspaces"] == [
+        {"workspace_id": "Special-1", "slots": ["query", "vision"]}
+    ]
+
+
+def test_own_provider_page_size_is_capped(app):
+    response = TestClient(app).get(
+        "/admin/system-provider/own-providers", params={"page_size": 5000}
+    )
+    assert response.status_code == 422
 
 
 # ----------------------------- provider test -----------------------------
@@ -684,6 +808,27 @@ async def test_watch_applies_a_change_made_by_another_worker(store):
     finally:
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
+
+
+async def test_applying_a_change_lets_other_requests_run_between_instances(store):
+    _set_system(store, query=_slot())
+    loaded = [_FakeRag(f"ws{i}") for i in range(20)]
+    progress = []
+
+    async def other_request():
+        while len(progress) < 3:
+            progress.append(
+                sum(r.roles["query"]["model"] == "new-model" for r in loaded)
+            )
+            await asyncio.sleep(0)
+
+    other = asyncio.create_task(other_request())
+    await reconcile_loaded_instances(
+        _FakeRag(), SimpleNamespace(loaded_instances=lambda: loaded), store, _env
+    )
+    await other
+    assert 0 < progress[1] < 20  # it ran while instances were still being updated
+    assert all(r.roles["query"]["model"] == "new-model" for r in loaded)
 
 
 # ----------------------------- a real instance -----------------------------

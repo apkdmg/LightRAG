@@ -479,7 +479,7 @@ def reconcile_system_provider(
     return changed
 
 
-def reconcile_loaded_instances(
+async def reconcile_loaded_instances(
     default_rag: Any,
     workspace_manager: Any,
     store: WorkspaceProviderStore,
@@ -487,11 +487,13 @@ def reconcile_loaded_instances(
 ) -> None:
     """Reconcile the default instance and every workspace instance in memory.
 
-    Instances built later pick up the server default as they are created.
+    Instances built later pick up the server default as they are created. Yields
+    between instances, because thousands can be loaded and requests keep running.
     """
     reconcile_system_provider(default_rag, None, store, env_settings)
     for rag in workspace_manager.loaded_instances():
         reconcile_system_provider(rag, rag.workspace, store, env_settings)
+        await asyncio.sleep(0)
 
 
 async def watch_system_provider(
@@ -515,7 +517,7 @@ async def watch_system_provider(
             continue
         last_seen = mtime
         try:
-            reconcile_loaded_instances(
+            await reconcile_loaded_instances(
                 default_rag, workspace_manager, store, env_settings
             )
         except Exception as e:

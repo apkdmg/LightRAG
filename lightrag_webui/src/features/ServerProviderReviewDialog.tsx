@@ -91,10 +91,10 @@ export default function ServerProviderReviewDialog({
     ? maskKey(input.api_key)
     : knownKeyPreview(view, slotKey, input.base_url ?? '')
   const affected = Math.max(
-    view.impact.total_workspaces - view.impact.own_provider[slotKey].length,
+    view.impact.total_workspaces - view.impact.own_provider_by_slot[slotKey],
     0
   )
-  const pausedHere = view.paused.filter((p) => p.slot === slotKey).length
+  const pausedHere = view.paused.by_slot[slotKey]
 
   const rows: [string, string, string][] = [
     [

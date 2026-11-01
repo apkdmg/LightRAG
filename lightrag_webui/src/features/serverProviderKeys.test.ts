@@ -33,8 +33,12 @@ const view = (overrides: Partial<ServerProviderView>): ServerProviderView => ({
   updated_at: null,
   updated_by: null,
   status: 'ok',
-  impact: { total_workspaces: 0, own_provider: { extraction: [], query: [], vision: [] } },
-  paused: [],
+  impact: {
+    total_workspaces: 0,
+    own_provider_by_slot: { extraction: 0, query: 0, vision: 0 },
+    own_provider_total: 0
+  },
+  paused: { total: 0, by_slot: { extraction: 0, query: 0, vision: 0 }, reasons: [], since: null },
   ...overrides
 })
 

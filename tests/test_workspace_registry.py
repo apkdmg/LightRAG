@@ -421,6 +421,28 @@ def test_listing_merges_storage_without_remembering_it():
     assert manager.get_workspace_info("a", {}).workspace_id == "a"
 
 
+def test_workspace_search_matches_id_or_owner_and_counts_only_matches():
+    from lightrag.api.workspace_manager import WorkspaceManager
+
+    manager = WorkspaceManager(instance_factory=lambda workspace_id: None)
+    persisted = {
+        f"ws{i:04}": {"owner_username": f"user{i:04}@unimas.my"} for i in range(3000)
+    }
+    persisted["research"] = {"owner_username": "Siti@unimas.my"}
+
+    page, total = manager.list_workspaces(
+        page=1, page_size=20, persisted=persisted, search="SITI"
+    )
+    assert total == 1
+    assert [w.workspace_id for w in page] == ["research"]
+
+    page, total = manager.list_workspaces(
+        page=1, page_size=20, persisted=persisted, search="ws00"
+    )
+    assert total == 100
+    assert len(page) == 20
+
+
 def test_failed_sso_callback_ends_existing_session(app_client, monkeypatch):
     """A refused or failed SSO sign-in must also clear any earlier session
     cookie, so the browser cannot carry on under a previous login."""
