@@ -7,11 +7,13 @@ price are counted and reported rather than treated as free.
 
 from __future__ import annotations
 
+import asyncio
 import time
 from collections import defaultdict
 from datetime import date, datetime, timedelta
+from math import ceil
 from statistics import median
-from typing import Any, Callable, Iterable, Optional
+from typing import Any, Awaitable, Callable, Iterable, Optional
 
 from lightrag.usage import (
     BYO_BILLING,
@@ -32,6 +34,13 @@ ANOMALY_STATE_KEY = "anomaly_state"
 BACKFILL_KEY = "backfill"
 HISTORY_DAYS = 56
 CACHE_SECONDS = 30
+MERGE_IN_THREAD_ROWS = 5000
+# Turning a page shouldn't wait seconds because the last click was a minute ago.
+WORKSPACE_ROWS_STALE_SECONDS = 300
+WORKSPACE_PAGE_SIZE = 50
+WORKSPACE_OPTION_LIMIT = 20
+PURPOSE_TOP_WORKSPACES = 20
+PURPOSE_BYO_NAMES = 5
 # Friday to Monday still counts as the same run of unusual days.
 RUN_GAP_DAYS = 3
 SEVERITY_ORDER = {"warning": 1, "serious": 2, "critical": 3}
@@ -43,6 +52,8 @@ SLOT_FOR_PURPOSE = {
     QUERY_PURPOSE: "query",
     VISION_PURPOSE: "vision",
 }
+# What ``_status_from_rows`` gives a workspace with no rows to compare.
+_NO_HISTORY_STATUS = an.status_code(None)
 DEFAULT_SETTINGS: dict[str, Any] = {
     "prices": {},
     "budget": {"amount": None, "start": None},
@@ -98,6 +109,52 @@ class InsightsService:
         self.app_state = app_state
         self._now = now
         self._cache: dict[tuple, tuple[float, Any]] = {}
+        self._building: dict[tuple, asyncio.Lock] = {}
+        self._refreshes: set[asyncio.Task] = set()
+
+    async def _cached(
+        self,
+        key: tuple,
+        build: Callable[[], Awaitable[Any]],
+        *,
+        stale_seconds: int = 0,
+    ) -> Any:
+        """``build`` once per CACHE_SECONDS, however many requests ask at the same time.
+
+        The page asks for the overview and a table together, and both need the
+        same expensive result. With ``stale_seconds``, a result that old is
+        returned straight away while a new one builds in the background.
+        """
+        cached = self._cache.get(key)
+        now = time.monotonic()
+        if cached and cached[0] > now:
+            return cached[1]
+        if cached and cached[0] + stale_seconds > now:
+            if key not in self._building:
+                task = asyncio.create_task(self._build_cached(key, build))
+                self._refreshes.add(task)
+                task.add_done_callback(self._refresh_done)
+            return cached[1]
+        return await self._build_cached(key, build)
+
+    async def _build_cached(
+        self, key: tuple, build: Callable[[], Awaitable[Any]]
+    ) -> Any:
+        async with self._building.setdefault(key, asyncio.Lock()):
+            cached = self._cache.get(key)
+            if cached and cached[0] > time.monotonic():
+                return cached[1]
+            try:
+                value = await build()
+            finally:
+                self._building.pop(key, None)
+            self._cache[key] = (time.monotonic() + CACHE_SECONDS, value)
+        return value
+
+    def _refresh_done(self, task: asyncio.Task) -> None:
+        self._refreshes.discard(task)
+        if not task.cancelled() and task.exception():
+            logger.warning(f"Could not refresh Insights data: {task.exception()}")
 
     def now(self) -> datetime:
         return self._now() if self._now else datetime.now(self.store.tz)
@@ -156,6 +213,20 @@ class InsightsService:
             group_by=wanted,
             exclude_backfill=exclude_backfill,
         )
+        # A year of every workspace is a lot of rows to add up on the event loop.
+        if len(raw) > MERGE_IN_THREAD_ROWS:
+            rows = await asyncio.to_thread(self._merge_rows, raw, groups, prices)
+        else:
+            rows = self._merge_rows(raw, groups, prices)
+        self._cache[key] = (time.monotonic() + CACHE_SECONDS, rows)
+        if len(self._cache) > 256:
+            self._cache.clear()
+        return rows
+
+    @staticmethod
+    def _merge_rows(
+        raw: list[dict[str, Any]], groups: tuple[str, ...], prices: dict[str, Any]
+    ) -> list[dict[str, Any]]:
         merged: dict[tuple, dict[str, Any]] = {}
         for row in raw:
             out = merged.setdefault(
@@ -184,11 +255,7 @@ class InsightsService:
             if row["billing"] == BYO_BILLING:
                 out["byo_cost"] += cost
                 out["byo_tokens"] += tokens
-        rows = list(merged.values())
-        self._cache[key] = (time.monotonic() + CACHE_SECONDS, rows)
-        if len(self._cache) > 256:
-            self._cache.clear()
-        return rows
+        return list(merged.values())
 
     @staticmethod
     def _series(rows: list[dict[str, Any]]) -> dict[str, dict[str, dict[date, float]]]:
@@ -250,8 +317,7 @@ class InsightsService:
         dict[str, dict[int, float]],
     ]:
         """Each purpose against its usual by this hour, plus the hourly shapes."""
-        now = self.now()
-        today = now.date()
+        today = self.today()
         start = self.day_start(today - timedelta(days=HISTORY_DAYS))
         end = self.day_start(today + timedelta(days=1))
         filters = {"workspace": workspace} if workspace else None
@@ -263,6 +329,18 @@ class InsightsService:
             grain="hour",
             exclude_backfill=True,
         )
+        return self._status_from_rows(rows)
+
+    def _status_from_rows(
+        self, rows: list[dict[str, Any]]
+    ) -> tuple[
+        dict[str, dict[str, Any]],
+        dict[str, dict[int, float]],
+        dict[str, dict[int, float]],
+    ]:
+        """The status calculation, from hourly rows by bucket and purpose."""
+        now = self.now()
+        today = now.date()
         actual: dict[str, dict[int, float]] = {p: defaultdict(float) for p in PURPOSES}
         for row in rows:
             bucket = row["bucket"].astimezone(self.store.tz)
@@ -497,7 +575,9 @@ class InsightsService:
         }
         if not workspace and not purpose:
             out["models"] = await self._model_table(start, today)
-            out["workspaces"] = (await self.workspaces(range_days))["rows"][:10]
+            out["workspaces"] = (await self.workspaces(range_days, page_size=10))[
+                "rows"
+            ]
             out["efficiency"] = await self._efficiency(start, today)
         if workspace is None:
             forecast = await self.forecast()
@@ -727,14 +807,18 @@ class InsightsService:
                 ["workspace"],
                 filters={"purpose": purpose, "billing": BYO_BILLING},
             )
-            byo_workspaces = [r["workspace"] for r in byo_rows if r["tokens"]]
+            byo_workspaces = sorted(
+                (r for r in byo_rows if r["tokens"]), key=lambda r: -r["tokens"]
+            )
+            byo_workspaces = [r["workspace"] for r in byo_workspaces]
         return {
             "id": purpose,
             "workspace": workspace,
             "model": keys[purpose]["model"],
             "billing": keys[purpose]["billing"],
             "byo_share": _round(byo_share, 4),
-            "byo_workspaces": byo_workspaces,
+            "byo_workspaces": byo_workspaces[:PURPOSE_BYO_NAMES],
+            "byo_workspace_count": len(byo_workspaces),
             "status": status[purpose],
             "operations": sorted(
                 (
@@ -762,7 +846,8 @@ class InsightsService:
                     for r in all_ws
                 ),
                 key=lambda r: -r["tokens"],
-            ),
+            )[:PURPOSE_TOP_WORKSPACES],
+            "workspace_count": len(all_ws),
             "models": sorted(
                 (
                     {
@@ -862,8 +947,63 @@ class InsightsService:
         purpose: Optional[str] = None,
         *,
         end: Optional[date] = None,
+        query: str = "",
+        show: str = "all",
+        sort: str = "cost",
+        page: int = 1,
+        page_size: int = WORKSPACE_PAGE_SIZE,
     ) -> dict[str, Any]:
+        """One page of the workspace table, filtered and sorted across all of them."""
+        everyone = await self._workspace_rows(range_days, purpose, end=end)
+        wanted = query.strip().lower()
+        matching = [
+            r
+            for r in everyone
+            if (
+                show == "all"
+                or (show == "byo" and r["byo_for"])
+                or (show == "look" and r["needs_look"])
+            )
+            and (
+                not wanted
+                or wanted in r["id"].lower()
+                or wanted in (r["owner"] or "").lower()
+            )
+        ]
+        # Ties go by name, so a row can't move between pages from one call to the next.
+        matching.sort(key=lambda r: (r[sort] is None, -(r[sort] or 0), r["id"]))
+        last_page = max(ceil(len(matching) / page_size), 1)
+        page = min(page, last_page)
+        return {
+            "rows": matching[(page - 1) * page_size : page * page_size],
+            "total": len(matching),
+            "page": page,
+            "page_size": page_size,
+            "counts": {
+                "workspaces": len(everyone),
+                "byo": sum(1 for r in everyone if r["byo_for"]),
+                "look": sum(1 for r in everyone if r["needs_look"]),
+            },
+        }
+
+    async def _workspace_rows(
+        self,
+        range_days: int,
+        purpose: Optional[str] = None,
+        *,
+        end: Optional[date] = None,
+    ) -> list[dict[str, Any]]:
+        """Every workspace's row. Each page, sort and search reads this one list."""
         today = end or self.today()
+        return await self._cached(
+            ("workspace_rows", today, range_days, purpose),
+            lambda: self._build_workspace_rows(range_days, purpose, today),
+            stale_seconds=WORKSPACE_ROWS_STALE_SECONDS,
+        )
+
+    async def _build_workspace_rows(
+        self, range_days: int, purpose: Optional[str], today: date
+    ) -> list[dict[str, Any]]:
         start = today - timedelta(days=range_days - 1)
         prev_start = start - timedelta(days=range_days)
         filters = {"purpose": purpose} if purpose else None
@@ -894,20 +1034,20 @@ class InsightsService:
         for a in (await self.anomalies())["items"]:
             if a["state"] == "open" and a["workspace"]:
                 open_by[a["workspace"]] += 1
+        worst = await self._worst_statuses()
+        byo = await self._byo_purposes()
         rows = []
         for ws in sorted(known):
             r = by_workspace.get(ws, {})
             old = before.get(ws, {}).get("tokens", 0)
             tokens = r.get("tokens", 0)
             deleted = ws.startswith("deleted-")
-            keys = self.workspace_keys(None if deleted else ws)
             docs = statuses.get(ws, {})
             status = (
                 {"code": "deleted", "ratio": None, "level": 0}
                 if deleted
-                else await self._worst_status(ws)
+                else worst.get(ws, _NO_HISTORY_STATUS)
             )
-            byo_for = [p for p in PURPOSES if keys[p]["billing"] == BYO_BILLING]
             look = not deleted and bool(
                 open_by[ws] or docs.get("failed") or status["level"] != 0
             )
@@ -923,7 +1063,7 @@ class InsightsService:
                     "mix": by_mix.get(ws, {}),
                     "documents": documents.get(ws, 0),
                     "questions": questions.get(ws, 0),
-                    "byo_for": byo_for,
+                    "byo_for": [] if deleted else byo.get(ws, []),
                     "last_active": last_active.get(ws).isoformat()
                     if last_active.get(ws)
                     else None,
@@ -935,8 +1075,78 @@ class InsightsService:
                     "needs_look": look,
                 }
             )
-        rows.sort(key=lambda x: -x["cost"])
-        return {"rows": rows}
+        return rows
+
+    async def workspace_options(
+        self, query: str = "", limit: int = WORKSPACE_OPTION_LIMIT
+    ) -> dict[str, Any]:
+        """Live workspaces for the picker, highest spend first."""
+        options = await self._cached(
+            ("workspace_options",), self._build_workspace_options
+        )
+        wanted = query.strip().lower()
+        matching = [
+            o
+            for o in options
+            if not wanted
+            or wanted in o["id"].lower()
+            or wanted in (o["owner"] or "").lower()
+        ]
+        return {"options": matching[:limit], "total": len(matching)}
+
+    async def _build_workspace_options(self) -> list[dict[str, Any]]:
+        today = self.today()
+        spend = {
+            r["workspace"]: r["cost"]
+            for r in await self._rows(today - timedelta(days=89), today, ["workspace"])
+        }
+        owners = await self._owners()
+        known = set(await self.store.known_workspaces()) | set(owners)
+        return [
+            {"id": ws, "owner": owners.get(ws)}
+            for ws in sorted(known, key=lambda w: (-spend.get(w, 0), w))
+            if ws and not ws.startswith("deleted-")
+        ]
+
+    async def _byo_purposes(self) -> dict[str, list[str]]:
+        """Workspace -> the purposes it pays for itself, for all of them at once."""
+        store = getattr(self.app_state, "workspace_provider_store", None)
+        if store is None:
+            return {}
+        try:
+            slots = await asyncio.to_thread(store.workspaces_with_own_provider)
+        except Exception as e:
+            logger.warning(f"Could not read provider configs: {e}")
+            return {}
+        out: dict[str, list[str]] = defaultdict(list)
+        for p in PURPOSES:
+            for ws in slots.get(SLOT_FOR_PURPOSE[p], []):
+                out[ws].append(p)
+        return dict(out)
+
+    async def _worst_statuses(self) -> dict[str, dict[str, Any]]:
+        """``_worst_status`` for every workspace, without a query for each.
+
+        Status only compares today with the same weekday in earlier weeks, so
+        those days are all it reads. A workspace with no rows there is left out.
+        """
+        today = self.today()
+        by_workspace: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for weeks in range(HISTORY_DAYS // 7 + 1):
+            day = today - timedelta(days=7 * weeks)
+            for row in await self._rows(
+                self.day_start(day),
+                self.day_start(day + timedelta(days=1)),
+                ["workspace", "bucket", "purpose"],
+                grain="hour",
+                exclude_backfill=True,
+            ):
+                by_workspace[row["workspace"]].append(row)
+        worst = {}
+        for ws, rows in by_workspace.items():
+            status, _, _ = self._status_from_rows(rows)
+            worst[ws] = max(status.values(), key=lambda s: abs(s["level"]))
+        return worst
 
     async def _owners(self) -> dict[str, str]:
         registry = getattr(self.app_state, "workspace_registry", None)
@@ -1352,13 +1562,7 @@ class InsightsService:
         self, workspace: Optional[str] = None, purpose: Optional[str] = None
     ) -> dict[str, Any]:
         """Unusual days by purpose, grouped by cause. Estimates are left out."""
-        cache_key = ("anomalies",)
-        cached = self._cache.get(cache_key)
-        if cached and cached[0] > time.monotonic():
-            detected = cached[1]
-        else:
-            detected = await self._detect_anomalies()
-            self._cache[cache_key] = (time.monotonic() + CACHE_SECONDS, detected)
+        detected = await self._cached(("anomalies",), self._detect_anomalies)
         state = await self.store.kv_get(ANOMALY_STATE_KEY, {}) or {}
         items = []
         for a in detected:
@@ -1422,26 +1626,6 @@ class InsightsService:
         rows = await self._rows(
             start, today, ["bucket", "purpose", "workspace"], exclude_backfill=True
         )
-        frames: dict[Optional[str], dict[str, dict[str, dict[date, float]]]] = {
-            None: {p: defaultdict(dict) for p in PURPOSES}
-        }
-        day_cost: dict[date, float] = defaultdict(float)
-        cost_by: dict[tuple[Optional[str], str, date], float] = {}
-        for r in rows:
-            ws, p, d = r["workspace"], r["purpose"], r["bucket"]
-            if p not in PURPOSES:
-                continue
-            frames.setdefault(ws, {q: defaultdict(dict) for q in PURPOSES})
-            attempts = r["calls"] + r["cache_hits"]
-            for scope in (None, ws):
-                s = frames[scope][p]
-                s["tokens"][d] = s["tokens"].get(d, 0) + r["tokens"]
-                s["work"][d] = s["work"].get(d, 0) + r["work"]
-                s["hits"][d] = s["hits"].get(d, 0) + r["cache_hits"]
-                s["attempts"][d] = s["attempts"].get(d, 0) + attempts
-                cost_by[(scope, p, d)] = cost_by.get((scope, p, d), 0) + r["cost"]
-            day_cost[d] += r["cost"]
-        out: list[dict[str, Any]] = []
         check_from = max(
             first + timedelta(days=an.ANOMALY_MIN_DAYS - 1),
             today - timedelta(days=window),
@@ -1467,50 +1651,11 @@ class InsightsService:
             if e["kind"] == "provider_rejection":
                 rejected[(key, e.get("workspace"))] = e
 
-        # Yesterday and earlier are judged on complete days; today waits, since
-        # an unfinished day always looks low.
-        system_flagged: set[tuple[date, str]] = set()
-        for scope, frame in frames.items():
-            d = check_from
-            while d < today:
-                flags = []
-                for p in PURPOSES:
-                    s = frame[p]
-                    cache = {
-                        day: s["hits"].get(day, 0) / a
-                        for day, a in s["attempts"].items()
-                        if a
-                    }
-                    flag = an.detect_purpose_day(p, d, s["tokens"], s["work"], cache)
-                    if flag is None or (scope is not None and (d, p) in system_flagged):
-                        continue
-                    flags.append(flag)
-                if scope is None:
-                    system_flagged.update((d, f["purpose"]) for f in flags)
-                if flags:
-                    extra = sum(
-                        max(0.0, f["tokens"] - f["usual"])
-                        / (f["tokens"] or 1)
-                        * cost_by.get((scope, f["purpose"], d), 0)
-                        for f in flags
-                    )
-                    workspace = scope
-                    if scope is None:
-                        workspace = self._main_contributor(frames, flags, d)
-                    # A small workspace doubling is not worth an alert.
-                    if scope is None or extra >= 0.02 * max(day_cost.get(d, 0), 1e-9):
-                        out.append(
-                            self._anomaly(
-                                d,
-                                workspace,
-                                flags,
-                                extra,
-                                day_cost.get(d, 0),
-                                events_by_day.get(d.isoformat(), []),
-                                scope,
-                            )
-                        )
-                d += timedelta(days=1)
+        # Thousands of workspaces take seconds to go through, and other requests
+        # have to keep moving meanwhile.
+        frames, out = await asyncio.to_thread(
+            self._flag_days, rows, today, check_from, events_by_day
+        )
         seen_days = {(a["day"], a["workspace"]) for a in out}
         for (day_key, ws), event in rejected.items():
             detail = event.get("detail") or {}
@@ -1544,6 +1689,91 @@ class InsightsService:
         out.extend(await self._live_anomalies(today, frames))
         out.extend(await self._new_model_anomalies(today, check_from))
         return out
+
+    def _flag_days(
+        self,
+        rows: list[dict[str, Any]],
+        today: date,
+        check_from: date,
+        events_by_day: dict[str, list[dict[str, Any]]],
+    ) -> tuple[dict[Optional[str], Any], list[dict[str, Any]]]:
+        """Each workspace's series, and the unusual days found in them."""
+        frames: dict[Optional[str], dict[str, dict[str, dict[date, float]]]] = {
+            None: {p: defaultdict(dict) for p in PURPOSES}
+        }
+        day_cost: dict[date, float] = defaultdict(float)
+        cost_by: dict[tuple[Optional[str], str, date], float] = {}
+        for r in rows:
+            ws, p, d = r["workspace"], r["purpose"], r["bucket"]
+            if p not in PURPOSES:
+                continue
+            frames.setdefault(ws, {q: defaultdict(dict) for q in PURPOSES})
+            attempts = r["calls"] + r["cache_hits"]
+            for scope in (None, ws):
+                s = frames[scope][p]
+                s["tokens"][d] = s["tokens"].get(d, 0) + r["tokens"]
+                s["work"][d] = s["work"].get(d, 0) + r["work"]
+                s["hits"][d] = s["hits"].get(d, 0) + r["cache_hits"]
+                s["attempts"][d] = s["attempts"].get(d, 0) + attempts
+                cost_by[(scope, p, d)] = cost_by.get((scope, p, d), 0) + r["cost"]
+            day_cost[d] += r["cost"]
+        out: list[dict[str, Any]] = []
+        # Yesterday and earlier are judged on complete days; today waits, since
+        # an unfinished day always looks low.
+        system_flagged: set[tuple[date, str]] = set()
+        for scope, frame in frames.items():
+            # Most workspaces are too small to flag on any day, so don't try each one.
+            checks = [
+                (
+                    p,
+                    frame[p]["tokens"],
+                    frame[p]["work"],
+                    {
+                        day: frame[p]["hits"].get(day, 0) / a
+                        for day, a in frame[p]["attempts"].items()
+                        if a
+                    },
+                )
+                for p in PURPOSES
+                if max(frame[p]["tokens"].values(), default=0) >= an.MIN_TOKENS_TO_FLAG
+            ]
+            if not checks:
+                continue
+            d = check_from
+            while d < today:
+                flags = []
+                for p, tokens, work, cache in checks:
+                    flag = an.detect_purpose_day(p, d, tokens, work, cache)
+                    if flag is None or (scope is not None and (d, p) in system_flagged):
+                        continue
+                    flags.append(flag)
+                if scope is None:
+                    system_flagged.update((d, f["purpose"]) for f in flags)
+                if flags:
+                    extra = sum(
+                        max(0.0, f["tokens"] - f["usual"])
+                        / (f["tokens"] or 1)
+                        * cost_by.get((scope, f["purpose"], d), 0)
+                        for f in flags
+                    )
+                    workspace = scope
+                    if scope is None:
+                        workspace = self._main_contributor(frames, flags, d)
+                    # A small workspace doubling is not worth an alert.
+                    if scope is None or extra >= 0.02 * max(day_cost.get(d, 0), 1e-9):
+                        out.append(
+                            self._anomaly(
+                                d,
+                                workspace,
+                                flags,
+                                extra,
+                                day_cost.get(d, 0),
+                                events_by_day.get(d.isoformat(), []),
+                                scope,
+                            )
+                        )
+                d += timedelta(days=1)
+        return frames, out
 
     @staticmethod
     def _merge_runs(items: list[dict[str, Any]]) -> list[dict[str, Any]]:

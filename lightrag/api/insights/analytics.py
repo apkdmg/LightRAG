@@ -10,6 +10,7 @@ from __future__ import annotations
 import math
 import re
 from datetime import date, timedelta
+from functools import lru_cache
 from statistics import median
 from typing import Any, Iterable, Optional
 
@@ -72,13 +73,15 @@ def document_label(doc_id: str, path: Optional[str]) -> dict[str, Any]:
     return {"kind": "document", "label": mask_name(path), "code": code}
 
 
+@lru_cache(maxsize=1024)
+def _same_weekdays(day: date) -> tuple[date, ...]:
+    """The same weekday in the previous 8 weeks. Asked for millions of times a scan."""
+    return tuple(day - timedelta(days=7 * n) for n in range(1, USUAL_WEEKS + 1))
+
+
 def usual_value(history: dict[date, float], day: date) -> Optional[float]:
     """Median for the same weekday over the previous 8 weeks, if there's enough."""
-    samples = [
-        history[d]
-        for d in (day - timedelta(days=7 * n) for n in range(1, USUAL_WEEKS + 1))
-        if d in history
-    ]
+    samples = [history[d] for d in _same_weekdays(day) if d in history]
     return median(samples) if len(samples) >= MIN_USUAL_SAMPLES else None
 
 
@@ -140,13 +143,9 @@ def detect_purpose_day(
     usual = usual_value(tokens, day)
     if usual is None:
         return None
-    samples = [
-        tokens[d]
-        for d in (day - timedelta(days=7 * n) for n in range(1, USUAL_WEEKS + 1))
-        if d in tokens
-    ]
     if max(today, usual) < MIN_TOKENS_TO_FLAG:
         return None
+    samples = [tokens[d] for d in _same_weekdays(day) if d in tokens]
     ratio = today / usual if usual else math.inf
     distance = (today - usual) / (_spread(samples) + 0.05 * usual + 1)
     usual_work = usual_value(work, day)

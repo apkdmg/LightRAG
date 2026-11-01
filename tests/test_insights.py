@@ -9,6 +9,7 @@ import importlib
 import os
 import struct
 import sys
+import time
 from datetime import date, datetime, timedelta, timezone
 from types import SimpleNamespace
 from uuid import uuid4
@@ -31,7 +32,11 @@ from lightrag.api.insights.backfill import run_backfill  # noqa: E402
 from lightrag.api.insights.brief import brief_csv, brief_lines, text_pdf  # noqa: E402
 from lightrag.api.insights.recorder import UsageRecorder  # noqa: E402
 from lightrag.api.insights.scheduler import InsightsScheduler, note_startup  # noqa: E402
-from lightrag.api.insights.service import InsightsService  # noqa: E402
+from lightrag.api.insights.service import (  # noqa: E402
+    _NO_HISTORY_STATUS,
+    WORKSPACE_ROWS_STALE_SECONDS,
+    InsightsService,
+)
 from lightrag.api.insights.store import (  # noqa: E402
     BACKFILL_SOURCE,
     MemoryUsageStore,
@@ -1551,3 +1556,286 @@ async def test_middleware_tags_the_source():
     assert (await call("/query/data")).source == "retrieval"
     assert (await call("/api/chat")).source == "ollama"
     assert (await call("/v1/chat/completions")).source == "openai_api"
+
+
+# --------------------------------------------------------------------------- #
+# At thousands of workspaces                                                  #
+# --------------------------------------------------------------------------- #
+
+
+def _many_workspaces(count):
+    """A record yesterday per workspace, largest for ws-000, each one a size apart."""
+    day = TODAY - timedelta(days=1)
+    return [
+        _record(day, "query", f"ws-{i:03d}", 1000 * (count - i), 100)
+        for i in range(count)
+    ]
+
+
+async def _page_through(service, **kw):
+    ids, page = [], 1
+    while True:
+        out = await service.workspaces(30, page=page, page_size=7, **kw)
+        ids += [r["id"] for r in out["rows"]]
+        if page * 7 >= out["total"]:
+            return ids
+        page += 1
+
+
+async def test_workspace_table_pages_and_counts_all_of_them():
+    store = MemoryUsageStore(TZ)
+    service = await _service(store, _many_workspaces(20))
+    out = await service.workspaces(30, page_size=7)
+    assert [r["id"] for r in out["rows"]] == [f"ws-{i:03d}" for i in range(7)]
+    assert (out["total"], out["page"], out["page_size"]) == (20, 1, 7)
+    assert out["counts"] == {"workspaces": 20, "byo": 0, "look": 0}
+    assert await _page_through(service) == [f"ws-{i:03d}" for i in range(20)]
+    # A page past the end, say after a filter shrank the list, shows the last one.
+    last = await service.workspaces(30, page=99, page_size=7)
+    assert last["page"] == 3 and [r["id"] for r in last["rows"]][-1] == "ws-019"
+
+
+async def test_workspace_table_sorts_across_pages_with_empty_values_last():
+    store = MemoryUsageStore(TZ)
+    day = TODAY - timedelta(days=1)
+    before = TODAY - timedelta(days=31)
+    records = [
+        # Tripled, doubled and halved; ws-new has no earlier period to compare with.
+        _record(before, "query", "ws-a", 1000, 0),
+        _record(day, "query", "ws-a", 3000, 0),
+        _record(before, "query", "ws-b", 1000, 0),
+        _record(day, "query", "ws-b", 2000, 0),
+        _record(before, "query", "ws-c", 8000, 0),
+        _record(day, "query", "ws-c", 4000, 0),
+        _record(day, "query", "ws-new", 9000, 0),
+    ]
+    service = await _service(store, records)
+    by_change = await service.workspaces(30, sort="change")
+    assert [r["id"] for r in by_change["rows"]] == ["ws-a", "ws-b", "ws-c", "ws-new"]
+    by_tokens = await service.workspaces(30, sort="tokens")
+    assert [r["id"] for r in by_tokens["rows"]] == ["ws-new", "ws-c", "ws-a", "ws-b"]
+    # Ties always come back in the same order, so a row can't jump between pages.
+    tied = await service.workspaces(30, sort="documents", page_size=2)
+    assert [r["id"] for r in tied["rows"]] == ["ws-a", "ws-b"]
+
+
+async def test_workspace_table_search_and_filters_cover_every_page():
+    store = MemoryUsageStore(TZ)
+    store.status_counts = {"ws-019": {"failed": 1}}
+    service = await _service(store, _many_workspaces(20))
+    service.app_state = SimpleNamespace(
+        workspace_provider_store=SimpleNamespace(
+            workspaces_with_own_provider=lambda: {
+                "extraction": ["ws-018"],
+                "query": ["ws-017", "ws-018"],
+                "vision": [],
+            }
+        ),
+        workspace_registry=SimpleNamespace(
+            list_owners=_async_value(
+                [SimpleNamespace(workspace_id="ws-016", email="Ann@x.my", identity="i")]
+            )
+        ),
+    )
+    # All of these are past the first page of the table.
+    found = await service.workspaces(30, query=" WS-015 ", page_size=7)
+    assert [r["id"] for r in found["rows"]] == ["ws-015"] and found["total"] == 1
+    by_owner = await service.workspaces(30, query="ann@", page_size=7)
+    assert [r["id"] for r in by_owner["rows"]] == ["ws-016"]
+    byo = await service.workspaces(30, show="byo", page_size=7)
+    assert [r["id"] for r in byo["rows"]] == ["ws-017", "ws-018"]
+    assert byo["rows"][1]["byo_for"] == ["extract", "keyword", "query"]
+    assert byo["rows"][0]["byo_for"] == ["query"]
+    look = await service.workspaces(30, show="look", page_size=7)
+    assert [r["id"] for r in look["rows"]] == ["ws-019"]
+    # The headline stays about everyone, whatever the table is filtered to.
+    assert look["counts"] == {"workspaces": 20, "byo": 2, "look": 1}
+    none = await service.workspaces(30, query="nobody")
+    assert none["rows"] == [] and none["total"] == 0 and none["page"] == 1
+
+
+def _async_value(value):
+    async def call():
+        return value
+
+    return call
+
+
+async def test_all_statuses_match_asking_one_workspace_at_a_time(store):
+    """Weeks of history on this weekday, with today above, below, level and new."""
+    records = []
+    for weeks in range(1, 9):
+        day = TODAY - timedelta(days=7 * weeks)
+        for ws in ("above", "below", "level", "late"):
+            records.append(_record(day, "query", ws, 10_000, 0, hour=8))
+        # Used only later in the day than now, which still counts as a week seen.
+        records.append(_record(day, "extract", "late", 50_000, 0, hour=22))
+        # Another weekday has no say in today's status.
+        records.append(_record(day - timedelta(days=1), "query", "level", 900_000, 0))
+    records += [
+        _record(TODAY, "query", "above", 40_000, 0, hour=8),
+        _record(TODAY, "query", "below", 500, 0, hour=8),
+        _record(TODAY, "query", "level", 10_000, 0, hour=8),
+        _record(TODAY, "query", "new", 40_000, 0, hour=8),
+    ]
+    service = await _service(store, records)
+    worst = await service._worst_statuses()
+    for ws in ("above", "below", "level", "late", "new"):
+        assert worst[ws] == await service._worst_status(ws), ws
+    assert worst["above"]["code"] == "above" and worst["below"]["code"] == "below"
+    assert worst["level"]["code"] == "normal"
+    # A workspace with no rows in those days gets what asking for it would give.
+    assert await service._worst_status("empty") == _NO_HISTORY_STATUS
+    assert "empty" not in worst
+
+
+async def test_workspace_table_cost_does_not_grow_with_workspace_queries():
+    async def queries(count):
+        store = MemoryUsageStore(TZ)
+        service = await _service(store, _many_workspaces(count))
+        calls = 0
+        rollup = store.rollup
+
+        async def counted(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            return await rollup(*args, **kwargs)
+
+        store.rollup = counted
+        await service.workspaces(30)
+        return calls
+
+    assert await queries(5) == await queries(60)
+
+
+async def test_many_small_workspaces_are_not_scanned_day_by_day(monkeypatch):
+    records = []
+    for i in range(70, 0, -1):
+        day = TODAY - timedelta(days=i)
+        records.append(_record(day, "query", "big", 8000, 1000))
+        records += [_record(day, "query", f"tiny-{n}", 50, 5) for n in range(5)]
+    store = MemoryUsageStore(TZ)
+    service = await _service(store, records)
+    calls = []
+    detect = an.detect_purpose_day
+
+    def counted(purpose, day, tokens, *rest):
+        calls.append(tokens)
+        return detect(purpose, day, tokens, *rest)
+
+    monkeypatch.setattr(an, "detect_purpose_day", counted)
+    await service.anomalies()
+    big_only = len(calls)
+    assert (
+        big_only and big_only <= 2 * 92
+    )  # The system's series and big's, nothing else
+
+
+async def test_concurrent_requests_share_one_build():
+    store = MemoryUsageStore(TZ)
+    service = await _service(store, _many_workspaces(3))
+    builds = 0
+
+    async def build():
+        nonlocal builds
+        builds += 1
+        await asyncio.sleep(0)
+        return builds
+
+    results = await asyncio.gather(*(service._cached(("k",), build) for _ in range(5)))
+    assert results == [1] * 5 and builds == 1 and not service._building
+
+
+async def test_a_failed_build_is_not_remembered():
+    service = await _service(MemoryUsageStore(TZ), [])
+
+    async def fails():
+        raise RuntimeError("database away")
+
+    async def works():
+        return "fine"
+
+    with pytest.raises(RuntimeError):
+        await service._cached(("k",), fails)
+    assert await service._cached(("k",), works) == "fine"
+
+
+async def test_stale_workspace_rows_answer_at_once_and_refresh_behind():
+    store = MemoryUsageStore(TZ)
+    service = await _service(store, _many_workspaces(2))
+    first = await service.workspaces(30)
+    assert first["total"] == 2
+    await store.write([_record(TODAY - timedelta(days=1), "query", "ws-late")], [])
+    key = next(k for k in service._cache if k[0] == "workspace_rows")
+    _, rows = service._cache[key]
+    # Fresh: nothing changes yet.
+    assert (await service.workspaces(30))["total"] == 2
+    # Past its time: this answer is the old list, and the next one is the new list.
+    service._cache[key] = (time.monotonic() - 1, rows)
+    assert (await service.workspaces(30))["total"] == 2
+    await asyncio.gather(*service._refreshes)
+    assert (await service.workspaces(30))["total"] == 3
+    # Too old to show: this one waits for the new list.
+    await store.write([_record(TODAY - timedelta(days=1), "query", "ws-later")], [])
+    service._cache[key] = (time.monotonic() - WORKSPACE_ROWS_STALE_SECONDS - 1, rows)
+    service._cache = {key: service._cache[key]}
+    assert (await service.workspaces(30))["total"] == 4
+
+
+async def test_workspace_options_search_names_and_owners_without_deleted():
+    store = MemoryUsageStore(TZ)
+    records = _many_workspaces(30)
+    records.append(_record(TODAY - timedelta(days=1), "query", "deleted-abcd1234"))
+    service = await _service(store, records)
+    service.app_state = SimpleNamespace(
+        workspace_registry=SimpleNamespace(
+            list_owners=_async_value(
+                [SimpleNamespace(workspace_id="ws-029", email=None, identity="Budi")]
+            )
+        )
+    )
+    out = await service.workspace_options()
+    assert len(out["options"]) == 20 and out["total"] == 30
+    # Highest spend first, so the ones most likely to be wanted need no typing.
+    assert out["options"][0] == {"id": "ws-000", "owner": None}
+    assert (await service.workspace_options("WS-02", 3))["total"] == 10
+    assert (await service.workspace_options("budi"))["options"] == [
+        {"id": "ws-029", "owner": "Budi"}
+    ]
+    assert (await service.workspace_options("deleted"))["total"] == 0
+
+
+async def test_purpose_page_shows_the_largest_workspaces_and_counts_the_rest():
+    store = MemoryUsageStore(TZ)
+    day = TODAY - timedelta(days=1)
+    records = _many_workspaces(30) + [
+        _record(day, "query", f"ws-{i:03d}", 10, 0, model="byo", billing="byo")
+        for i in range(8)
+    ]
+    service = await _service(store, records)
+    page = await service.purpose_page("query", 30)
+    assert len(page["workspaces"]) == 20 and page["workspace_count"] == 30
+    assert page["workspaces"][0]["id"] == "ws-000"
+    assert len(page["byo_workspaces"]) == 5 and page["byo_workspace_count"] == 8
+
+
+async def test_scale_routes_answer_and_validate():
+    service = await _service(MemoryUsageStore(TZ), _many_workspaces(30))
+    client = _client(service)
+    table = client.get(
+        "/admin/insights/workspaces",
+        params={"q": "ws-02", "sort": "tokens", "page": 2, "page_size": 4},
+    ).json()
+    assert [r["id"] for r in table["rows"]] == [f"ws-02{i}" for i in range(4, 8)]
+    assert (table["total"], table["page"]) == (10, 2)
+    assert len(client.get("/admin/insights/workspaces").json()["rows"]) == 30
+    for bad in ({"sort": "id"}, {"show": "x"}, {"page": 0}, {"page_size": 1000}):
+        assert client.get("/admin/insights/workspaces", params=bad).status_code == 422
+    options = client.get("/admin/insights/workspace-options", params={"q": "ws-01"})
+    assert options.json()["total"] == 10
+    capped = client.get(
+        "/admin/insights/breakdown", params={"group": "workspace", "limit": 5}
+    ).json()
+    assert len(capped["rows"]) == 5 and capped["total"] == 30
+    export = client.get("/admin/insights/breakdown.csv", params={"group": "workspace"})
+    assert len(export.text.strip().splitlines()) == 31

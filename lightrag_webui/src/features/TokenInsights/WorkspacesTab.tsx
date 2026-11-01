@@ -1,11 +1,14 @@
-import { useMemo, useState } from 'react'
+import { useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import Input from '@/components/ui/Input'
+import { useDebounce } from '@/hooks/useDebounce'
 import { insightsApi } from './api'
 import { useData, useInsights } from './context'
 import { Card, Empty, Mix, Seg, StatusLabel, TextButton, Title, fmtChange, fmtCount, fmtMoney, fmtPct, fmtTokens } from './ui'
 
 type Sort = 'cost' | 'tokens' | 'change' | 'documents' | 'questions'
+
+const SEARCH_DEBOUNCE_MS = 250
 
 export default function WorkspacesTab() {
   const { t } = useTranslation()
@@ -13,23 +16,23 @@ export default function WorkspacesTab() {
   const [sort, setSort] = useState<Sort>('cost')
   const [show, setShow] = useState<'all' | 'byo' | 'look'>('all')
   const [query, setQuery] = useState('')
+  const q = useDebounce(query, SEARCH_DEBOUNCE_MS).trim()
+  // A page belongs to one view, so changing the search or a filter goes back to the first.
+  const view = JSON.stringify([params, scope.purpose, q, show, sort])
+  const [paging, setPaging] = useState({ view, page: 1 })
+  const page = paging.view === view ? paging.page : 1
   const { data, error, loading } = useData(
-    () => insightsApi.workspaces({ ...params, purpose: scope.purpose }),
-    [JSON.stringify(params), scope.purpose]
+    () => insightsApi.workspaces({ ...params, purpose: scope.purpose, q, show, sort, page }),
+    [view, page]
   )
-  const all: any[] = useMemo(() => data?.rows ?? [], [data])
-  const rows = useMemo(() => {
-    const q = query.trim().toLowerCase()
-    return all
-      .filter((r) => (show === 'byo' ? r.byo_for.length : show === 'look' ? r.needs_look : true))
-      .filter((r) => !q || r.id.toLowerCase().includes(q) || (r.owner || '').toLowerCase().includes(q))
-      .sort((a, b) => (b[sort] ?? -Infinity) - (a[sort] ?? -Infinity))
-  }, [all, show, query, sort])
+  const rows: any[] = data?.rows ?? []
+  const shownPage: number = data?.page ?? page
+  const lastPage = data ? Math.max(Math.ceil(data.total / data.page_size), 1) : 1
   if (error && !data) return <Empty>{error}</Empty>
   return (
     <Card className={loading ? 'opacity-60 transition-opacity' : 'transition-opacity'}>
       <div className="mb-3 flex flex-wrap items-end justify-between gap-x-4 gap-y-2.5">
-        <Title sub={t('insights.workspaces.sentence', { count: all.length, byo: all.filter((r) => r.byo_for.length).length, look: all.filter((r) => r.needs_look).length })}>{t('insights.workspaces.title')}</Title>
+        <Title sub={data ? t('insights.workspaces.sentence', { count: data.counts.workspaces, byo: data.counts.byo, look: data.counts.look }) : undefined}>{t('insights.workspaces.title')}</Title>
         <div className="flex flex-wrap items-end gap-3">
           <label className="text-muted-foreground flex flex-col gap-0.5 text-xs">{t('insights.workspaces.find')}
             <Input value={query} onChange={(e) => setQuery(e.target.value)} placeholder={t('insights.workspaces.placeholder')} className="h-9 w-44" />
@@ -83,8 +86,16 @@ export default function WorkspacesTab() {
             ))}
           </tbody>
         </table>
-        {!rows.length ? <p className="text-muted-foreground mt-3 mb-0 text-xs">{t('insights.workspaces.none')}</p> : null}
+        {data && !rows.length ? <p className="text-muted-foreground mt-3 mb-0 text-xs">{t('insights.workspaces.none')}</p> : null}
       </div>
+      {lastPage > 1 ? (
+        <div className="mt-3 flex items-center justify-end gap-2 text-xs">
+          <span className="text-muted-foreground me-auto">{t('insights.workspaces.matching', { count: data.total })}</span>
+          <button type="button" className="hover:bg-muted min-h-9 rounded-lg border px-3 text-[13px] disabled:opacity-50" disabled={shownPage <= 1} onClick={() => setPaging({ view, page: shownPage - 1 })}>{t('insights.workspaces.previousPage')}</button>
+          <span className="text-muted-foreground">{t('insights.workspaces.pageOf', { page: shownPage, total: lastPage })}</span>
+          <button type="button" className="hover:bg-muted min-h-9 rounded-lg border px-3 text-[13px] disabled:opacity-50" disabled={shownPage >= lastPage} onClick={() => setPaging({ view, page: shownPage + 1 })}>{t('insights.workspaces.nextPage')}</button>
+        </div>
+      ) : null}
       <p className="text-muted-foreground mt-3 mb-0 text-xs">{t('insights.workspaces.deletedNote')}</p>
     </Card>
   )

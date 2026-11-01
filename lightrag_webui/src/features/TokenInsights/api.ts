@@ -13,6 +13,7 @@ export const insightsApi = {
   overview: (p: Params) => get('/overview', p),
   purpose: (id: string, p: Params) => get(`/purposes/${id}`, p),
   workspaces: (p: Params) => get('/workspaces', p),
+  workspaceOptions: (p: Params) => get('/workspace-options', p),
   workspace: (id: string, p: Params) => get(`/workspaces/${encodeURIComponent(id)}`, p),
   breakdown: (p: Params) => get('/breakdown', p),
   calls: (p: Params) => get('/calls', p),

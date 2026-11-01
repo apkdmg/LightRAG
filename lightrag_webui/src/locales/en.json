@@ -834,6 +834,9 @@
       "tpm": "{{value}} per minute"
     },
     "purposePage": {
+      "andMore": "and {{count}} more",
+      "allWorkspaces_one": "See {{count}} workspace",
+      "allWorkspaces_other": "See all {{count}} workspaces",
       "back": "Back to {{workspace}}",
       "inWorkspace": "{{name}} in {{workspace}}",
       "desc": {
@@ -1008,11 +1011,18 @@
       "failed_one": "{{count}} document failed",
       "failed_other": "{{count}} documents failed",
       "none": "No workspace matches.",
+      "matching_one": "{{count}} workspace",
+      "matching_other": "{{count}} workspaces",
+      "previousPage": "Previous",
+      "nextPage": "Next",
+      "pageOf": "Page {{page}} of {{total}}",
+      "showingOf": "Showing {{shown}} of {{total}}. Search to find the rest.",
       "deletedNote": "A deleted workspace keeps its numbers under a short code, without its name."
     },
     "explore": {
       "groupBy": "Group by",
       "export": "Export CSV",
+      "topOf": "Showing the largest {{shown}} of {{total}}. Export CSV has them all.",
       "path": "Showing",
       "remove": "Remove {{name}}",
       "dim": {
