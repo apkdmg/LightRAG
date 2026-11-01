@@ -130,7 +130,7 @@ function App() {
           useAuthStore.getState().login(
             token,
             isGuestMode,
-            false, // Not SSO
+            useAuthStore.getState().isSSOMode,
             status.core_version,
             status.api_version,
             status.webui_title || null,

@@ -33,13 +33,13 @@ interface AuthState {
   coreVersion: string | null;
   apiVersion: string | null;
   username: string | null; // login username
-  role: string | null; // role from JWT (user | admin | guest); used for admin-only UI
+  role: string | null; // role from JWT, or SSO login metadata (user | admin | guest); used for admin-only UI
   webuiTitle: string | null; // Custom title
   webuiDescription: string | null; // Title description
   lastTokenRenewal: string | null; // Human-readable local time of last token renewal (for debugging and monitoring)
   tokenExpiresAt: number | null; // Token expiration timestamp (extracted from JWT)
 
-  login: (token: string, isGuest?: boolean, isSSO?: boolean, coreVersion?: string | null, apiVersion?: string | null, webuiTitle?: string | null, webuiDescription?: string | null) => void;
+  login: (token: string, isGuest?: boolean, isSSO?: boolean, coreVersion?: string | null, apiVersion?: string | null, webuiTitle?: string | null, webuiDescription?: string | null, ssoRole?: string | null) => void;
   logout: () => void;
   setVersion: (coreVersion: string | null, apiVersion: string | null) => void;
   setCustomTitle: (webuiTitle: string | null, webuiDescription: string | null) => void;
@@ -199,6 +199,15 @@ const getRoleFromToken = (token: string): string | null => {
   return payload.role || null;
 };
 
+// SSO sessions store a placeholder token (the JWT is in an HTTP-only cookie), so
+// the role from the login metadata is kept separately. This only drives what the
+// UI shows; the server enforces the role on every request.
+const SSO_ROLE_KEY = 'LIGHTRAG-SSO-ROLE';
+
+const resolveRole = (token: string, isSSO: boolean): string | null => {
+  return getRoleFromToken(token) ?? (isSSO ? localStorage.getItem(SSO_ROLE_KEY) : null);
+};
+
 const isGuestToken = (token: string): boolean => {
   const payload = parseTokenPayload(token);
   return payload.role === 'guest';
@@ -209,7 +218,7 @@ const getTokenExpiresAt = (token: string): number | null => {
   return payload.exp ? payload.exp * 1000 : null; // Convert to milliseconds
 };
 
-const initAuthState = (): { isAuthenticated: boolean; isGuestMode: boolean; isSSOMode: boolean; coreVersion: string | null; apiVersion: string | null; username: string | null; role: string | null; webuiTitle: string | null; webuiDescription: string | null; lastTokenRenewal: string | null; tokenExpiresAt: number | null } => {
+export const initAuthState = (): { isAuthenticated: boolean; isGuestMode: boolean; isSSOMode: boolean; coreVersion: string | null; apiVersion: string | null; username: string | null; role: string | null; webuiTitle: string | null; webuiDescription: string | null; lastTokenRenewal: string | null; tokenExpiresAt: number | null } => {
   const token = localStorage.getItem('LIGHTRAG-API-TOKEN');
   const coreVersion = localStorage.getItem('LIGHTRAG-CORE-VERSION');
   const apiVersion = localStorage.getItem('LIGHTRAG-API-VERSION');
@@ -218,7 +227,7 @@ const initAuthState = (): { isAuthenticated: boolean; isGuestMode: boolean; isSS
   const lastTokenRenewal = localStorage.getItem('LIGHTRAG-LAST-TOKEN-RENEWAL');
   const isSSOMode = localStorage.getItem('LIGHTRAG-SSO-MODE') === 'true';
   const username = token ? getUsernameFromToken(token) : null;
-  const role = token ? getRoleFromToken(token) : null;
+  const role = token ? resolveRole(token, isSSOMode) : null;
   const tokenExpiresAt = token ? getTokenExpiresAt(token) : null;
 
   if (!token) {
@@ -269,14 +278,21 @@ export const useAuthStore = create<AuthState>(set => {
     lastTokenRenewal: initialState.lastTokenRenewal,
     tokenExpiresAt: initialState.tokenExpiresAt,
 
-    login: (token, isGuest = false, isSSO = false, coreVersion = null, apiVersion = null, webuiTitle = null, webuiDescription = null) => {
+    login: (token, isGuest = false, isSSO = false, coreVersion = null, apiVersion = null, webuiTitle = null, webuiDescription = null, ssoRole) => {
       localStorage.setItem('LIGHTRAG-API-TOKEN', token);
 
       // Store SSO mode flag
       if (isSSO) {
         localStorage.setItem('LIGHTRAG-SSO-MODE', 'true');
+        // undefined means a re-login without metadata (app startup): keep the stored role
+        if (ssoRole) {
+          localStorage.setItem(SSO_ROLE_KEY, ssoRole);
+        } else if (ssoRole === null) {
+          localStorage.removeItem(SSO_ROLE_KEY);
+        }
       } else {
         localStorage.removeItem('LIGHTRAG-SSO-MODE');
+        localStorage.removeItem(SSO_ROLE_KEY);
       }
 
       if (coreVersion) {
@@ -299,7 +315,7 @@ export const useAuthStore = create<AuthState>(set => {
       }
 
       const username = getUsernameFromToken(token);
-      const role = getRoleFromToken(token);
+      const role = resolveRole(token, isSSO);
       const tokenExpiresAt = getTokenExpiresAt(token);
       const now = Date.now();
       const formattedTime = formatTimestampToLocalString(now);
@@ -328,6 +344,7 @@ export const useAuthStore = create<AuthState>(set => {
 
       localStorage.removeItem('LIGHTRAG-API-TOKEN');
       localStorage.removeItem('LIGHTRAG-LAST-TOKEN-RENEWAL');
+      localStorage.removeItem(SSO_ROLE_KEY);
       localStorage.removeItem('LIGHTRAG-SSO-MODE');
 
       const coreVersion = localStorage.getItem('LIGHTRAG-CORE-VERSION');
