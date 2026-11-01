@@ -3,7 +3,6 @@ import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
 
 import Button from '@/components/ui/Button'
-import Input from '@/components/ui/Input'
 import {
   Card,
   CardHeader,
@@ -11,33 +10,24 @@ import {
   CardDescription,
   CardContent
 } from '@/components/ui/Card'
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectSeparator,
-  SelectTrigger,
-  SelectValue
-} from '@/components/ui/Select'
 import { SaveIcon, Trash2Icon } from 'lucide-react'
 
 import {
   getProviderConfig,
-  getServerProvider,
+  getServerProviderAvailability,
   updateProviderConfig,
   deleteProviderConfig,
   getEffectiveRoleConfig,
-  listAdminWorkspaces,
   type ProviderSlotMasked,
   type ProviderSlotKey,
-  type EffectiveRolesResponse,
-  type AdminWorkspace
+  type EffectiveRolesResponse
 } from '@/api/lightrag'
 import DeleteWorkspaceCard from '@/components/DeleteWorkspaceCard'
 import { useProvidersStore } from '@/stores/providers'
 import { useAuthStore } from '@/stores/state'
 import { PROVIDER_SLOT_META, getPreset, presetForBaseUrl } from '@/features/providerPresets'
 import ProviderSlotFields, { type SlotDraft } from '@/features/ProviderSlotFields'
+import ManageWorkspaceSelector from '@/features/ManageWorkspaceSelector'
 import ServerProviderPanel from '@/features/ServerProviderPanel'
 
 function draftFromMasked(masked: ProviderSlotMasked): SlotDraft {
@@ -176,118 +166,6 @@ function ProviderSlotForm({ slot, masked, targetWorkspace, onSaved }: SlotFormPr
   )
 }
 
-// Radix Select forbids empty-string item values, so use non-empty sentinels.
-const SELF_WORKSPACE = '__self__'
-const OTHER_WORKSPACE = '__other__'
-const SERVER_DEFAULT = '__server__'
-
-interface ManageWorkspaceSelectorProps {
-  value: string | null // null = the admin's own workspace
-  onChange: (workspace: string | null) => void
-  serverDefaultAvailable: boolean
-  serverDefaultSelected: boolean
-  onServerDefaultSelectedChange: (selected: boolean) => void
-}
-
-/** Admin-only: pick whose workspace the provider settings below apply to. */
-function ManageWorkspaceSelector({
-  value,
-  onChange,
-  serverDefaultAvailable,
-  serverDefaultSelected,
-  onServerDefaultSelectedChange
-}: ManageWorkspaceSelectorProps) {
-  const { t } = useTranslation()
-  const [workspaces, setWorkspaces] = useState<AdminWorkspace[]>([])
-  const [manual, setManual] = useState(false)
-  const [manualValue, setManualValue] = useState('')
-
-  useEffect(() => {
-    let cancelled = false
-    listAdminWorkspaces()
-      .then((res) => {
-        if (!cancelled) setWorkspaces(res.workspaces)
-      })
-      .catch((err: any) => {
-        toast.error(err?.message || t('providerSettings.admin.loadWorkspacesFailed'))
-      })
-    return () => {
-      cancelled = true
-    }
-  }, [t])
-
-  const selectValue = serverDefaultSelected
-    ? SERVER_DEFAULT
-    : value === null
-      ? SELF_WORKSPACE
-      : manual
-        ? OTHER_WORKSPACE
-        : value
-
-  const handleSelect = (v: string) => {
-    onServerDefaultSelectedChange(v === SERVER_DEFAULT)
-    if (v === SERVER_DEFAULT) {
-      setManual(false)
-      onChange(null)
-    } else if (v === SELF_WORKSPACE) {
-      setManual(false)
-      onChange(null)
-    } else if (v === OTHER_WORKSPACE) {
-      setManual(true)
-      onChange(manualValue.trim() || null)
-    } else {
-      setManual(false)
-      onChange(v)
-    }
-  }
-
-  return (
-    <Card>
-      <CardContent className="flex flex-col gap-2 pt-6">
-        <label className="text-sm font-medium">{t('providerSettings.admin.manageWorkspace')}</label>
-        <Select value={selectValue} onValueChange={handleSelect}>
-          <SelectTrigger>
-            <SelectValue />
-          </SelectTrigger>
-          <SelectContent>
-            {serverDefaultAvailable && (
-              <>
-                <SelectItem value={SERVER_DEFAULT}>
-                  {t('providerSettings.server.selectorLabel')}
-                </SelectItem>
-                <SelectSeparator />
-              </>
-            )}
-            <SelectItem value={SELF_WORKSPACE}>{t('providerSettings.admin.myWorkspace')}</SelectItem>
-            {workspaces.map((w) => (
-              <SelectItem key={w.workspace_id} value={w.workspace_id}>
-                {w.owner_username} ({w.workspace_id})
-              </SelectItem>
-            ))}
-            <SelectItem value={OTHER_WORKSPACE}>{t('providerSettings.admin.otherWorkspace')}</SelectItem>
-          </SelectContent>
-        </Select>
-        {manual && (
-          <Input
-            value={manualValue}
-            onChange={(e) => {
-              setManualValue(e.target.value)
-              onChange(e.target.value.trim() || null)
-            }}
-            placeholder={t('providerSettings.admin.otherWorkspacePlaceholder')}
-            autoComplete="off"
-          />
-        )}
-        {value && (
-          <p className="text-xs text-amber-600 dark:text-amber-400">
-            {t('providerSettings.admin.actingOn', { workspace: value })}
-          </p>
-        )}
-      </CardContent>
-    </Card>
-  )
-}
-
 export default function ProviderSettings() {
   const { t } = useTranslation()
   const { role } = useAuthStore()
@@ -334,7 +212,7 @@ export default function ProviderSettings() {
   useEffect(() => {
     if (!isAdmin) return
     let cancelled = false
-    getServerProvider()
+    getServerProviderAvailability()
       .then(() => {
         if (!cancelled) setServerDefaultAvailable(true)
       })
@@ -367,7 +245,12 @@ export default function ProviderSettings() {
         />
       )}
 
-      {serverDefaultSelected ? <ServerProviderPanel /> : (
+      {serverDefaultSelected ? <ServerProviderPanel
+        onManageWorkspace={(workspace) => {
+          setServerDefaultSelected(false)
+          setTargetWorkspace(workspace)
+        }}
+      /> : (
         <>
           {disabled && (
             <Card>

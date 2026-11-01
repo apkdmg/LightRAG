@@ -6,9 +6,9 @@ including creation, deletion, listing, and impersonation.
 """
 
 import logging
-from typing import List
+from typing import List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from pydantic import BaseModel, Field
 
 from lightrag.api.dependencies import (
@@ -256,8 +256,9 @@ def create_admin_routes():
     )
     async def list_workspaces(
         request: Request,
-        page: int = 1,
-        page_size: int = 50,
+        page: int = Query(1, ge=1),
+        page_size: int = Query(50, ge=1, le=1000),
+        search: Optional[str] = None,
         workspace_manager: WorkspaceManager = Depends(get_workspace_manager),
     ):
         """
@@ -266,6 +267,7 @@ def create_admin_routes():
         Args:
             page: Page number (1-indexed).
             page_size: Number of items per page.
+            search: Keep only workspaces whose id or owner contains this.
 
         Returns:
             WorkspaceListResponse: Paginated list of workspaces.
@@ -275,6 +277,7 @@ def create_admin_routes():
                 page=page,
                 page_size=page_size,
                 persisted=await persisted_workspaces(request.app),
+                search=search,
             )
 
             return WorkspaceListResponse(

@@ -1441,11 +1441,11 @@ export type ServerProviderSlot = Omit<ProviderSlotMasked, 'effective'> & {
   }
 }
 
-export type ServerProviderPause = {
-  workspace: string
-  slot: ProviderSlotKey
-  kind: string | null
-  status_code: number | null
+/** Counts, not names: an outage can pause thousands of workspaces. */
+export type ServerProviderPauses = {
+  total: number
+  by_slot: Record<ProviderSlotKey, number>
+  reasons: { kind: string | null; status_code: number | null; count: number }[]
   since: number | null
 }
 
@@ -1458,9 +1458,10 @@ export type ServerProviderView = {
   status: 'ok' | 'unreadable' | 'no_secret'
   impact: {
     total_workspaces: number
-    own_provider: Record<ProviderSlotKey, string[]>
+    own_provider_by_slot: Record<ProviderSlotKey, number>
+    own_provider_total: number
   }
-  paused: ServerProviderPause[]
+  paused: ServerProviderPauses
   /** Set on a change: how many workspaces resumed ingestion because of it. */
   resumed?: number
 }
@@ -1483,6 +1484,31 @@ export type ServerProviderTestResult = {
 /** Admin-only: the server default provider and who a change would affect. */
 export const getServerProvider = async (): Promise<ServerProviderView> => {
   const response = await axiosInstance.get('/admin/system-provider')
+  return response.data
+}
+
+/** Admin-only: whether the server default can be managed here. Cheap to call. */
+export const getServerProviderAvailability = async (): Promise<{ available: boolean }> => {
+  const response = await axiosInstance.get('/admin/system-provider/status')
+  return response.data
+}
+
+export type OwnProviderWorkspaceList = {
+  workspaces: { workspace_id: string; slots: ProviderSlotKey[] }[]
+  total: number
+  page: number
+  page_size: number
+}
+
+/** Admin-only: one page of the workspaces a server default doesn't reach. */
+export const listOwnProviderWorkspaces = async (
+  page = 1,
+  pageSize = 20,
+  search?: string
+): Promise<OwnProviderWorkspaceList> => {
+  const response = await axiosInstance.get('/admin/system-provider/own-providers', {
+    params: { page, page_size: pageSize, search }
+  })
   return response.data
 }
 
@@ -1527,10 +1553,11 @@ export type AdminWorkspaceListResponse = {
 /** Admin-only: list workspaces (used by the provider "Manage workspace" selector). */
 export const listAdminWorkspaces = async (
   page = 1,
-  pageSize = 1000
+  pageSize = 20,
+  search?: string
 ): Promise<AdminWorkspaceListResponse> => {
   const response = await axiosInstance.get('/admin/workspaces', {
-    params: { page, page_size: pageSize }
+    params: { page, page_size: pageSize, search }
   })
   return response.data
 }

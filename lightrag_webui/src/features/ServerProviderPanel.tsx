@@ -31,6 +31,7 @@ import {
 import { errorMessage } from '@/lib/utils'
 import { PROVIDER_SLOT_META, getPreset, presetForBaseUrl } from '@/features/providerPresets'
 import ProviderSlotFields, { type SlotDraft } from '@/features/ProviderSlotFields'
+import OwnProviderWorkspacesDialog from '@/features/OwnProviderWorkspacesDialog'
 import ServerProviderReviewDialog from '@/features/ServerProviderReviewDialog'
 import { knownKeyPreview, sameBaseUrl } from '@/features/serverProviderKeys'
 
@@ -118,6 +119,7 @@ function ServerSlotCard({ slotKey, view, onChanged }: ServerSlotCardProps) {
   }, [slotKey, onChanged, t])
 
   const fromWebui = slot.effective.source === 'webui'
+  const total = view.impact.total_workspaces
   const meta = PROVIDER_SLOT_META.find((m) => m.key === slotKey)!
 
   return (
@@ -149,6 +151,12 @@ function ServerSlotCard({ slotKey, view, onChanged }: ServerSlotCardProps) {
             {t('providerSettings.effectiveLine', {
               host: slot.effective.host || '—',
               model: slot.effective.model || '—'
+            })}
+          </p>
+          <p className="text-xs text-muted-foreground">
+            {t('providerSettings.server.appliesTo', {
+              affected: Math.max(total - view.impact.own_provider_by_slot[slotKey], 0),
+              total
             })}
           </p>
           {fromWebui && (
@@ -231,9 +239,14 @@ function pauseReason(kind: string | null, statusCode: number | null, t: (k: stri
     : t('providerSettings.server.pauseInvalidKey', { status: statusCode })
 }
 
+interface ServerProviderPanelProps {
+  onManageWorkspace: (workspace: string) => void
+}
+
 /** Admin-only: the provider every workspace without its own uses. */
-export default function ServerProviderPanel() {
+export default function ServerProviderPanel({ onManageWorkspace }: ServerProviderPanelProps) {
   const { t } = useTranslation()
+  const [showingOwn, setShowingOwn] = useState(false)
   const [view, setView] = useState<ServerProviderView | null>(null)
   const [revisions, setRevisions] = useState<Partial<Record<ProviderSlotKey, number>>>({})
 
@@ -261,15 +274,9 @@ export default function ServerProviderPanel() {
     return <p className="text-sm text-muted-foreground">{t('providerSettings.loading')}</p>
   }
 
-  const own = view.impact.own_provider
-  const withOwn = new Set(Object.values(own).flat())
-  const pauseReasons = [
-    ...new Set(view.paused.map((p) => pauseReason(p.kind, p.status_code, t)))
-  ].join('; ')
-  const pausedSince = view.paused
-    .map((p) => p.since)
-    .filter((s): s is number => s !== null)
-    .sort((a, b) => a - b)[0]
+  const pauseReasons = view.paused.reasons
+    .map((r) => pauseReason(r.kind, r.status_code, t))
+    .join('; ')
 
   return (
     <>
@@ -287,15 +294,15 @@ export default function ServerProviderPanel() {
         </Alert>
       )}
 
-      {view.paused.length > 0 && (
+      {view.paused.total > 0 && (
         <Alert variant="destructive" className={DANGER_ALERT}>
           <AlertTriangleIcon className="size-4" />
           <AlertDescription>
             {t('providerSettings.server.paused', {
-              count: view.paused.length,
+              count: view.paused.total,
               reason: pauseReasons,
-              since: pausedSince
-                ? new Date(pausedSince * 1000).toLocaleString()
+              since: view.paused.since
+                ? new Date(view.paused.since * 1000).toLocaleString()
                 : '—'
             })}
           </AlertDescription>
@@ -309,22 +316,24 @@ export default function ServerProviderPanel() {
             {t('providerSettings.server.impact', { count: view.impact.total_workspaces })}{' '}
             {t('providerSettings.server.notCovered')}
           </p>
-          {withOwn.size > 0 && (
-            <details className="mt-1 text-xs">
-              <summary className="cursor-pointer">
-                {t('providerSettings.server.viewOwn', { count: withOwn.size })}
-              </summary>
-              <ul className="mt-1 list-disc pl-4">
-                {PROVIDER_SLOT_META.filter(({ key }) => own[key].length > 0).map(({ key, titleKey }) => (
-                  <li key={key} className="break-all">
-                    {t(`providerSettings.${titleKey}`)}: {own[key].join(', ')}
-                  </li>
-                ))}
-              </ul>
-            </details>
+          {view.impact.own_provider_total > 0 && (
+            <button
+              type="button"
+              className="mt-1 cursor-pointer text-xs underline underline-offset-2"
+              onClick={() => setShowingOwn(true)}
+            >
+              {t('providerSettings.server.viewOwn', { count: view.impact.own_provider_total })}
+            </button>
           )}
         </AlertDescription>
       </Alert>
+
+      {showingOwn && (
+        <OwnProviderWorkspacesDialog
+          onClose={() => setShowingOwn(false)}
+          onManage={onManageWorkspace}
+        />
+      )}
 
       <div className="grid gap-4 lg:grid-cols-3">
         {PROVIDER_SLOT_META.map(({ key }) => (

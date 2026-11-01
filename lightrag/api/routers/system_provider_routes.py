@@ -20,11 +20,12 @@ enabled. Fork-only and self-contained.
 import asyncio
 import logging
 import time
+from collections import Counter
 from datetime import datetime, timezone
 from typing import Any, Literal, Optional
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from pydantic import SecretStr
 
 from lightrag.api.dependencies import UserInfo, require_admin
@@ -33,11 +34,11 @@ from lightrag.api.routers.provider_routes import (
     ProviderSlotInput,
     UpdateProviderConfigRequest,
     _get_store,
+    _lift_provider_pause,
     _merge_slot,
-    _resume_paused_ingestion,
     _validate_base_url,
 )
-from lightrag.api.startup_resume import _candidate_workspaces
+from lightrag.api.startup_resume import MAX_CONCURRENT_RESUMES, _candidate_workspaces
 from lightrag.api.workspace_deletion import persisted_workspaces
 from lightrag.api.workspace_providers import (
     SLOT_ROLES,
@@ -68,6 +69,7 @@ _TEST_IMAGE = (
 
 # Strong references so background emails are not garbage-collected mid-send.
 _email_tasks: set[asyncio.Task] = set()
+_resume_runs: set[asyncio.Task] = set()
 
 
 class ProviderTestRequest(ProviderSlotInput):
@@ -203,10 +205,16 @@ async def _test_provider(slot: ProviderSlot, vision: bool) -> dict[str, Any]:
     return result("ok", status_code=code)
 
 
-async def _paused_on_system_key(request: Request) -> list[dict[str, Any]]:
+async def _own_providers(store: WorkspaceProviderStore) -> dict[str, list[str]]:
+    """Reads and decrypts a file per workspace, so it stays off the event loop."""
+    return await asyncio.to_thread(store.workspaces_with_own_provider)
+
+
+async def _paused_on_system_key(
+    request: Request, own: dict[str, list[str]]
+) -> list[dict[str, Any]]:
     """Workspaces whose ingestion is paused on a key the server default controls."""
     app_state = request.app.state
-    store: WorkspaceProviderStore = app_state.workspace_provider_store
     try:
         workspaces = await _candidate_workspaces(
             app_state.default_rag, app_state.workspace_registry, True
@@ -214,7 +222,7 @@ async def _paused_on_system_key(request: Request) -> list[dict[str, Any]]:
     except Exception as e:
         logger.warning(f"Could not list workspaces to check for pauses: {e}")
         return []
-    own = store.workspaces_with_own_provider()
+    own_sets = {slot: set(ids) for slot, ids in own.items()}
     paused: list[dict[str, Any]] = []
     for workspace in workspaces:
         try:
@@ -227,7 +235,7 @@ async def _paused_on_system_key(request: Request) -> list[dict[str, Any]]:
         if not pause:
             continue
         slot = _ROLE_SLOTS.get(pause.get("role"))
-        if slot is None or workspace in own[slot]:
+        if slot is None or workspace in own_sets[slot]:
             continue
         paused.append(
             {
@@ -241,22 +249,65 @@ async def _paused_on_system_key(request: Request) -> list[dict[str, Any]]:
     return paused
 
 
+def _pause_summary(paused: list[dict[str, Any]]) -> dict[str, Any]:
+    """Counts rather than names, since an outage can pause thousands."""
+    reasons = Counter((p["kind"], p["status_code"]) for p in paused)
+    sinces = [p["since"] for p in paused if p["since"] is not None]
+    return {
+        "total": len(paused),
+        "by_slot": {
+            slot: sum(p["slot"] == slot for p in paused) for slot in SLOT_ROLES
+        },
+        "reasons": [
+            {"kind": kind, "status_code": code, "count": count}
+            for (kind, code), count in reasons.most_common()
+        ],
+        "since": min(sinces, default=None),
+    }
+
+
+async def _run_resumed_pipelines(app_state: Any, workspaces: list[str]) -> None:
+    """Restart pipelines a few at a time, for the same reasons as at startup.
+
+    Each run holds a slot until its workspace's queue is empty, so an outage
+    ending can't send every waiting document to the provider at once.
+    """
+    manager = app_state.workspace_manager
+    semaphore = asyncio.Semaphore(min(MAX_CONCURRENT_RESUMES, manager.max_instances))
+
+    async def run(workspace: str) -> None:
+        async with semaphore:
+            try:
+                # The unnamed default workspace only exists on the default instance.
+                rag = (
+                    await manager.get_lightrag_instance(workspace)
+                    if workspace
+                    else app_state.default_rag
+                )
+                await rag.apipeline_process_enqueue_documents()
+            except Exception as e:
+                logger.error(f"Could not resume ingestion for '{workspace}': {e}")
+
+    await asyncio.gather(*(run(workspace) for workspace in workspaces))
+
+
 async def _resume_paused(request: Request, slots: set[str]) -> int:
-    """Resume ingestion paused on any of these slots. Returns how many workspaces."""
-    app_state = request.app.state
-    resumed = 0
-    for pause in await _paused_on_system_key(request):
-        if pause["slot"] not in slots:
-            continue
-        workspace = pause["workspace"]
-        # The unnamed default workspace only exists on the default instance.
-        await _resume_paused_ingestion(
-            app_state.workspace_manager,
-            workspace,
-            rag=None if workspace else app_state.default_rag,
-        )
-        resumed += 1
-    return resumed
+    """Lift pauses on these slots and restart their pipelines in the background.
+
+    Returns how many workspaces were resumed, without waiting for their pipelines.
+    """
+    store: WorkspaceProviderStore = request.app.state.workspace_provider_store
+    lifted = [
+        pause["workspace"]
+        for pause in await _paused_on_system_key(request, await _own_providers(store))
+        if pause["slot"] in slots and await _lift_provider_pause(pause["workspace"])
+    ]
+    if lifted:
+        logger.info(f"Server default changed: resuming {len(lifted)} workspace(s)")
+        task = asyncio.create_task(_run_resumed_pipelines(request.app.state, lifted))
+        _resume_runs.add(task)
+        task.add_done_callback(_resume_runs.discard)
+    return len(lifted)
 
 
 async def _view(request: Request) -> dict[str, Any]:
@@ -296,14 +347,16 @@ async def _view(request: Request) -> dict[str, Any]:
     _, total = app_state.workspace_manager.list_workspaces(
         page=1, page_size=1, persisted=await persisted_workspaces(request.app)
     )
+    own = await _own_providers(store)
     return {
         **masked,
         "status": record_status,
         "impact": {
             "total_workspaces": total,
-            "own_provider": store.workspaces_with_own_provider(),
+            "own_provider_by_slot": {slot: len(ids) for slot, ids in own.items()},
+            "own_provider_total": len({w for ids in own.values() for w in ids}),
         },
-        "paused": await _paused_on_system_key(request),
+        "paused": _pause_summary(await _paused_on_system_key(request, own)),
     }
 
 
@@ -351,6 +404,41 @@ def create_system_provider_routes() -> APIRouter:
         """The server default, what's in use, and who a change would affect."""
         _get_store(request)
         return await _view(request)
+
+    @router.get("/status")
+    async def get_availability(
+        request: Request, _: UserInfo = Depends(require_signed_in_admin)
+    ):
+        """Whether this feature is on. Cheap, unlike the full view."""
+        _get_store(request)
+        return {"available": True}
+
+    @router.get("/own-providers")
+    async def list_own_providers(
+        request: Request,
+        search: Optional[str] = None,
+        page: int = Query(1, ge=1),
+        page_size: int = Query(20, ge=1, le=100),
+        _: UserInfo = Depends(require_signed_in_admin),
+    ):
+        """The workspaces a server default doesn't reach, one page at a time."""
+        own = await _own_providers(_get_store(request))
+        slots_by_workspace: dict[str, list[str]] = {}
+        for slot, workspaces in own.items():
+            for workspace in workspaces:
+                slots_by_workspace.setdefault(workspace, []).append(slot)
+        needle = (search or "").lower()
+        matching = sorted(w for w in slots_by_workspace if needle in w.lower())
+        start = (page - 1) * page_size
+        return {
+            "workspaces": [
+                {"workspace_id": w, "slots": slots_by_workspace[w]}
+                for w in matching[start : start + page_size]
+            ],
+            "total": len(matching),
+            "page": page,
+            "page_size": page_size,
+        }
 
     @router.post("/test")
     async def test_server_default(
@@ -406,7 +494,7 @@ def create_system_provider_routes() -> APIRouter:
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(e)
             )
 
-        reconcile_loaded_instances(
+        await reconcile_loaded_instances(
             app_state.default_rag, app_state.workspace_manager, store, env_settings
         )
         resumed = await _resume_paused(request, set(provided))
@@ -430,7 +518,7 @@ def create_system_provider_routes() -> APIRouter:
         slots = set(SLOT_ROLES) if slot == "all" else {slot}
         before = {name: _in_use(request, SLOT_ROLES[name][0]) for name in slots}
         store.delete(SYSTEM_RECORD_ID, which=slot)
-        reconcile_loaded_instances(
+        await reconcile_loaded_instances(
             app_state.default_rag,
             app_state.workspace_manager,
             store,

@@ -405,6 +405,7 @@ class WorkspaceManager:
         page: int = 1,
         page_size: int = 50,
         persisted: Optional[Dict[str, Dict[str, Any]]] = None,
+        search: Optional[str] = None,
     ) -> Tuple[List[WorkspaceInfo], int]:
         """
         List all known workspaces with pagination.
@@ -415,15 +416,25 @@ class WorkspaceManager:
             persisted: Workspaces found in storage, by id. This process only
                 remembers workspaces it has served since startup, so without
                 this the list is incomplete after a restart.
+            search: Keep only workspaces whose id or owner contains this,
+                ignoring case.
 
         Returns:
-            Tuple of (list of WorkspaceInfo, total count).
+            Tuple of (list of WorkspaceInfo, total count after the search).
         """
         persisted = persisted or {}
         all_workspaces = [
             self._workspace_info(workspace_id, persisted.get(workspace_id))
             for workspace_id in {*self._workspace_metadata, *persisted}
         ]
+        if search:
+            needle = search.lower()
+            all_workspaces = [
+                w
+                for w in all_workspaces
+                if needle in w.workspace_id.lower()
+                or needle in (w.owner_username or "").lower()
+            ]
 
         # Most recently accessed first; the id keeps pages stable on ties
         all_workspaces.sort(key=lambda w: (-w.last_accessed_at, w.workspace_id))
