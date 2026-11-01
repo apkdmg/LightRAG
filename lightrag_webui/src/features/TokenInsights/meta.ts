@@ -8,6 +8,10 @@ export const PURPOSE_COLOR: Record<Purpose, string> = {
   query: 'var(--ti-query)'
 }
 
+/** No ratio means this workspace has no usage to compare, which isn't "far" from anyone. */
+export const isFarFromOthers = (ratio: number | null | undefined) =>
+  ratio !== null && ratio !== undefined && (ratio >= 1.25 || ratio <= 0.8)
+
 export const INGEST: Purpose[] = ['extract', 'vlm']
 export const QUESTIONS: Purpose[] = ['keyword', 'query']
 
