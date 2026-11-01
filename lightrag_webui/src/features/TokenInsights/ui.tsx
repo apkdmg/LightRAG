@@ -1,4 +1,4 @@
-import { ReactNode, useEffect, useRef, useState } from 'react'
+import { Component, ReactNode, useEffect, useRef, useState } from 'react'
 import { animate, useReducedMotion } from 'motion/react'
 import { useTranslation } from 'react-i18next'
 import { cn } from '@/lib/utils'
@@ -37,6 +37,32 @@ export const fmtChange = (n: number | null | undefined) => {
 export const fmtDay = (iso: string, long = false) => {
   const d = new Date(iso + 'T00:00:00')
   return d.toLocaleDateString(undefined, long ? { weekday: 'short', day: 'numeric', month: 'short' } : { day: 'numeric', month: 'short' })
+}
+
+function ViewFailed() {
+  const { t } = useTranslation()
+  return <Empty>{t('insights.viewFailed')}</Empty>
+}
+
+/** Keeps one view's failure from blanking the whole app. A new `resetKey` tries again. */
+export class ViewBoundary extends Component<{ resetKey?: string; children: ReactNode }, { failed: boolean }> {
+  state = { failed: false }
+
+  static getDerivedStateFromError() {
+    return { failed: true }
+  }
+
+  componentDidCatch(error: Error) {
+    console.error('Token Insights view failed:', error)
+  }
+
+  componentDidUpdate(previous: { resetKey?: string }) {
+    if (this.state.failed && previous.resetKey !== this.props.resetKey) this.setState({ failed: false })
+  }
+
+  render() {
+    return this.state.failed ? <ViewFailed /> : this.props.children
+  }
 }
 
 export function Card({ className, children }: { className?: string; children: ReactNode }) {

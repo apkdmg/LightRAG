@@ -641,6 +641,7 @@
     "estCost": "Est. cost",
     "loading": "Loading…",
     "empty": "No usage in this period.",
+    "viewFailed": "This view could not be shown. Choose another view or reload the page.",
     "notKnownYet": "Not known yet",
     "needs28": "Needs 28 days of data",
     "notEnoughToCompare": "Not enough history to compare yet",
