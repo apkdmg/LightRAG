@@ -372,8 +372,35 @@ class WorkspaceManager:
         except Exception as e:
             logger.error(f"Error finalizing storage for workspace {workspace_id}: {e}")
 
+    def _workspace_info(
+        self, workspace_id: str, persisted: Optional[Dict[str, Any]] = None
+    ) -> WorkspaceInfo:
+        """Combine this process's metadata with what storage recorded."""
+        metadata = self._workspace_metadata.get(workspace_id, {})
+        persisted = persisted or {}
+        is_active = workspace_id in self._instances
+        access_count = 0
+        if is_active:
+            _, _, _, access_count = self._instances[workspace_id]
+
+        return WorkspaceInfo(
+            workspace_id=workspace_id,
+            owner_username=persisted.get("owner_username")
+            or metadata.get("owner_username", workspace_id),
+            created_at=persisted.get("created_at") or metadata.get("created_at", 0),
+            last_accessed_at=max(
+                metadata.get("last_accessed_at", 0),
+                persisted.get("last_accessed_at", 0),
+            ),
+            access_count=access_count,
+            is_active=is_active,
+        )
+
     def list_workspaces(
-        self, page: int = 1, page_size: int = 50
+        self,
+        page: int = 1,
+        page_size: int = 50,
+        persisted: Optional[Dict[str, Dict[str, Any]]] = None,
     ) -> Tuple[List[WorkspaceInfo], int]:
         """
         List all known workspaces with pagination.
@@ -381,30 +408,21 @@ class WorkspaceManager:
         Args:
             page: Page number (1-indexed).
             page_size: Number of items per page.
+            persisted: Workspaces found in storage, by id. This process only
+                remembers workspaces it has served since startup, so without
+                this the list is incomplete after a restart.
 
         Returns:
             Tuple of (list of WorkspaceInfo, total count).
         """
-        all_workspaces = []
-        for workspace_id, metadata in self._workspace_metadata.items():
-            is_active = workspace_id in self._instances
-            access_count = 0
-            if is_active:
-                _, _, _, access_count = self._instances[workspace_id]
+        persisted = persisted or {}
+        all_workspaces = [
+            self._workspace_info(workspace_id, persisted.get(workspace_id))
+            for workspace_id in {*self._workspace_metadata, *persisted}
+        ]
 
-            all_workspaces.append(
-                WorkspaceInfo(
-                    workspace_id=workspace_id,
-                    owner_username=metadata.get("owner_username", workspace_id),
-                    created_at=metadata.get("created_at", 0),
-                    last_accessed_at=metadata.get("last_accessed_at", 0),
-                    access_count=access_count,
-                    is_active=is_active,
-                )
-            )
-
-        # Sort by last_accessed_at descending
-        all_workspaces.sort(key=lambda w: w.last_accessed_at, reverse=True)
+        # Most recently accessed first; the id keeps pages stable on ties
+        all_workspaces.sort(key=lambda w: (-w.last_accessed_at, w.workspace_id))
 
         # Paginate
         total = len(all_workspaces)
@@ -413,33 +431,23 @@ class WorkspaceManager:
 
         return all_workspaces[start:end], total
 
-    def get_workspace_info(self, workspace_id: str) -> Optional[WorkspaceInfo]:
+    def get_workspace_info(
+        self, workspace_id: str, persisted: Optional[Dict[str, Any]] = None
+    ) -> Optional[WorkspaceInfo]:
         """
         Get information about a specific workspace.
 
         Args:
             workspace_id: The workspace identifier.
+            persisted: This workspace's record from storage, if it has one.
 
         Returns:
             WorkspaceInfo if found, None otherwise.
         """
-        if workspace_id not in self._workspace_metadata:
+        if workspace_id not in self._workspace_metadata and persisted is None:
             return None
 
-        metadata = self._workspace_metadata[workspace_id]
-        is_active = workspace_id in self._instances
-        access_count = 0
-        if is_active:
-            _, _, _, access_count = self._instances[workspace_id]
-
-        return WorkspaceInfo(
-            workspace_id=workspace_id,
-            owner_username=metadata.get("owner_username", workspace_id),
-            created_at=metadata.get("created_at", 0),
-            last_accessed_at=metadata.get("last_accessed_at", 0),
-            access_count=access_count,
-            is_active=is_active,
-        )
+        return self._workspace_info(workspace_id, persisted)
 
     async def shutdown(self) -> None:
         """

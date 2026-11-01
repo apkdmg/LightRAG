@@ -1799,6 +1799,9 @@ def create_app(args):
             )
         from lightrag.api.workspace_manager import WorkspaceManager
 
+        # Its doc status storage can list every workspace (see workspace_deletion)
+        app.state.default_rag = rag
+
         async def _instance_is_stale(workspace_id: str, created_at: float) -> bool:
             # Another worker deleted the workspace after this instance was built
             tombstone = await app.state.workspace_registry.cached_tombstone(
