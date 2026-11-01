@@ -1826,22 +1826,6 @@ def create_app(args):
     app.include_router(create_query_routes(rag, api_key, args.top_k))
     app.include_router(create_graph_routes(rag, api_key))
 
-    # Email ingestion routes — native inline-image vision via the vlm role.
-    if args.vlm_process_enable:
-        _vlm_func = create_role_llm_func("vlm")
-
-        async def email_vision_func(prompt, image_data=None, **kwargs):
-            """Describe an inline email image via the native vlm role.
-
-            ``image_data`` is a raw base64 string; the binding's image_inputs
-            handling auto-detects the MIME type.
-            """
-            if not image_data:
-                return await _vlm_func(prompt, **kwargs)
-            return await _vlm_func(prompt, image_inputs=[image_data], **kwargs)
-    else:
-        email_vision_func = None
-
     # Email re-syncs that find the pipeline busy wait here (on disk) instead
     # of being dropped; drained whenever the workspace's pipeline is free.
     from lightrag.api.email_resync_queue import DeferredResyncQueue
@@ -1855,10 +1839,11 @@ def create_app(args):
     app.state.email_resync_queue = DeferredResyncQueue(
         args.working_dir, _resync_queue_rag
     )
+    # Email images are described through this instance's vlm role.
     app.include_router(
         create_email_routes(
             rag,
-            email_vision_func,
+            args.vlm_process_enable,
             api_key,
             resync_queue=app.state.email_resync_queue,
         )
