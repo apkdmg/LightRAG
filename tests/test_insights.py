@@ -37,7 +37,7 @@ from lightrag.api.insights.store import (  # noqa: E402
     MemoryUsageStore,
     PostgresUsageStore,
 )
-from lightrag.api.provider_alerts import SmtpSettings  # noqa: E402
+from lightrag.api.provider_alerts import SmtpSettings, is_own_alert_email  # noqa: E402
 from lightrag.lightrag import LightRAG  # noqa: E402
 from lightrag.llm_roles import RoleLLMConfig  # noqa: E402
 from lightrag.usage import (  # noqa: E402
@@ -1292,6 +1292,7 @@ async def test_anomaly_alert_is_one_email_and_not_repeated():
     ids = await scheduler.send_anomaly_alerts()
     assert ids and len(sent) == 1
     assert "Extraction" in sent[0].get_content()
+    assert is_own_alert_email(sent[0]["From"], sent[0]["Subject"], "a@b.c")
     assert await scheduler.send_anomaly_alerts() == [] and len(sent) == 1
 
 
@@ -1306,6 +1307,7 @@ async def test_budget_warning_has_both_dates_and_fires_once_per_threshold():
     assert await scheduler.send_budget_warning() is not None
     body = sent[0].get_content()
     assert "Without BYO" in body and "Requesty" in body
+    assert is_own_alert_email(sent[0]["From"], sent[0]["Subject"], "a@b.c")
     assert await scheduler.send_budget_warning() is None and len(sent) == 1
 
 
@@ -1318,6 +1320,7 @@ async def test_weekly_digest_goes_once_a_week():
     )
     assert await scheduler.send_digest() is True
     assert "Query" in sent[0].get_content()
+    assert is_own_alert_email(sent[0]["From"], sent[0]["Subject"], "a@b.c")
     assert await scheduler.send_digest() is False
 
 

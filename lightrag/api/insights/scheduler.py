@@ -13,7 +13,11 @@ from email.message import EmailMessage
 from email.utils import make_msgid
 from typing import Any, Callable, Optional
 
-from lightrag.api.provider_alerts import SmtpSettings, send_email_sync
+from lightrag.api.provider_alerts import (
+    ALERT_SUBJECT_TAG,
+    SmtpSettings,
+    send_email_sync,
+)
 from lightrag.usage import emit_event
 from lightrag.utils import get_env_value, logger
 
@@ -139,7 +143,7 @@ class InsightsScheduler:
         ]
         word = "anomaly" if len(fresh) == 1 else "anomalies"
         ok = await self._email(
-            f"[LightRAG] {len(fresh)} token usage {word} to review",
+            f"{ALERT_SUBJECT_TAG} {len(fresh)} token usage {word} to review",
             "Token usage looks unusual:\n\n" + "\n".join(lines),
         )
         if not ok:
@@ -167,7 +171,7 @@ class InsightsScheduler:
         if same_budget and state.get("threshold", 10**6) <= reached:
             return None
         ok = await self._email(
-            f"[LightRAG] Token budget runs out around {budget['runs_out']}",
+            f"{ALERT_SUBJECT_TAG} Token budget runs out around {budget['runs_out']}",
             f"At the current pace the budget runs out around {budget['runs_out']}, "
             f"in about {days} days. That counts usage on workspace (BYO) keys.\n\n"
             f"Without BYO usage it would last until "
@@ -198,7 +202,7 @@ class InsightsScheduler:
         if not await self.store.try_lease(f"digest:{week}", 3600):
             return False
         ok = await self._email(
-            f"[LightRAG] Weekly token usage, week {today.isocalendar()[1]}",
+            f"{ALERT_SUBJECT_TAG} Weekly token usage, week {today.isocalendar()[1]}",
             await self.digest_text(today),
         )
         if ok:
