@@ -59,6 +59,10 @@ from lightrag.api.routers.ollama_api import OllamaAPI
 from lightrag.api.routers.openai_api import create_openai_routes
 from lightrag.api.routers.apikey_routes import create_apikey_routes
 from lightrag.api.routers.admin_routes import create_admin_routes
+from lightrag.api.insights.middleware import UsageContextMiddleware
+from lightrag.api.insights.runtime import start_insights as _start_insights
+from lightrag.api.insights.runtime import stop_insights as _stop_insights
+from lightrag.api.routers.insights_routes import router as insights_router
 from lightrag.api.routers.email_routes import create_email_routes
 
 from lightrag.utils import logger, set_verbose_debug
@@ -504,6 +508,8 @@ def create_app(args):
             if registry is not None:
                 await registry.initialize()
 
+            await _start_insights(app, rag, args)
+
             resync_queue = getattr(app.state, "email_resync_queue", None)
             if resync_queue is not None:
                 await resync_queue.start()
@@ -549,6 +555,8 @@ def create_app(args):
             resync_queue = getattr(app.state, "email_resync_queue", None)
             if resync_queue is not None:
                 await resync_queue.stop()
+
+            await _stop_insights(app)
 
             registry = getattr(app.state, "workspace_registry", None)
             if registry is not None:
@@ -669,6 +677,7 @@ def create_app(args):
     )
     # Baseline security headers on every response (nosniff, framing, referrer).
     app.add_middleware(SecurityHeadersMiddleware)
+    app.add_middleware(UsageContextMiddleware)
 
     # Create combined auth dependency for all endpoints
     combined_auth = get_combined_auth_dependency(api_key)
@@ -1878,6 +1887,8 @@ def create_app(args):
         )
     )
     logger.info("Email ingestion routes enabled")
+
+    app.include_router(insights_router)
 
     # Admin routes for multi-tenancy management
     if args.enable_multi_tenancy:

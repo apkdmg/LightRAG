@@ -33,7 +33,7 @@ function NavigationTab({ value, currentTab, children }: NavigationTabProps) {
 
 function TabsNavigation() {
   const currentTab = useSettingsStore.use.currentTab()
-  const { isGuestMode } = useAuthStore()
+  const { isGuestMode, role } = useAuthStore()
   const { t } = useTranslation()
 
   return (
@@ -55,6 +55,12 @@ function TabsNavigation() {
         {!isGuestMode && (
           <NavigationTab value="providers" currentTab={currentTab}>
             {t('header.providers')}
+          </NavigationTab>
+        )}
+        {/* The server enforces the admin role on every Insights request. */}
+        {role === 'admin' && (
+          <NavigationTab value="insights" currentTab={currentTab}>
+            {t('header.insights')}
           </NavigationTab>
         )}
       </TabsList>

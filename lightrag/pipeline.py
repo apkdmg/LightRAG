@@ -46,6 +46,7 @@ from lightrag.exceptions import (
 )
 from lightrag.kg.shared_storage import get_namespace_data, get_namespace_lock
 from lightrag.operate import merge_nodes_and_edges
+from lightrag.usage import document_usage_fields, emit_event, run_in_usage_scope
 from lightrag.provider_rejection import (
     EXTRACT_ROLE,
     VISION_ROLE,
@@ -1647,10 +1648,15 @@ class _PipelineMixin:
                     status_doc=status_doc_w,
                     file_path=file_path_w,
                 )
-                analyzed = await self.analyze_multimodal(
-                    doc_id=doc_id_w,
-                    file_path=file_path_w,
-                    parsed_data=parsed_data_w,
+                analyzed = await run_in_usage_scope(
+                    self.analyze_multimodal(
+                        doc_id=doc_id_w,
+                        file_path=file_path_w,
+                        parsed_data=parsed_data_w,
+                    ),
+                    **document_usage_fields(
+                        doc_id_w, getattr(status_doc_w, "track_id", None)
+                    ),
                 )
                 await ctx.q_process.put((doc_id_w, status_doc_w, analyzed))
             except Exception as e:
@@ -1682,11 +1688,16 @@ class _PipelineMixin:
             item = await ctx.q_process.get()
             try:
                 doc_id_w, status_doc_w, parsed_data_w = item
-                await self.process_single_document(
-                    doc_id=doc_id_w,
-                    status_doc=status_doc_w,
-                    parsed_data=parsed_data_w,
-                    ctx=ctx,
+                await run_in_usage_scope(
+                    self.process_single_document(
+                        doc_id=doc_id_w,
+                        status_doc=status_doc_w,
+                        parsed_data=parsed_data_w,
+                        ctx=ctx,
+                    ),
+                    **document_usage_fields(
+                        doc_id_w, getattr(status_doc_w, "track_id", None)
+                    ),
                 )
             finally:
                 ctx.q_process.task_done()
@@ -2446,6 +2457,7 @@ class _PipelineMixin:
                 ctx.pipeline_status["history_messages"].append(log_message)
         if pause:
             logger.info(log_message)
+            emit_event("ingestion_resumed", workspace=self.workspace)
 
     async def _pause_for_provider_rejection(
         self,
@@ -2679,9 +2691,9 @@ class _PipelineMixin:
             parsed_dir = parsed_artifact_dir_for(document_name, parent_hint=p.parent)
             asset_dir = parsed_dir / f"{base_name}.blocks.assets"
 
-            def _extract_blocks_sync() -> tuple[
-                list[dict[str, Any]], dict[str, Any], dict[str, Any]
-            ]:
+            def _extract_blocks_sync() -> (
+                tuple[list[dict[str, Any]], dict[str, Any], dict[str, Any]]
+            ):
                 # Pre-clean parsed_dir and pre-create the asset dir so the
                 # drawing extractor can write image bytes BEFORE write_sidecar
                 # runs (which is then called with clean_parsed_dir=False to
@@ -4411,11 +4423,19 @@ class _PipelineMixin:
                     valid_keys.append(item_id)
                     if kind == "drawing":
                         analyze_tasks.append(
-                            _analyze_drawing(item_id, item, sidecar_path.parent)
+                            run_in_usage_scope(
+                                _analyze_drawing(item_id, item, sidecar_path.parent),
+                                purpose="vlm",
+                                operation="document_image",
+                            )
                         )
                     else:
                         analyze_tasks.append(
-                            _analyze_text_modality(kind, item_id, item)
+                            run_in_usage_scope(
+                                _analyze_text_modality(kind, item_id, item),
+                                purpose="extract",
+                                operation=f"{kind}_analysis",
+                            )
                         )
 
                 analyzed = await asyncio.gather(*analyze_tasks, return_exceptions=True)

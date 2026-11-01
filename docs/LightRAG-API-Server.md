@@ -544,6 +544,10 @@ You cannot change storage implementation selection after adding documents to Lig
 
 When switching the storage implementation in LightRAG, the LLM cache can be migrated from the existing storage to the new one. Subsequently, when re-uploading files to the new storage, the pre-existing LLM cache will significantly accelerate file processing. For detailed instructions on using the LLM cache migration tool, please refer to [README_MIGRATE_LLM_CACHE.md](../lightrag/tools/README_MIGRATE_LLM_CACHE.md)
 
+### Token Usage Dashboard
+
+Admins can see LLM usage, cost, anomalies and a budget forecast in the WebUI's Insights tab. It needs PostgreSQL KV storage. See [Token Insights](./TOKEN_INSIGHTS.md).
+
 ### LightRAG API Server Command Line Options
 
 | Parameter             | Default       | Description                                                                                                                     |

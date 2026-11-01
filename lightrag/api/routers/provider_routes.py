@@ -31,6 +31,7 @@ import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, SecretStr
 
+from lightrag.usage import emit_event
 from lightrag.api.dependencies import (
     UserInfo,
     get_current_user,
@@ -312,6 +313,8 @@ def create_provider_routes(api_key: Optional[str] = None) -> APIRouter:
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(e)
             )
 
+        for slot in provided:
+            emit_event("byo_change", workspace=workspace, slot=slot)
         await workspace_manager.invalidate(workspace)
         await _resume_paused_ingestion(workspace_manager, workspace)
         logger.info(
@@ -337,6 +340,7 @@ def create_provider_routes(api_key: Optional[str] = None) -> APIRouter:
         store = _get_store(request)
         removed = store.delete(workspace, which=slot)
         await workspace_manager.invalidate(workspace)
+        emit_event("byo_change", workspace=workspace, slot=slot)
         await _resume_paused_ingestion(workspace_manager, workspace)
         logger.info(
             f"Provider config slot '{slot}' cleared for workspace '{workspace}' "

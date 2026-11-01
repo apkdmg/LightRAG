@@ -132,6 +132,7 @@ from lightrag.utils import (
 from lightrag.types import KnowledgeGraph
 from dotenv import load_dotenv
 from lightrag.pipeline import _PipelineMixin
+from lightrag.usage import emit_event, run_in_usage_scope
 from lightrag.kg.factory import get_storage_class
 from lightrag.addon_params import (
     ObservableAddonParams,
@@ -1889,17 +1890,20 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
 
         if data_param.mode in ["local", "global", "hybrid", "mix"]:
             logger.debug(f"[aquery_data] Using kg_query for mode: {data_param.mode}")
-            query_result = await kg_query(
-                query.strip(),
-                self.chunk_entity_relation_graph,
-                self.entities_vdb,
-                self.relationships_vdb,
-                self.text_chunks,
-                data_param,  # Use data_param with only_need_context=True
-                global_config,
-                hashing_kv=self.llm_response_cache,
-                system_prompt=None,
-                chunks_vdb=self.chunks_vdb,
+            query_result = await run_in_usage_scope(
+                kg_query(
+                    query.strip(),
+                    self.chunk_entity_relation_graph,
+                    self.entities_vdb,
+                    self.relationships_vdb,
+                    self.text_chunks,
+                    data_param,  # Use data_param with only_need_context=True
+                    global_config,
+                    hashing_kv=self.llm_response_cache,
+                    system_prompt=None,
+                    chunks_vdb=self.chunks_vdb,
+                ),
+                operation="retrieval",
             )
         elif data_param.mode == "naive":
             logger.debug(f"[aquery_data] Using naive_query for mode: {data_param.mode}")
@@ -1986,26 +1990,32 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
             query_result = None
 
             if param.mode in ["local", "global", "hybrid", "mix"]:
-                query_result = await kg_query(
-                    query.strip(),
-                    self.chunk_entity_relation_graph,
-                    self.entities_vdb,
-                    self.relationships_vdb,
-                    self.text_chunks,
-                    param,
-                    global_config,
-                    hashing_kv=self.llm_response_cache,
-                    system_prompt=system_prompt,
-                    chunks_vdb=self.chunks_vdb,
+                query_result = await run_in_usage_scope(
+                    kg_query(
+                        query.strip(),
+                        self.chunk_entity_relation_graph,
+                        self.entities_vdb,
+                        self.relationships_vdb,
+                        self.text_chunks,
+                        param,
+                        global_config,
+                        hashing_kv=self.llm_response_cache,
+                        system_prompt=system_prompt,
+                        chunks_vdb=self.chunks_vdb,
+                    ),
+                    default_operation=param.mode,
                 )
             elif param.mode == "naive":
-                query_result = await naive_query(
-                    query.strip(),
-                    self.chunks_vdb,
-                    param,
-                    global_config,
-                    hashing_kv=self.llm_response_cache,
-                    system_prompt=system_prompt,
+                query_result = await run_in_usage_scope(
+                    naive_query(
+                        query.strip(),
+                        self.chunks_vdb,
+                        param,
+                        global_config,
+                        hashing_kv=self.llm_response_cache,
+                        system_prompt=system_prompt,
+                    ),
+                    default_operation="naive",
                 )
             elif param.mode == "bypass":
                 # Bypass mode: directly use LLM without knowledge retrieval
@@ -2018,12 +2028,15 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
                 use_llm_func = partial(use_llm_func, _priority=8)
 
                 param.stream = True if param.stream is None else param.stream
-                response = await use_llm_func(
-                    query.strip(),
-                    system_prompt=system_prompt,
-                    history_messages=param.conversation_history,
-                    enable_cot=True,
-                    stream=param.stream,
+                response = await run_in_usage_scope(
+                    use_llm_func(
+                        query.strip(),
+                        system_prompt=system_prompt,
+                        history_messages=param.conversation_history,
+                        enable_cot=True,
+                        stream=param.stream,
+                    ),
+                    default_operation="bypass",
                 )
                 if type(response) is str:
                     return {
@@ -2215,6 +2228,7 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
             success = await self.llm_response_cache.drop()
             if success:
                 logger.info("Cleared all cache")
+                emit_event("cache_cleared", workspace=self.workspace)
             else:
                 logger.warning("Failed to clear all cache")
 
@@ -2682,19 +2696,23 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
         # ---- 7. Rebuild entities/relations that still have remaining sources ----
         if entities_to_rebuild or relationships_to_rebuild:
             try:
-                await rebuild_knowledge_from_chunks(
-                    entities_to_rebuild=entities_to_rebuild,
-                    relationships_to_rebuild=relationships_to_rebuild,
-                    knowledge_graph_inst=self.chunk_entity_relation_graph,
-                    entities_vdb=self.entities_vdb,
-                    relationships_vdb=self.relationships_vdb,
-                    text_chunks_storage=self.text_chunks,
-                    llm_response_cache=self.llm_response_cache,
-                    global_config=self._build_global_config(),
-                    pipeline_status=pipeline_status,
-                    pipeline_status_lock=pipeline_status_lock,
-                    entity_chunks_storage=self.entity_chunks,
-                    relation_chunks_storage=self.relation_chunks,
+                await run_in_usage_scope(
+                    rebuild_knowledge_from_chunks(
+                        entities_to_rebuild=entities_to_rebuild,
+                        relationships_to_rebuild=relationships_to_rebuild,
+                        knowledge_graph_inst=self.chunk_entity_relation_graph,
+                        entities_vdb=self.entities_vdb,
+                        relationships_vdb=self.relationships_vdb,
+                        text_chunks_storage=self.text_chunks,
+                        llm_response_cache=self.llm_response_cache,
+                        global_config=self._build_global_config(),
+                        pipeline_status=pipeline_status,
+                        pipeline_status_lock=pipeline_status_lock,
+                        entity_chunks_storage=self.entity_chunks,
+                        relation_chunks_storage=self.relation_chunks,
+                    ),
+                    operation="rebuild",
+                    purpose="extract",
                 )
             except Exception as e:
                 logger.error(f"[purge] Failed to rebuild knowledge from chunks: {e}")
@@ -3439,19 +3457,23 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
             if entities_to_rebuild or relationships_to_rebuild:
                 try:
                     deletion_stage = "rebuild_knowledge_graph"
-                    await rebuild_knowledge_from_chunks(
-                        entities_to_rebuild=entities_to_rebuild,
-                        relationships_to_rebuild=relationships_to_rebuild,
-                        knowledge_graph_inst=self.chunk_entity_relation_graph,
-                        entities_vdb=self.entities_vdb,
-                        relationships_vdb=self.relationships_vdb,
-                        text_chunks_storage=self.text_chunks,
-                        llm_response_cache=self.llm_response_cache,
-                        global_config=self._build_global_config(),
-                        pipeline_status=pipeline_status,
-                        pipeline_status_lock=pipeline_status_lock,
-                        entity_chunks_storage=self.entity_chunks,
-                        relation_chunks_storage=self.relation_chunks,
+                    await run_in_usage_scope(
+                        rebuild_knowledge_from_chunks(
+                            entities_to_rebuild=entities_to_rebuild,
+                            relationships_to_rebuild=relationships_to_rebuild,
+                            knowledge_graph_inst=self.chunk_entity_relation_graph,
+                            entities_vdb=self.entities_vdb,
+                            relationships_vdb=self.relationships_vdb,
+                            text_chunks_storage=self.text_chunks,
+                            llm_response_cache=self.llm_response_cache,
+                            global_config=self._build_global_config(),
+                            pipeline_status=pipeline_status,
+                            pipeline_status_lock=pipeline_status_lock,
+                            entity_chunks_storage=self.entity_chunks,
+                            relation_chunks_storage=self.relation_chunks,
+                        ),
+                        operation="rebuild",
+                        purpose="extract",
                     )
 
                 except Exception as e:

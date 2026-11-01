@@ -34,6 +34,7 @@ from typing import (
 import numpy as np
 from dotenv import load_dotenv
 
+from lightrag.usage import emit_cache_hit
 from lightrag.constants import (
     DEFAULT_LOG_MAX_BYTES,
     DEFAULT_LOG_BACKUP_COUNT,
@@ -1941,6 +1942,7 @@ async def handle_cache(
     cache_entry = await hashing_kv.get_by_id(flattened_key)
     if cache_entry:
         logger.debug(f"Flattened cache hit(key:{flattened_key})")
+        emit_cache_hit(cache_type, getattr(hashing_kv, "workspace", None))
         content = cache_entry["return"]
         timestamp = cache_entry.get("create_time", 0)
         return content, timestamp

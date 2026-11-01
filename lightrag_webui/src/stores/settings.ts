@@ -6,7 +6,7 @@ import { Message, QueryRequest } from '@/api/lightrag'
 
 type Theme = 'dark' | 'light' | 'system'
 type Language = 'en' | 'zh' | 'fr' | 'ar' | 'zh_TW' | 'ru' | 'ja' | 'de' | 'uk' | 'ko' | 'vi'
-type Tab = 'documents' | 'knowledge-graph' | 'retrieval' | 'api' | 'providers'
+type Tab = 'documents' | 'knowledge-graph' | 'retrieval' | 'api' | 'providers' | 'insights'
 
 // The shared API key is kept in sessionStorage only: it is never written to
 // localStorage, so it does not outlive the browser tab and is not left behind

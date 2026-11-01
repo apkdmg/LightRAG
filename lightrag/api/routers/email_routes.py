@@ -61,6 +61,7 @@ from lightrag.provider_rejection import (
     classify_provider_rejection,
     emit_provider_rejection,
 )
+from lightrag.usage import VISION_PURPOSE, run_in_usage_scope
 from lightrag.utils import (
     CacheData,
     _serialize_cache_variant,
@@ -1032,7 +1033,13 @@ Attachments ({len(all_attachments)} files):
         # Describe the image; skip the component entirely if there's no genuine
         # description (no vision model / transient failure) so we never ingest a
         # "Vision processing failed" placeholder as knowledge-graph content.
-        result = await self._describe_image(image)
+        result = await run_in_usage_scope(
+            self._describe_image(image),
+            workspace=getattr(self.rag, "workspace", None),
+            purpose=VISION_PURPOSE,
+            operation="email_inline",
+            source="email",
+        )
         if not result.ok:
             logger.info(
                 f"Skipping inline image {image.filename}: "
@@ -1217,7 +1224,13 @@ Content:
 
         # Handle images
         if content_type.startswith("image/"):
-            return await self._describe_image(attachment)
+            return await run_in_usage_scope(
+                self._describe_image(attachment),
+                workspace=getattr(self.rag, "workspace", None),
+                purpose=VISION_PURPOSE,
+                operation="email_attachment",
+                source="email",
+            )
 
         # Handle PDFs
         if content_type == "application/pdf":

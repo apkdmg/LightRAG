@@ -14,9 +14,11 @@ if not pm.is_installed("openai"):
 
 from openai import (
     APIConnectionError,
+    BadRequestError,
     RateLimitError,
     APITimeoutError,
 )
+from lightrag.usage import provider_usage_fields
 from tenacity import (
     retry,
     stop_after_attempt,
@@ -402,6 +404,12 @@ async def openai_complete_if_cache(
         kwargs["stream"] = stream
     if timeout is not None:
         kwargs["timeout"] = timeout
+    # Streaming answers only report usage when asked to.
+    asked_for_stream_usage = bool(
+        kwargs.get("stream") and token_tracker and "stream_options" not in kwargs
+    )
+    if asked_for_stream_usage:
+        kwargs["stream_options"] = {"include_usage": True}
 
     # Determine the correct model identifier to use
     # For Azure OpenAI, we must use the deployment name instead of the model name
@@ -413,9 +421,20 @@ async def openai_complete_if_cache(
         # above. Length-truncation is detected via finish_reason below and the
         # raw content is returned unchanged so upstream tolerant JSON parsing
         # can still salvage it.
-        response = await openai_async_client.chat.completions.create(
-            model=api_model, messages=messages, **kwargs
-        )
+        try:
+            response = await openai_async_client.chat.completions.create(
+                model=api_model, messages=messages, **kwargs
+            )
+        except BadRequestError as e:
+            # Not every OpenAI-compatible provider accepts stream_options. The
+            # answer matters more: go without, and the usage gets estimated.
+            if not (asked_for_stream_usage and "stream_options" in str(e)):
+                raise
+            logger.info(f"Provider rejected stream_options for {api_model}: {e}")
+            kwargs.pop("stream_options")
+            response = await openai_async_client.chat.completions.create(
+                model=api_model, messages=messages, **kwargs
+            )
     except APITimeoutError as e:
         logger.error(f"OpenAI API Timeout Error: {e}")
         try:
@@ -464,6 +483,7 @@ async def openai_complete_if_cache(
             # Track if we've started iterating
             iteration_started = False
             final_chunk_usage = None
+            final_finish_reason = None
 
             # COT (Chain of Thought) state tracking
             cot_active = False
@@ -487,6 +507,11 @@ async def openai_complete_if_cache(
                             f"Received chunk without choices (likely Azure content filter): {chunk}"
                         )
                         continue
+
+                    final_finish_reason = (
+                        getattr(chunk.choices[0], "finish_reason", None)
+                        or final_finish_reason
+                    )
 
                     # Check if delta exists
                     if not hasattr(chunk.choices[0], "delta"):
@@ -558,6 +583,8 @@ async def openai_complete_if_cache(
                             final_chunk_usage, "completion_tokens", 0
                         ),
                         "total_tokens": getattr(final_chunk_usage, "total_tokens", 0),
+                        "finish_reason": final_finish_reason,
+                        **provider_usage_fields(final_chunk_usage),
                     }
                     token_tracker.add_usage(token_counts)
                     logger.debug(f"Streaming token usage (from API): {token_counts}")
@@ -720,6 +747,10 @@ async def openai_complete_if_cache(
                         response.usage, "completion_tokens", 0
                     ),
                     "total_tokens": getattr(response.usage, "total_tokens", 0),
+                    "finish_reason": getattr(
+                        response.choices[0], "finish_reason", None
+                    ),
+                    **provider_usage_fields(response.usage),
                 }
                 token_tracker.add_usage(token_counts)
 

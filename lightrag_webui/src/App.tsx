@@ -1,4 +1,4 @@
-import { useState, useCallback, useEffect, useRef } from 'react'
+import { lazy, Suspense, useState, useCallback, useEffect, useRef } from 'react'
 import ThemeProvider from '@/components/ThemeProvider'
 import TabVisibilityProvider from '@/contexts/TabVisibilityProvider'
 import ApiKeyAlert from '@/components/ApiKeyAlert'
@@ -19,10 +19,14 @@ import ProviderSettings from '@/features/ProviderSettings'
 
 import { Tabs, TabsContent } from '@/components/ui/Tabs'
 
+// Charts and animation libraries load only when an admin opens the tab.
+const TokenInsights = lazy(() => import('@/features/TokenInsights'))
+
 function App() {
   const message = useBackendState.use.message()
   const enableHealthCheck = useSettingsStore.use.enableHealthCheck()
   const currentTab = useSettingsStore.use.currentTab()
+  const isAdmin = useAuthStore((state) => state.role === 'admin')
   const [apiKeyAlertOpen, setApiKeyAlertOpen] = useState(false)
   const [initializing, setInitializing] = useState(true) // Add initializing state
   const versionCheckRef = useRef(false); // Prevent duplicate calls in Vite dev mode
@@ -152,6 +156,20 @@ function App() {
     checkVersion();
   }, []); // Empty dependency array ensures it only runs once on mount
 
+  // Links from alert emails open the Insights tab directly.
+  useEffect(() => {
+    if (isAdmin && window.location.hash.includes('insights=1')) {
+      useSettingsStore.getState().setCurrentTab('insights')
+    }
+  }, [isAdmin])
+
+  // The remembered tab may belong to an admin who has logged out on this browser.
+  useEffect(() => {
+    if (currentTab === 'insights' && !isAdmin) {
+      useSettingsStore.getState().setCurrentTab('documents')
+    }
+  }, [currentTab, isAdmin])
+
   const handleTabChange = useCallback(
     (tab: string) => useSettingsStore.getState().setCurrentTab(tab as any),
     []
@@ -224,6 +242,15 @@ function App() {
                 <TabsContent value="providers" className="absolute top-0 right-0 bottom-0 left-0 overflow-auto">
                   <ProviderSettings />
                 </TabsContent>
+                {isAdmin && (
+                  <TabsContent value="insights" className="absolute top-0 right-0 bottom-0 left-0 overflow-hidden">
+                    {currentTab === 'insights' && (
+                      <Suspense fallback={null}>
+                        <TokenInsights />
+                      </Suspense>
+                    )}
+                  </TabsContent>
+                )}
               </div>
             </Tabs>
             {enableHealthCheck && <StatusIndicator />}

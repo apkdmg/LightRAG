@@ -31,6 +31,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
+from lightrag.usage import emit_event
 from lightrag.api.config import validate_tenant_isolation_configuration
 from lightrag.api.workspace_manager import WorkspaceManager
 from lightrag.api.workspace_registry import WorkspaceRegistry
@@ -216,6 +217,8 @@ async def purge_workspace(
 
     if result.ok:
         logger.warning(f"Workspace '{workspace_id}' and all its data deleted")
+        # Usage totals stay, under a short hash and without the name.
+        emit_event("workspace_deleted", workspace=workspace_id)
     else:
         logger.error(
             f"Deleting workspace '{workspace_id}' failed: {'; '.join(result.errors)}"

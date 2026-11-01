@@ -57,6 +57,7 @@ from lightrag.base import (
 )
 from lightrag.chunk_schema import strip_internal_multimodal_markup_for_extraction
 from lightrag.prompt import PROMPTS, resolve_entity_extraction_prompt_profile
+from lightrag.usage import run_in_usage_scope
 from lightrag.constants import (
     GRAPH_FIELD_SEP,
     DEFAULT_MAX_ENTITY_TOKENS,
@@ -432,12 +433,15 @@ async def _summarize_descriptions(
     use_prompt = prompt_template.format(**context_base)
 
     # Use LLM function with cache (higher priority for summary generation)
-    summary, _ = await use_llm_func_with_cache(
-        use_prompt,
-        use_llm_func,
-        llm_response_cache=llm_response_cache,
-        cache_type="summary",
-        llm_cache_identity=get_llm_cache_identity(global_config, "extract"),
+    summary, _ = await run_in_usage_scope(
+        use_llm_func_with_cache(
+            use_prompt,
+            use_llm_func,
+            llm_response_cache=llm_response_cache,
+            cache_type="summary",
+            llm_cache_identity=get_llm_cache_identity(global_config, "extract"),
+        ),
+        default_operation="summary",
     )
 
     # Check summary token length against embedding limit
@@ -3425,16 +3429,21 @@ async def extract_entities(
                 "entity_continue_extraction_user_prompt"
             ].format(**{**context_base, "input_text": content})
 
-        final_result, timestamp = await use_llm_func_with_cache(
-            entity_extraction_user_prompt,
-            use_llm_func,
-            system_prompt=entity_extraction_system_prompt,
-            llm_response_cache=llm_response_cache,
-            cache_type="extract",
-            chunk_id=chunk_key,
-            cache_keys_collector=cache_keys_collector,
-            response_format=({"type": "json_object"} if use_json_extraction else None),
-            llm_cache_identity=get_llm_cache_identity(global_config, "extract"),
+        final_result, timestamp = await run_in_usage_scope(
+            use_llm_func_with_cache(
+                entity_extraction_user_prompt,
+                use_llm_func,
+                system_prompt=entity_extraction_system_prompt,
+                llm_response_cache=llm_response_cache,
+                cache_type="extract",
+                chunk_id=chunk_key,
+                cache_keys_collector=cache_keys_collector,
+                response_format=(
+                    {"type": "json_object"} if use_json_extraction else None
+                ),
+                llm_cache_identity=get_llm_cache_identity(global_config, "extract"),
+            ),
+            operation="extraction",
         )
 
         history = pack_user_ass_to_openai_messages(
@@ -3490,19 +3499,22 @@ async def extract_entities(
                 run_gleaning = False
 
         if run_gleaning:
-            glean_result, timestamp = await use_llm_func_with_cache(
-                entity_continue_extraction_user_prompt,
-                use_llm_func,
-                system_prompt=entity_extraction_system_prompt,
-                llm_response_cache=llm_response_cache,
-                history_messages=history,
-                cache_type="extract",
-                chunk_id=chunk_key,
-                cache_keys_collector=cache_keys_collector,
-                response_format=(
-                    {"type": "json_object"} if use_json_extraction else None
+            glean_result, timestamp = await run_in_usage_scope(
+                use_llm_func_with_cache(
+                    entity_continue_extraction_user_prompt,
+                    use_llm_func,
+                    system_prompt=entity_extraction_system_prompt,
+                    llm_response_cache=llm_response_cache,
+                    history_messages=history,
+                    cache_type="extract",
+                    chunk_id=chunk_key,
+                    cache_keys_collector=cache_keys_collector,
+                    response_format=(
+                        {"type": "json_object"} if use_json_extraction else None
+                    ),
+                    llm_cache_identity=get_llm_cache_identity(global_config, "extract"),
                 ),
-                llm_cache_identity=get_llm_cache_identity(global_config, "extract"),
+                operation="gleaning",
             )
 
             # Process gleaning result with appropriate parser

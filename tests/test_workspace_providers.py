@@ -196,6 +196,7 @@ def test_legacy_llm_config_migrates(tmp_path):
 class _FakeRag:
     def __init__(self, default_opts=None):
         self.calls = []
+        self.metadata = {}
         self._default_opts = default_opts or {}
 
     def get_llm_role_config(self, role=None):
@@ -208,6 +209,9 @@ class _FakeRag:
 
     async def aupdate_llm_role_config(self, role, **kwargs):
         self.calls.append((role, kwargs))
+
+    def set_role_llm_metadata(self, role, **metadata):
+        self.metadata[role] = metadata
 
 
 async def test_apply_maps_slots_to_roles(tmp_path):
@@ -230,6 +234,8 @@ async def test_apply_maps_slots_to_roles(tmp_path):
     }
     # vision → vlm
     assert by_role["vlm"]["model"] == "gemini-2.0-flash"
+    # usage on these roles is reported as billed to the owner's key
+    assert rag.metadata["vlm"] == {"billing": "byo"}
 
 
 async def test_apply_partial_leaves_other_roles_default(tmp_path):
