@@ -10,6 +10,8 @@ group:
 - ``query``      → applied to the ``query`` role (answer generation; a reasoning
   model is usually preferred).
 - ``vision``     → applied to the ``vlm`` role (image/infographic description).
+  Email images are the exception: they always use the system key (see
+  ``_system_vision_func`` in ``routers/email_routes.py``).
 
 When a slot has no override, the system default applies — that fallback is
 handled by the role-config resolution in ``lightrag_server.py``; this module

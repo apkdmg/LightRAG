@@ -236,10 +236,14 @@ carries a placeholder instead of extracted text — ingestion does not fail.
 Inline images — and any `image/*` attachment — are passed to a vision model so
 that their visual content (charts, diagrams, embedded text) becomes searchable.
 
-The vision model is wired in **only when `VLM_PROCESS_ENABLE=true`**. The email
-router receives a vision function backed by the native `vlm` LLM role; when the
-master switch is off, no vision function is supplied and images fall back to a
-plain placeholder (`"[Image: <filename> ... No vision model available ...]"`).
+The vision model is wired in **only when `VLM_PROCESS_ENABLE=true`**. When the
+master switch is off, images are skipped: they get no document of their own and
+appear only in the master document's attachment list.
+
+Email images always use the system's `VLM_LLM_*` settings and API key, including
+in workspaces where the owner has set their own Vision provider. Their calls run
+under the server's `vlm` role queue, so `VLM_MAX_ASYNC_LLM` limits them across
+all workspaces.
 
 To enable inline-image description, configure the VLM in your `.env`:
 
@@ -251,16 +255,29 @@ VLM_LLM_BINDING=openai
 VLM_LLM_MODEL=your_vlm_model
 VLM_LLM_BINDING_HOST=https://api.example.com/v1
 VLM_LLM_BINDING_API_KEY=your_vlm_api_key
-# Optional: per-role concurrency / timeout / image-size cap
+# Optional: per-role concurrency / timeout / image-size limits
 # VLM_MAX_ASYNC_LLM=4
 # VLM_LLM_TIMEOUT=180
 # VLM_MAX_IMAGE_BYTES=5242880
+# VLM_MIN_IMAGE_PIXEL=32
 ```
 
 If `VLM_LLM_*` is left unset, the `vlm` role falls back to the base `LLM_*`
 configuration, which must itself be vision-capable. If a vision call fails at
-runtime, the image is still ingested with a "Vision processing failed"
-placeholder — one bad image never aborts the bundle.
+runtime, that image is skipped — one bad image never aborts the bundle.
+
+Two things keep image costs down, as they do for images in uploaded documents:
+
+- **Size limits.** An image larger than `VLM_MAX_IMAGE_BYTES`, or with a side
+  shorter than `VLM_MIN_IMAGE_PIXEL` (tracking pixels, small icons), is skipped
+  without calling the model.
+- **Cached descriptions.** Each description is stored in the workspace's LLM
+  cache as a `default:analysis:*` entry, keyed on the image bytes, the prompt and
+  the model. Re-syncing an email, or receiving the same image in another email,
+  reuses it, so the document text stays the same and entity extraction hits its
+  cache too. `ENABLE_LLM_CACHE_FOR_EXTRACT` turns this on and off. Entries stay
+  until the LLM cache is cleared or the workspace is deleted: deleting a document
+  with `delete_llm_cache` does not remove them.
 
 ### Size limit
 
@@ -398,7 +415,8 @@ curl "http://localhost:9621/documents/email/supported-formats" \
 | Attachment ingested but its document only shows `[Spreadsheet: ...]` or `[Attachment: ...]` | The attachment type is **metadata-only** (Excel, other binary formats) — by design no text is extracted | Convert the file to a supported text format (CSV, PDF, DOCX) before sending, or accept metadata-only indexing |
 | Attachment document shows `PyMuPDF not installed` / `python-docx not installed` | The optional PDF/DOCX extraction package is missing on the server | Install the dependency (`PyMuPDF` for PDF, `python-docx` for DOCX) and re-ingest |
 | `200` returned but final counts (in `track_status`) show fewer documents than expected — partial failure | One or more attachments / inline images failed during background processing | Per-part failures are caught and logged (search server logs for the `track_id`); the rest of the bundle is still ingested. Fix the offending file and re-ingest the email |
-| Inline images appear in the graph only as `[Image: ... No vision model available ...]` | `VLM_PROCESS_ENABLE` is `false`, so no vision function was wired into the email router | Set `VLM_PROCESS_ENABLE=true` and configure `VLM_LLM_*` with a vision-capable binding, then restart the server |
+| Inline images have no document of their own | `VLM_PROCESS_ENABLE` is `false`, so images are not sent to a vision model | Set `VLM_PROCESS_ENABLE=true` and configure `VLM_LLM_*` with a vision-capable binding, then restart the server |
+| One image has no document, but others in the email do | It is outside the size limits, or its vision call failed | Search the server logs for `Skipping inline image` or `Skipping attachment`. Raise `VLM_MAX_IMAGE_BYTES` or lower `VLM_MIN_IMAGE_PIXEL` if needed, then re-ingest the email |
 | Server refuses to start: VLM binding does not support image inputs | `VLM_PROCESS_ENABLE=true` but the effective VLM binding is `lollms` (or otherwise not vision-capable) | Set `VLM_LLM_BINDING` (or `LLM_BINDING`) to one of `openai`, `azure_openai`, `gemini`, `bedrock`, `ollama` |
 | `400` — *Must provide either 'email_file' or 'metadata'* | The request supplied neither an `.eml` file nor a `metadata` JSON string | Send `email_file` (Mode 1) or `metadata` (Mode 2) |
 | `400` — *Invalid metadata JSON* | The `metadata` form field is not valid JSON, or is missing the required `from` field | Fix the JSON; ensure `from` is present (see the `EmailMetadata` schema) |

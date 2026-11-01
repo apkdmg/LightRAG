@@ -48,14 +48,29 @@ from pydantic import BaseModel, Field
 
 from lightrag.api.dependencies import resolve_workspace_from_request
 from lightrag.api.utils_api import get_combined_auth_dependency
+from lightrag.constants import DEFAULT_MM_ANALYSIS_PRIORITY, DEFAULT_MM_IMAGE_MIN_PIXEL
 from lightrag.exceptions import EnqueueRefusedError
+from lightrag.llm._vision_utils import (
+    image_audit_metadata,
+    image_cache_metadata,
+    normalize_image_inputs,
+)
 from lightrag.provider_rejection import (
     VISION_ROLE,
     ProviderRejectionEvent,
     classify_provider_rejection,
     emit_provider_rejection,
 )
-from lightrag.utils import generate_track_id
+from lightrag.utils import (
+    CacheData,
+    _serialize_cache_variant,
+    compute_args_hash,
+    generate_track_id,
+    get_env_value,
+    handle_cache,
+    save_to_cache,
+    serialize_llm_cache_identity,
+)
 
 logger = logging.getLogger("lightrag.api.email")
 
@@ -97,6 +112,18 @@ class ExtractionResult:
     @property
     def ok(self) -> bool:
         return self.status == "ok" and bool(self.text and self.text.strip())
+
+
+def _vlm_image_limits() -> Tuple[int, int]:
+    """Return ``(max_bytes, min_side_pixels)`` for images sent to the vision model.
+
+    The settings, defaults and floors document images use in the multimodal
+    analysis in ``lightrag/pipeline.py``.
+    """
+    return (
+        max(256 * 1024, get_env_value("VLM_MAX_IMAGE_BYTES", 5 * 1024 * 1024, int)),
+        max(1, get_env_value("VLM_MIN_IMAGE_PIXEL", DEFAULT_MM_IMAGE_MIN_PIXEL, int)),
+    )
 
 
 _SLUG_RE = re.compile(r"[^A-Za-z0-9._-]")
@@ -682,6 +709,7 @@ class EmailIngestionService:
         rag_instance: Any,
         vision_model_func: Optional[Any] = None,
         resync_queue: Optional[Any] = None,
+        vision_cache_identity: Optional[Dict[str, Any]] = None,
     ):
         """
         Initialize the email ingestion service.
@@ -691,10 +719,13 @@ class EmailIngestionService:
             vision_model_func: Optional vision model for image description.
             resync_queue: Optional ``DeferredResyncQueue``; re-syncs that find
                 the pipeline busy are queued there instead of being dropped.
+            vision_cache_identity: Non-secret identity of the model behind
+                ``vision_model_func``; a new model describes images afresh.
         """
         self.rag = rag_instance
         self.vision_model_func = vision_model_func
         self.resync_queue = resync_queue
+        self.vision_cache_identity = vision_cache_identity
 
     async def ingest_email(
         self,
@@ -1068,28 +1099,69 @@ Content:
     async def _describe_image(self, image: ParsedAttachment) -> ExtractionResult:
         """Describe an image via the vision model. Returns a gated result.
 
-        No-model / empty / error cases return non-ok so the caller skips the
-        component instead of ingesting a placeholder.
+        The one place email images reach the vision model. Images outside the
+        size limits are not sent, and a description is reused while the image
+        bytes and the model stay the same, so a re-sync pays for no image twice
+        and the component's text stays stable.
+
+        No-model / size-limited / empty / error cases return non-ok so the
+        caller skips the component instead of ingesting a placeholder.
         """
         if self.vision_model_func is None:
             return ExtractionResult(None, "no_extractor", "no vision model")
+        if not image.content:
+            return ExtractionResult(None, "empty", "empty image")
+
+        max_image_bytes, min_image_pixel = _vlm_image_limits()
+        if len(image.content) > max_image_bytes:
+            return ExtractionResult(None, "unsupported", "image too large")
+
+        image_b64 = base64.b64encode(image.content).decode("utf-8")
+        normalized = normalize_image_inputs(
+            [{"base64": image_b64, "source_file": image.filename, "modality": "image"}]
+        )
+        # Like document images, an image whose size can't be read is still sent.
+        width, height = normalized[0].width, normalized[0].height
+        if width is not None and min(width, height) < min_image_pixel:
+            return ExtractionResult(None, "unsupported", "image too small")
+
+        prompt = (
+            "Describe this image in detail. Include any text, charts, graphs, "
+            "diagrams, or important visual elements. If it contains data, "
+            "summarize the key information."
+        )
+        # No filename in the key: the same logo in another email is the same image.
+        args_hash = compute_args_hash(
+            prompt,
+            serialize_llm_cache_identity(self.vision_cache_identity),
+            _serialize_cache_variant(image_cache_metadata(normalized)),
+            "email_image",
+        )
+
+        # A cache problem may cost a vision call, but never the image.
+        try:
+            cached = await handle_cache(
+                self.rag.llm_response_cache,
+                args_hash,
+                prompt,
+                mode="default",
+                cache_type="analysis",
+            )
+        except Exception as e:
+            logger.warning(f"Image cache read failed for {image.filename}: {e}")
+            cached = None
+        if cached is not None:
+            return ExtractionResult(cached[0], "ok")
 
         try:
-            image_b64 = base64.b64encode(image.content).decode("utf-8")
-            prompt = (
-                "Describe this image in detail. Include any text, charts, graphs, "
-                "diagrams, or important visual elements. If it contains data, "
-                "summarize the key information."
-            )
             response = await self.vision_model_func(prompt, image_data=image_b64)
-            if response and response.strip():
-                return ExtractionResult(response, "ok")
-            return ExtractionResult(None, "empty", "empty vision response")
+            if not (response and response.strip()):
+                return ExtractionResult(None, "empty", "empty vision response")
         except Exception as e:
             logger.warning(f"Vision model failed for {image.filename}: {e}")
             rejection = classify_provider_rejection(e)
             if rejection is not None:
-                # Inline images use the server's vlm role, i.e. the system key.
+                # Email images always use the system vlm role, i.e. the system key.
                 await emit_provider_rejection(
                     ProviderRejectionEvent(
                         workspace=self.rag.workspace,
@@ -1099,6 +1171,25 @@ Content:
                     )
                 )
             return ExtractionResult(None, "failed", "vision error")
+
+        # Shares the entity-extraction cache flag, as document images do; when
+        # it is off, handle_cache above does not read and nothing is saved here.
+        if self.rag.enable_llm_cache_for_entity_extract:
+            audit = _serialize_cache_variant(image_audit_metadata(normalized))
+            try:
+                await save_to_cache(
+                    self.rag.llm_response_cache,
+                    CacheData(
+                        args_hash=args_hash,
+                        content=response,
+                        prompt=f"{prompt}\n<vlm_images>{audit}</vlm_images>",
+                        mode="default",
+                        cache_type="analysis",
+                    ),
+                )
+            except Exception as e:
+                logger.warning(f"Image cache write failed for {image.filename}: {e}")
+        return ExtractionResult(response, "ok")
 
     async def _extract_attachment_content(
         self, attachment: ParsedAttachment
@@ -1323,6 +1414,39 @@ async def get_lightrag_for_request(request: Request, rag_instance=None):
         return rag_instance
 
 
+def _system_vision_func(system_rag: Any) -> Any:
+    """Vision function for email images, whichever workspace they belong to.
+
+    Uses the vlm role of the server's default instance. BYO provider overrides
+    only ever apply to instances the WorkspaceManager builds, so this stays on
+    the system key, and the role's queue holds all email images to
+    ``VLM_MAX_ASYNC_LLM``.
+    """
+
+    async def email_vision_func(prompt: str, image_data: str) -> str:
+        # image_data is raw base64; the binding's image_inputs handling
+        # auto-detects the MIME type.
+        return await system_rag.role_llm_funcs["vlm"](
+            prompt,
+            image_inputs=[image_data],
+            stream=False,
+            _priority=DEFAULT_MM_ANALYSIS_PRIORITY,
+        )
+
+    return email_vision_func
+
+
+def _system_vision_cache_identity(system_rag: Any) -> Dict[str, Any]:
+    """Non-secret identity of the model behind :func:`_system_vision_func`."""
+    config = system_rag.get_llm_role_config("vlm")
+    return {
+        "role": "vlm",
+        "binding": config["binding"],
+        "model": config["model"],
+        "host": config["host"],
+    }
+
+
 # ============================================================================
 # Route Factory
 # ============================================================================
@@ -1330,7 +1454,7 @@ async def get_lightrag_for_request(request: Request, rag_instance=None):
 
 def create_email_routes(
     rag,
-    vision_model_func=None,
+    vision_enabled: bool = False,
     api_key: Optional[str] = None,
     resync_queue: Optional[Any] = None,
 ):
@@ -1338,9 +1462,10 @@ def create_email_routes(
     Create email ingestion routes.
 
     Args:
-        rag: The default LightRAG instance (for single-instance mode).
-        vision_model_func: Optional native vision function for inline-image
-            description; called as ``vision_model_func(prompt, image_data=<base64>)``.
+        rag: The default LightRAG instance (for single-instance mode). Its vlm
+            role describes email images in every workspace.
+        vision_enabled: Whether images are sent to the vision model
+            (``VLM_PROCESS_ENABLE``).
         api_key: Optional API key for authentication.
         resync_queue: Optional ``DeferredResyncQueue`` for re-syncs that find
             the pipeline busy.
@@ -1350,7 +1475,10 @@ def create_email_routes(
     """
     combined_auth = get_combined_auth_dependency(api_key)
     _default_rag = rag
-    _vision_model_func = vision_model_func
+    _vision_model_func = _system_vision_func(rag) if vision_enabled else None
+    _vision_cache_identity = (
+        _system_vision_cache_identity(rag) if vision_enabled else None
+    )
 
     @router.post(
         "/email",
@@ -1464,7 +1592,10 @@ the LightRAG knowledge graph under the shared Bundle ID.
             # ingestion service with native inline-image vision description.
             rag_instance = await get_lightrag_for_request(http_request, _default_rag)
             service = EmailIngestionService(
-                rag_instance, _vision_model_func, resync_queue=resync_queue
+                rag_instance,
+                _vision_model_func,
+                resync_queue=resync_queue,
+                vision_cache_identity=_vision_cache_identity,
             )
             logger.info("Using LightRAG email ingestion service")
 
