@@ -157,6 +157,10 @@ class WorkspaceManager:
         """Return the maximum number of instances allowed."""
         return self._max_instances
 
+    def loaded_instances(self) -> list[LightRAG]:
+        """Instances already in memory. Reading this loads nothing."""
+        return [entry[0] for entry in self._instances.values()]
+
     async def _create_instance(self, workspace_id: str) -> LightRAG:
         """Build and initialize a new LightRAG instance for a workspace."""
         rag = self._instance_factory(workspace_id)

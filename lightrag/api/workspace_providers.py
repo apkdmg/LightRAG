@@ -44,6 +44,8 @@ from typing import Any, Callable, Optional
 from cryptography.fernet import Fernet, InvalidToken
 from pydantic import BaseModel, Field, SecretStr
 
+from lightrag.usage import BYO_BILLING
+
 logger = logging.getLogger("lightrag.api.workspace_providers")
 
 # Role groups the three owner-facing slots map onto. Imported by the routes.
@@ -333,6 +335,8 @@ async def _apply_slot(rag: Any, roles: tuple[str, ...], slot: ProviderSlot) -> N
             model=slot.model,
             provider_options=provider_options,
         )
+        # Usage recording reads this: calls on this role now bill the owner's key.
+        rag.set_role_llm_metadata(role, billing=BYO_BILLING)
 
 
 async def apply_workspace_provider_overrides(

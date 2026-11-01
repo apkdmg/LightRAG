@@ -359,10 +359,12 @@ export const InvalidApiKeyError = 'Invalid API Key'
 export const RequireApiKeError = 'API Key required'
 
 // Axios instance
-const axiosInstance = axios.create({
+export const axiosInstance = axios.create({
   baseURL: backendBaseUrl,
   headers: {
-    'Content-Type': 'application/json'
+    'Content-Type': 'application/json',
+    // Lets usage records tell WebUI questions from other REST API clients.
+    'X-LightRAG-Client': 'webui'
   },
   withCredentials: true  // Send cookies (HTTP-only SSO token cookie) with requests
 })
@@ -605,6 +607,7 @@ export const queryTextStream = async (
   const token = localStorage.getItem('LIGHTRAG-API-TOKEN');
   const isSSOMode = localStorage.getItem('LIGHTRAG-SSO-MODE') === 'true';
   const headers: HeadersInit = {
+    'X-LightRAG-Client': 'webui',
     'Content-Type': 'application/json',
     'Accept': 'application/x-ndjson',
   };

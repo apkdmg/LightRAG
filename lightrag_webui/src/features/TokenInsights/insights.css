@@ -1,0 +1,38 @@
+.ti-root {
+  --ti-extract: #2a78d6;
+  --ti-vlm: #eda100;
+  --ti-keyword: #1baf7a;
+  --ti-query: #eb6834;
+  --ti-grid: #e1e0d9;
+  --ti-axis: #898781;
+  --ti-h1: #e4e4e7;
+  --ti-h2: #b7d3f6;
+  --ti-h3: #6da7ec;
+  --ti-h4: #2a78d6;
+  --ti-h5: #184f95;
+}
+.dark .ti-root {
+  --ti-extract: #3987e5;
+  --ti-vlm: #c98500;
+  --ti-keyword: #199e70;
+  --ti-query: #d95926;
+  --ti-grid: #2c2c2a;
+  --ti-h1: #27272a;
+  --ti-h2: #184f95;
+  --ti-h3: #256abf;
+  --ti-h4: #5598e7;
+  --ti-h5: #b7d3f6;
+}
+@keyframes ti-pulse {
+  0% { box-shadow: 0 0 0 0 rgba(208, 59, 59, 0.55); }
+  100% { box-shadow: 0 0 0 8px rgba(208, 59, 59, 0); }
+}
+.ti-pulse { animation: ti-pulse 900ms ease-out 2; }
+@media (prefers-reduced-motion: reduce) {
+  .ti-pulse { animation: none; }
+  .ti-root * { transition-duration: 0ms !important; }
+}
+@keyframes ti-rise {
+  from { transform: scaleY(0); transform-origin: bottom; }
+  to { transform: scaleY(1); transform-origin: bottom; }
+}

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import time
 from copy import deepcopy
 from dataclasses import dataclass, field
 from functools import partial, wraps
@@ -21,6 +22,17 @@ from lightrag.provider_rejection import (
     ProviderRejectionEvent,
     classify_provider_rejection,
     emit_provider_rejection,
+)
+from lightrag.usage import (
+    SYSTEM_BILLING,
+    TOKEN_TRACKING_BINDINGS,
+    VISION_PURPOSE,
+    UsageCapture,
+    UsageRecord,
+    current_usage_scope,
+    emit_usage,
+    recorded_stream,
+    usage_enabled,
 )
 from lightrag.utils import (
     get_env_value,
@@ -202,9 +214,133 @@ class _RoleLLMMixin:
                 **model_kwargs,
             )
         )
+        wrapped = self._record_usage(role_name, wrapped)
         if role_name in _QUERY_TIME_ROLES:
             return self._report_provider_rejections(role_name, wrapped)
         return wrapped
+
+    def _record_usage(
+        self, role_name: str, func: Callable[..., object]
+    ) -> Callable[..., object]:
+        """Report token usage for each call, around the role's queue.
+
+        This runs in the caller's context, so it sees the usage scope; the queue
+        workers don't. The capture object reaches the binding through kwargs.
+        ``wraps`` carries the queue's ``shutdown`` attribute over.
+        """
+
+        @wraps(func)
+        async def recording(*args, **kwargs):
+            if not usage_enabled():
+                return await func(*args, **kwargs)
+
+            metadata = self._role_llm_states[role_name].metadata
+            scope = current_usage_scope()
+            capture = UsageCapture()
+            if metadata.get("binding") in TOKEN_TRACKING_BINDINGS:
+                kwargs.setdefault("token_tracker", capture)
+            started = time.perf_counter()
+
+            def finish(text: str | list[str] | None, status: str) -> None:
+                try:
+                    emit_usage(
+                        self._usage_record(
+                            role_name,
+                            metadata,
+                            scope,
+                            capture,
+                            args,
+                            kwargs,
+                            text,
+                            status,
+                            started,
+                        )
+                    )
+                except Exception as e:
+                    logger.warning(f"Could not record LLM usage: {e}")
+
+            try:
+                response = await func(*args, **kwargs)
+            except Exception:
+                finish(None, "error")
+                raise
+            if hasattr(response, "__aiter__"):
+                return recorded_stream(response, finish)
+            finish(response, "ok")
+            return response
+
+        return recording
+
+    def _usage_record(
+        self,
+        role_name: str,
+        metadata: dict[str, Any],
+        scope: Any,
+        capture: UsageCapture,
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+        text: str | list[str] | None,
+        status: str,
+        started: float,
+    ) -> UsageRecord:
+        counts = capture.counts or {}
+        if status == "ok" and counts.get("finish_reason") == "length":
+            status = "truncated"
+        estimated = measured = False
+        prompt_tokens = counts.get("prompt_tokens", 0)
+        completion_tokens = counts.get("completion_tokens", 0)
+        if counts:
+            measured = True
+        elif status != "error" and role_name != VISION_PURPOSE:
+            # No provider figure: estimate text. A word count can't measure
+            # images, so Vision is reported as not measured instead.
+            estimated = measured = True
+            prompt_tokens, completion_tokens = self._estimate_usage_tokens(
+                args, kwargs, text
+            )
+        elif status == "error":
+            measured = True
+        return UsageRecord(
+            workspace=scope.workspace or self.workspace or "default",
+            purpose=role_name,
+            operation=scope.operation_for(role_name),
+            source=scope.source or "other",
+            client=scope.client,
+            model=metadata.get("model") or self.llm_model_name or "",
+            host=metadata.get("host"),
+            billing=metadata.get("billing", SYSTEM_BILLING),
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            reasoning_tokens=counts.get("reasoning_tokens", 0),
+            cached_tokens=counts.get("cached_tokens", 0),
+            cost=counts.get("cost"),
+            latency_ms=int((time.perf_counter() - started) * 1000),
+            status=status,
+            estimated=estimated,
+            measured=measured,
+            doc_id=scope.doc_id,
+            track_id=scope.track_id,
+        )
+
+    def _estimate_usage_tokens(
+        self,
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+        text: str | list[str] | None,
+    ) -> tuple[int, int]:
+        tokenizer = getattr(self, "tokenizer", None)
+        if tokenizer is None:
+            return 0, 0
+        pieces = [str(args[0]) if args else "", str(kwargs.get("system_prompt") or "")]
+        pieces += [
+            str(message.get("content", ""))
+            for message in kwargs.get("history_messages") or []
+        ]
+        answer = "".join(text) if isinstance(text, list) else (text or "")
+        return (
+            len(tokenizer.encode("\n".join(pieces))),
+            len(tokenizer.encode(str(answer))),
+        )
 
     def _report_provider_rejections(
         self, role_name: str, func: Callable[..., object]

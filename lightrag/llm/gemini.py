@@ -550,6 +550,8 @@ async def gemini_complete_if_cache(
                 "prompt_tokens": getattr(usage, "prompt_token_count", 0),
                 "completion_tokens": getattr(usage, "candidates_token_count", 0),
                 "total_tokens": getattr(usage, "total_token_count", 0),
+                "reasoning_tokens": getattr(usage, "thoughts_token_count", 0) or 0,
+                "cached_tokens": getattr(usage, "cached_content_token_count", 0) or 0,
             }
         )
 
