@@ -13,7 +13,7 @@ import ForecastTab from './ForecastTab'
 import { ICON_CHECK, ICON_CLOCK, PURPOSES, Purpose, SEVERITY } from './meta'
 import OverviewTab from './OverviewTab'
 import SettingsDialog from './SettingsDialog'
-import { Card, Empty, Seg, StatusIcon, Swatch, fmtDay } from './ui'
+import { Card, Empty, Seg, StatusIcon, Swatch, ViewBoundary, fmtDay } from './ui'
 import WhyPanel from './WhyPanel'
 import WorkspacesTab from './WorkspacesTab'
 import WorkTab from './WorkTab'
@@ -126,6 +126,10 @@ function Attention({ overview, scope, set }: { overview: any; scope: Scope; set:
 }
 
 export default function TokenInsights() {
+  return <ViewBoundary><InsightsPage /></ViewBoundary>
+}
+
+function InsightsPage() {
   const { t } = useTranslation()
   const [scope, setScope] = useState<Scope>(() => ({ ...DEFAULT, ...readHash() }))
   const [explore, setExploreState] = useState<{ group: string; drill: Drill[] }>({ group: 'purpose', drill: [] })
@@ -209,12 +213,14 @@ export default function TokenInsights() {
                 </button>
               ))}
             </div>
-            {scope.tab === 'overview' ? <OverviewTab /> : null}
-            {scope.tab === 'workspaces' ? <WorkspacesTab /> : null}
-            {scope.tab === 'explore' ? <ExploreTab /> : null}
-            {scope.tab === 'anomalies' ? <AnomaliesTab /> : null}
-            {scope.tab === 'work' ? <WorkTab /> : null}
-            {scope.tab === 'forecast' ? <ForecastTab onOpenSettings={() => setSettingsOpen(true)} /> : null}
+            <ViewBoundary resetKey={JSON.stringify([scope.tab, scope.purpose, scope.workspace, params, scope.unit])}>
+              {scope.tab === 'overview' ? <OverviewTab /> : null}
+              {scope.tab === 'workspaces' ? <WorkspacesTab /> : null}
+              {scope.tab === 'explore' ? <ExploreTab /> : null}
+              {scope.tab === 'anomalies' ? <AnomaliesTab /> : null}
+              {scope.tab === 'work' ? <WorkTab /> : null}
+              {scope.tab === 'forecast' ? <ForecastTab onOpenSettings={() => setSettingsOpen(true)} /> : null}
+            </ViewBoundary>
           </div>
         </div>
         <AnimatePresence>{scope.day ? <WhyPanel key="why" /> : null}</AnimatePresence>

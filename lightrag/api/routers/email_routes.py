@@ -47,6 +47,7 @@ from fastapi import (
 from pydantic import BaseModel, Field
 
 from lightrag.api.dependencies import resolve_workspace_from_request
+from lightrag.api.provider_alerts import is_own_alert_email
 from lightrag.api.utils_api import get_combined_auth_dependency
 from lightrag.constants import DEFAULT_MM_ANALYSIS_PRIORITY, DEFAULT_MM_IMAGE_MIN_PIXEL
 from lightrag.exceptions import EnqueueRefusedError
@@ -1562,6 +1563,9 @@ relationships in the knowledge graph. This enables queries like:
 Inline images are described by the native vision model (when configured);
 document attachments have their text extracted. All content is inserted into
 the LightRAG knowledge graph under the shared Bundle ID.
+
+**LightRAG's own alerts:** an email from `SMTP_FROM` with `[LightRAG]` in its subject
+is not ingested. The response is 200 with `status` set to `skipped`.
         """,
     )
     async def ingest_email(
@@ -1737,6 +1741,19 @@ the LightRAG knowledge graph under the shared Bundle ID.
             # components enqueue under this single track_id so
             # GET /documents/track_status/{track_id} reflects the whole email.
             bundle_id = generate_bundle_id(parsed_email.message_id)
+
+            # Alerts go to admin mailboxes, which a mail connector may send back
+            # here. Indexing them adds noise and spends tokens on LightRAG's own
+            # mail, most of all during the outages they report.
+            if is_own_alert_email(parsed_email.from_address, parsed_email.subject):
+                logger.info(f"Skipped LightRAG's own email: {parsed_email.subject}")
+                return EmailIngestionResponse(
+                    status="skipped",
+                    bundle_id=bundle_id,
+                    message="This is an alert sent by LightRAG, so it was not ingested.",
+                    email_subject=parsed_email.subject,
+                )
+
             track_id = generate_track_id("email")
 
             # Define background task for email ingestion

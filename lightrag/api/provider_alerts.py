@@ -23,11 +23,14 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from email.message import EmailMessage
-from email.utils import formataddr, make_msgid
+from email.utils import formataddr, make_msgid, parseaddr
 from typing import Any, Awaitable, Callable, Optional
 
 from lightrag.provider_rejection import ProviderRejectionEvent
 from lightrag.utils import get_env_value, logger
+
+# In the subject of every email this server sends.
+ALERT_SUBJECT_TAG = "[LightRAG]"
 
 # LLM role -> owner-facing Providers-page slot.
 _ROLE_SLOTS = {
@@ -101,6 +104,24 @@ def send_email_sync(settings: SmtpSettings, to: list[str], msg: EmailMessage) ->
         if settings.username:
             server.login(settings.username, settings.password)
         server.send_message(msg, to_addrs=to)
+
+
+def is_own_alert_email(
+    from_address: Optional[str],
+    subject: Optional[str],
+    sender: Optional[str] = None,
+) -> bool:
+    """True for an alert or digest from this server, back from a mailbox connector.
+
+    Both the sender and the subject tag must match, so a person's reply or
+    forward, and other mail from a shared ``SMTP_FROM`` address, still count.
+    """
+    own = parseaddr(get_env_value("SMTP_FROM", "") if sender is None else sender)[1]
+    return bool(
+        own
+        and parseaddr(from_address or "")[1].lower() == own.lower()
+        and ALERT_SUBJECT_TAG in (subject or "")
+    )
 
 
 class ProviderRejectionNotifier:
@@ -218,7 +239,8 @@ def build_alert_message(
 
     msg = EmailMessage()
     msg["Subject"] = (
-        f"[LightRAG] LLM provider {what} - workspace {event.workspace} ({slot})"
+        f"{ALERT_SUBJECT_TAG} LLM provider {what} - "
+        f"workspace {event.workspace} ({slot})"
     )
     msg["From"] = formataddr(("LightRAG alerts", sender))
     msg["To"] = ", ".join(recipients)

@@ -3,7 +3,7 @@ import { useTranslation } from 'react-i18next'
 import { insightsApi } from './api'
 import { UsageChart, ChartPoint } from './charts'
 import { useData, useInsights } from './context'
-import { INGEST, PURPOSES, PURPOSE_COLOR, Purpose, QUESTIONS } from './meta'
+import { INGEST, PURPOSES, PURPOSE_COLOR, Purpose, QUESTIONS, isFarFromOthers } from './meta'
 import PurposePage from './PurposePage'
 import WorkspacePage from './WorkspacePage'
 import {
@@ -134,7 +134,7 @@ export function PurposeCards({ data }: { data: any }) {
                   {data.scope.workspace && p.others_per_unit ? (
                     <Kv k={t('insights.card.others')}>
                       {fmtTokens(p.others_per_unit)}
-                      {p.others_ratio >= 1.25 || p.others_ratio <= 0.8 ? ` · ${t('insights.card.thisOne', { ratio: p.others_ratio.toFixed(1) })}` : ''}
+                      {isFarFromOthers(p.others_ratio) ? ` · ${t('insights.card.thisOne', { ratio: p.others_ratio.toFixed(1) })}` : ''}
                     </Kv>
                   ) : null}
                   <Kv k={t('insights.card.cache')}>{fmtPct(p.cache_rate)}</Kv>
