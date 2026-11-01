@@ -90,7 +90,8 @@ const OAuth2Callback = () => {
           userData.core_version || null,
           userData.api_version || null,
           userData.webui_title || null,
-          userData.webui_description || null
+          userData.webui_description || null,
+          userData.role || null
         )
 
         // Set version check flag
