@@ -18,6 +18,7 @@ from lightrag.api.dependencies import (
 )
 from lightrag.api.workspace_deletion import (
     WorkspaceBusyError,
+    persisted_workspaces,
     purge_app_workspace,
     workspace_exists,
 )
@@ -135,6 +136,7 @@ def create_admin_routes():
     )
     async def create_workspace(
         request: CreateWorkspaceRequest,
+        http_request: Request,
         workspace_manager: WorkspaceManager = Depends(get_workspace_manager),
     ):
         """
@@ -153,7 +155,10 @@ def create_admin_routes():
             workspace_id = sanitize_workspace_id(request.username)
 
             # Check if workspace already exists
-            existing = workspace_manager.get_workspace_info(workspace_id)
+            persisted = await persisted_workspaces(http_request.app)
+            existing = workspace_manager.get_workspace_info(
+                workspace_id, persisted.get(workspace_id)
+            )
             if existing:
                 raise HTTPException(
                     status_code=status.HTTP_409_CONFLICT,
@@ -250,6 +255,7 @@ def create_admin_routes():
         dependencies=[Depends(require_admin)],
     )
     async def list_workspaces(
+        request: Request,
         page: int = 1,
         page_size: int = 50,
         workspace_manager: WorkspaceManager = Depends(get_workspace_manager),
@@ -268,6 +274,7 @@ def create_admin_routes():
             workspaces, total = workspace_manager.list_workspaces(
                 page=page,
                 page_size=page_size,
+                persisted=await persisted_workspaces(request.app),
             )
 
             return WorkspaceListResponse(
@@ -300,6 +307,7 @@ def create_admin_routes():
     )
     async def get_workspace_stats(
         workspace_id: str,
+        request: Request,
         workspace_manager: WorkspaceManager = Depends(get_workspace_manager),
     ):
         """
@@ -313,7 +321,10 @@ def create_admin_routes():
         """
         try:
             sanitized_id = sanitize_workspace_id(workspace_id)
-            workspace_info = workspace_manager.get_workspace_info(sanitized_id)
+            persisted = await persisted_workspaces(request.app)
+            workspace_info = workspace_manager.get_workspace_info(
+                sanitized_id, persisted.get(sanitized_id)
+            )
 
             if not workspace_info:
                 raise HTTPException(
@@ -470,6 +481,7 @@ def create_admin_routes():
         dependencies=[Depends(require_admin)],
     )
     async def get_admin_status(
+        request: Request,
         workspace_manager: WorkspaceManager = Depends(get_workspace_manager),
     ):
         """
@@ -479,7 +491,11 @@ def create_admin_routes():
             Dict containing system status and workspace statistics.
         """
         try:
-            _, total_workspaces = workspace_manager.list_workspaces(page=1, page_size=1)
+            _, total_workspaces = workspace_manager.list_workspaces(
+                page=1,
+                page_size=1,
+                persisted=await persisted_workspaces(request.app),
+            )
 
             return {
                 "status": "healthy",

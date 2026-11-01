@@ -4439,6 +4439,19 @@ class PGDocStatusStorage(DocStatusStorage):
 
         return docs_by_status
 
+    async def list_workspaces_with_statuses(
+        self, statuses: list[DocStatus]
+    ) -> list[str] | None:
+        """List every workspace holding documents in any of the given statuses."""
+        if not statuses:
+            return []
+
+        sql = (
+            "SELECT DISTINCT workspace FROM LIGHTRAG_DOC_STATUS WHERE status = ANY($1)"
+        )
+        result = await self.db.query(sql, [[s.value for s in statuses]], multirows=True)
+        return [row["workspace"] for row in result or []]
+
     async def get_docs_by_statuses(
         self, statuses: list[DocStatus]
     ) -> dict[str, DocProcessingStatus]:

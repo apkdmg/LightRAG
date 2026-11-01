@@ -9,6 +9,7 @@ from fastapi.openapi.docs import (
     get_swagger_ui_html,
     get_swagger_ui_oauth2_redirect_html,
 )
+import asyncio
 import json
 import os
 import re
@@ -507,6 +508,25 @@ def create_app(args):
             if resync_queue is not None:
                 await resync_queue.start()
 
+            if args.resume_pending_on_startup:
+                from lightrag.api.startup_resume import (
+                    MAX_CONCURRENT_RESUMES,
+                    resume_pending_documents,
+                )
+
+                app.state.startup_resume_task = asyncio.create_task(
+                    resume_pending_documents(
+                        rag,
+                        _resync_queue_rag,
+                        registry=registry,
+                        multi_tenant=args.enable_multi_tenancy,
+                        # Evicting a workspace would finalize its running pipeline
+                        max_concurrent=min(
+                            MAX_CONCURRENT_RESUMES, args.max_workspace_instances
+                        ),
+                    )
+                )
+
             ASCIIColors.green("\nServer is ready to accept connections! 🚀\n")
 
             yield
@@ -519,6 +539,12 @@ def create_app(args):
                 )
 
                 remove_provider_rejection_listener(notifier)
+
+            # Stop resumed runs before the storages they use are finalized.
+            resume_task = getattr(app.state, "startup_resume_task", None)
+            if resume_task is not None:
+                resume_task.cancel()
+                await asyncio.gather(resume_task, return_exceptions=True)
 
             resync_queue = getattr(app.state, "email_resync_queue", None)
             if resync_queue is not None:
@@ -1772,6 +1798,9 @@ def create_app(args):
                 "Configure AUTH_ACCOUNTS or OAuth2 to isolate users."
             )
         from lightrag.api.workspace_manager import WorkspaceManager
+
+        # Its doc status storage can list every workspace (see workspace_deletion)
+        app.state.default_rag = rag
 
         async def _instance_is_stale(workspace_id: str, created_at: float) -> bool:
             # Another worker deleted the workspace after this instance was built

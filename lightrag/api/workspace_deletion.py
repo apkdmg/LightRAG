@@ -34,6 +34,7 @@ from typing import Any, Optional
 from lightrag.api.config import validate_tenant_isolation_configuration
 from lightrag.api.workspace_manager import WorkspaceManager
 from lightrag.api.workspace_registry import WorkspaceRegistry
+from lightrag.base import DocStatus
 
 logger = logging.getLogger("lightrag.api.workspace_deletion")
 
@@ -222,14 +223,52 @@ async def purge_workspace(
     return result
 
 
-async def workspace_exists(app: Any, workspace_id: str) -> bool:
-    """Whether a workspace is bound, served, or has files on this server."""
-    from lightrag.api.config import global_args
+async def persisted_workspaces(app: Any) -> dict[str, dict[str, Any]]:
+    """Workspaces found in storage, by id, including ones not served yet.
+
+    Doc status is the only complete source of workspaces with documents: email
+    ingestion creates workspaces with no registered owner and no input directory.
+    The registry adds owners and workspaces with no documents yet. Backends that
+    cannot list workspaces contribute nothing. A source that fails is logged and
+    skipped, so the admin API can still answer.
+    """
+    found: dict[str, dict[str, Any]] = {}
+
+    default_rag = getattr(app.state, "default_rag", None)
+    if default_rag is not None:
+        try:
+            listed = await default_rag.doc_status.list_workspaces_with_statuses(
+                list(DocStatus)
+            )
+        except Exception as e:
+            logger.error(f"Could not list workspaces from doc status: {e}")
+        else:
+            found.update((workspace, {}) for workspace in listed or [])
 
     registry = getattr(app.state, "workspace_registry", None)
-    if registry is not None and await registry.get_by_workspace(workspace_id):
-        return True
+    if registry is not None:
+        try:
+            owners = await registry.list_owners()
+        except Exception as e:
+            logger.error(f"Could not list workspace owners: {e}")
+        else:
+            for owner in owners:
+                found[owner.workspace_id] = {
+                    "owner_username": owner.email or owner.identity,
+                    "created_at": owner.created_at,
+                    "last_accessed_at": owner.last_login_at,
+                }
+
+    return found
+
+
+async def workspace_exists(app: Any, workspace_id: str) -> bool:
+    """Whether a workspace is in storage, served, or has files on this server."""
+    from lightrag.api.config import global_args
+
     if app.state.workspace_manager.is_known(workspace_id):
+        return True
+    if workspace_id in await persisted_workspaces(app):
         return True
     return any(
         (Path(base_dir) / workspace_id).is_dir()

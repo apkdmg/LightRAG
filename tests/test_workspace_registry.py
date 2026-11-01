@@ -318,6 +318,109 @@ def test_login_binds_workspace_and_admin_can_manage_it(app_client):
     )
 
 
+def _admin_headers(client):
+    return {"Authorization": f"Bearer {_login(client, 'admin', 'admin-pw')}"}
+
+
+def _doc_status_lists(client, result):
+    from unittest.mock import AsyncMock
+
+    lister = AsyncMock(return_value=result)
+    if isinstance(result, Exception):
+        lister = AsyncMock(side_effect=result)
+    client.app.state.default_rag.doc_status.list_workspaces_with_statuses = lister
+    return lister
+
+
+def test_admin_sees_workspaces_not_served_since_restart(app_client):
+    """Email ingestion leaves workspaces with documents but no owner, and the
+    manager forgets every workspace on restart."""
+    from lightrag.base import DocStatus
+
+    client, _ = app_client
+    _login(client, "alice", "alice-pw")
+    headers = _admin_headers(client)
+    lister = _doc_status_lists(client, ["alice", "email_only"])
+
+    response = client.get("/admin/workspaces", headers=headers)
+    assert response.status_code == 200, response.text
+    listed = response.json()
+    assert listed["total"] == 3
+    by_id = {w["workspace_id"]: w for w in listed["workspaces"]}
+    assert set(by_id) == {"admin", "alice", "email_only"}
+    assert by_id["alice"]["owner_username"] == "local:alice"
+    assert by_id["alice"]["created_at"] > 0
+    assert by_id["email_only"]["owner_username"] == "email_only"
+    assert by_id["email_only"]["is_active"] is False
+    assert set(lister.await_args.args[0]) == set(DocStatus)
+
+    admin_status = client.get("/admin/status", headers=headers).json()
+    assert admin_status["total_workspaces"] == 3
+
+    # The other routes that ask whether a workspace exists agree with the list
+    stats = client.get("/admin/workspaces/email_only", headers=headers)
+    assert stats.status_code == 200, stats.text
+    assert client.get("/admin/workspaces/nobody", headers=headers).status_code == 404
+    conflict = client.post(
+        "/admin/workspaces", json={"username": "email_only"}, headers=headers
+    )
+    assert conflict.status_code == 409
+
+
+def test_admin_cannot_impersonate_a_workspace_only_found_in_storage(app_client):
+    """Listing a workspace must not widen who a token can be minted for."""
+    client, _ = app_client
+    headers = _admin_headers(client)
+    _doc_status_lists(client, ["email_only"])
+
+    response = client.post("/admin/workspaces/email_only/impersonate", headers=headers)
+    assert response.status_code == 404
+
+
+@pytest.mark.parametrize("listed", [None, RuntimeError("database down")])
+def test_admin_list_falls_back_to_owners(app_client, listed):
+    """A backend that cannot list workspaces, or fails, must not break the API."""
+    client, _ = app_client
+    _login(client, "alice", "alice-pw")
+    headers = _admin_headers(client)
+    _doc_status_lists(client, listed)
+
+    response = client.get("/admin/workspaces", headers=headers)
+    assert response.status_code == 200, response.text
+    assert {w["workspace_id"] for w in response.json()["workspaces"]} == {
+        "admin",
+        "alice",
+    }
+
+
+def test_workspace_exists_finds_workspace_only_in_doc_status(app_client):
+    from lightrag.api.workspace_deletion import workspace_exists
+
+    client, _ = app_client
+    _doc_status_lists(client, ["email_only"])
+
+    assert run(workspace_exists(client.app, "email_only")) is True
+    assert run(workspace_exists(client.app, "nobody")) is False
+
+
+def test_listing_merges_storage_without_remembering_it():
+    """Listing must not make a workspace known: a listing racing a purge would
+    otherwise bring the deleted workspace back until the next restart."""
+    from lightrag.api.workspace_manager import WorkspaceManager
+
+    manager = WorkspaceManager(instance_factory=lambda workspace_id: None)
+    persisted = {"b": {}, "a": {}, "c": {"last_accessed_at": 5.0}}
+
+    first, total = manager.list_workspaces(page=1, page_size=2, persisted=persisted)
+    second, _ = manager.list_workspaces(page=2, page_size=2, persisted=persisted)
+
+    assert total == 3
+    assert [w.workspace_id for w in first + second] == ["c", "a", "b"]
+    assert not manager.is_known("a")
+    assert manager.get_workspace_info("a") is None
+    assert manager.get_workspace_info("a", {}).workspace_id == "a"
+
+
 def test_failed_sso_callback_ends_existing_session(app_client, monkeypatch):
     """A refused or failed SSO sign-in must also clear any earlier session
     cookie, so the browser cannot carry on under a previous login."""

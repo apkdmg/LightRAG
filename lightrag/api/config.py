@@ -876,6 +876,9 @@ def parse_args() -> argparse.Namespace:
     args.max_workspace_instances = get_env_value("MAX_WORKSPACE_INSTANCES", 10000, int)
     args.workspace_ttl_minutes = get_env_value("WORKSPACE_TTL_MINUTES", 60, int)
     args.auto_create_workspace = get_env_value("AUTO_CREATE_WORKSPACE", True, bool)
+    args.resume_pending_on_startup = get_env_value(
+        "RESUME_PENDING_ON_STARTUP", True, bool
+    )
 
     # Per-workspace BYO LLM / Vision-LLM providers (fork feature).
     # When enabled, a workspace owner may supply their own OpenAI-compatible
