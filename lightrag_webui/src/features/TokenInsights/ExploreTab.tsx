@@ -116,6 +116,7 @@ export default function ExploreTab() {
             </tbody>
           </table>
           {!rows.length && !loading ? <Empty>{t('insights.empty')}</Empty> : null}
+          {data?.total > rows.length ? <p className="text-muted-foreground mt-3 mb-0 text-xs">{t('insights.explore.topOf', { shown: rows.length, total: data.total })}</p> : null}
         </div>
       )}
       <p className="text-muted-foreground mt-3 mb-0 text-xs">

@@ -20,7 +20,11 @@ from pydantic import BaseModel, Field
 from lightrag.api.dependencies import UserInfo, require_admin
 from lightrag.api.insights.backfill import run_backfill
 from lightrag.api.insights.brief import brief_csv, brief_lines, text_pdf
-from lightrag.api.insights.service import InsightsService
+from lightrag.api.insights.service import (
+    WORKSPACE_OPTION_LIMIT,
+    WORKSPACE_PAGE_SIZE,
+    InsightsService,
+)
 from lightrag.usage import PURPOSES
 
 router = APIRouter(
@@ -137,10 +141,35 @@ async def workspaces(
     start: Optional[str] = None,
     end: Optional[str] = None,
     purpose: Optional[str] = None,
+    q: str = Query("", max_length=255),
+    show: str = Query("all", pattern="^(all|byo|look)$"),
+    sort: str = Query("cost", pattern="^(cost|tokens|change|documents|questions)$"),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(WORKSPACE_PAGE_SIZE, ge=1, le=200),
 ) -> dict[str, Any]:
+    """One page of the table. Search, filter and sort cover every workspace."""
     service = _service(request)
     length, last = _range(service, days, start, end)
-    return await service.workspaces(length, _purpose(purpose), end=last)
+    return await service.workspaces(
+        length,
+        _purpose(purpose),
+        end=last,
+        query=q,
+        show=show,
+        sort=sort,
+        page=page,
+        page_size=page_size,
+    )
+
+
+@router.get("/workspace-options")
+async def workspace_options(
+    request: Request,
+    q: str = Query("", max_length=255),
+    limit: int = Query(WORKSPACE_OPTION_LIMIT, ge=1, le=100),
+) -> dict[str, Any]:
+    """Names for the workspace picker, without the cost of the full table."""
+    return await _service(request).workspace_options(q, limit)
 
 
 @router.get("/workspaces/{workspace}")
@@ -189,11 +218,13 @@ async def breakdown(
     model: Optional[str] = None,
     source: Optional[str] = None,
     billing: Optional[str] = None,
+    limit: int = Query(200, ge=1, le=1000),
 ) -> dict[str, Any]:
+    """The largest rows, and how many there are. The CSV export has them all."""
     service = _service(request)
     length, last = _range(service, days, start, end)
     try:
-        return await service.breakdown(
+        result = await service.breakdown(
             group,
             length,
             _filters(purpose, workspace, operation, model, source, billing),
@@ -202,6 +233,7 @@ async def breakdown(
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    return {**result, "rows": result["rows"][:limit], "total": len(result["rows"])}
 
 
 @router.get("/breakdown.csv")

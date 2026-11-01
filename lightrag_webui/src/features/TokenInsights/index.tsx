@@ -2,9 +2,10 @@ import { useCallback, useEffect, useMemo, useState } from 'react'
 import { AnimatePresence } from 'motion/react'
 import { useTranslation } from 'react-i18next'
 import { CheckIcon, ChevronsUpDownIcon, SettingsIcon } from 'lucide-react'
-import { Command, CommandEmpty, CommandGroup, CommandInput, CommandItem, CommandList } from '@/components/ui/Command'
+import { Command, CommandGroup, CommandInput, CommandItem, CommandList } from '@/components/ui/Command'
 import Input from '@/components/ui/Input'
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/Popover'
+import { useDebounce } from '@/hooks/useDebounce'
 import AnomaliesTab from './AnomaliesTab'
 import { Params, insightsApi } from './api'
 import { Ctx, Drill, Scope, useData } from './context'
@@ -20,6 +21,8 @@ import WorkTab from './WorkTab'
 import './insights.css'
 
 const TABS = ['overview', 'workspaces', 'explore', 'anomalies', 'work', 'forecast']
+const SEARCH_DEBOUNCE_MS = 250
+const ALL_OPTION = '__all__'
 const DEFAULT: Scope = { tab: 'overview', purpose: '', workspace: '', range: 30, start: '', end: '', unit: 'tokens', day: null }
 
 /** The URL holds the view, so an alert email or a colleague can open it directly. */
@@ -58,11 +61,30 @@ const writeHash = (scope: Scope) => {
   window.history.replaceState(null, '', `#/?${q.toString()}`)
 }
 
-function WorkspacePicker({ value, onChange, options }: { value: string; onChange: (v: string) => void; options: string[] }) {
+/** Thousands of workspaces: nothing loads until the list opens, and the server searches. */
+function WorkspacePicker({ value, onChange }: { value: string; onChange: (v: string) => void }) {
   const { t } = useTranslation()
   const [open, setOpen] = useState(false)
+  const [search, setSearch] = useState('')
+  const q = useDebounce(search, SEARCH_DEBOUNCE_MS).trim()
+  const { data, error, loading } = useData<any>(
+    () => (open ? insightsApi.workspaceOptions({ q }) : Promise.resolve(null)),
+    [open, q]
+  )
+  const handleOpenChange = (next: boolean) => {
+    setOpen(next)
+    if (!next) setSearch('')
+  }
+  const pick = (workspace: string) => {
+    onChange(workspace)
+    handleOpenChange(false)
+  }
+  const options: { id: string; owner: string | null }[] = data?.options ?? []
+  // New results replace the list, so Enter would otherwise have nothing to pick.
+  const [moved, setMoved] = useState<{ results: unknown; value: string } | null>(null)
+  const highlighted = moved && moved.results === data ? moved.value : q ? options[0]?.id ?? '' : ALL_OPTION
   return (
-    <Popover open={open} onOpenChange={setOpen}>
+    <Popover open={open} onOpenChange={handleOpenChange}>
       <PopoverTrigger asChild>
         <button type="button" role="combobox" aria-expanded={open} aria-label={t('insights.control.workspace')} className="bg-card flex min-h-[38px] w-[200px] items-center justify-between gap-2 rounded-lg border px-2.5 text-sm">
           <span className="truncate">{value || t('insights.allWorkspaces')}</span>
@@ -70,18 +92,29 @@ function WorkspacePicker({ value, onChange, options }: { value: string; onChange
         </button>
       </PopoverTrigger>
       <PopoverContent className="w-[260px] p-0" align="start">
-        <Command>
-          <CommandInput placeholder={t('insights.workspaces.placeholder')} />
-          <CommandList>
-            <CommandEmpty>{t('insights.workspaces.none')}</CommandEmpty>
+        <Command shouldFilter={false} value={highlighted} onValueChange={(next) => setMoved({ results: data, value: next })}>
+          <CommandInput value={search} onValueChange={setSearch} placeholder={t('insights.workspaces.placeholder')} />
+          <CommandList className={loading ? 'opacity-60' : ''}>
+            {error ? <p className="text-muted-foreground px-3 py-3 text-xs">{error}</p> : null}
+            {data && !options.length && q ? <p className="text-muted-foreground px-3 py-3 text-center text-sm">{t('insights.workspaces.none')}</p> : null}
             <CommandGroup>
-              {['', ...options].map((o) => (
-                <CommandItem key={o || 'all'} value={o || t('insights.allWorkspaces')} onSelect={() => { onChange(o); setOpen(false) }}>
-                  <CheckIcon className={`me-1.5 size-3.5 ${value === o ? 'opacity-100' : 'opacity-0'}`} />
-                  <span className="truncate">{o || t('insights.allWorkspaces')}</span>
+              {!search.trim() ? (
+                <CommandItem value={ALL_OPTION} onSelect={() => pick('')}>
+                  <CheckIcon className={`me-1.5 size-3.5 ${value === '' ? 'opacity-100' : 'opacity-0'}`} />
+                  <span className="truncate">{t('insights.allWorkspaces')}</span>
+                </CommandItem>
+              ) : null}
+              {options.map((o) => (
+                <CommandItem key={o.id} value={o.id} onSelect={() => pick(o.id)}>
+                  <CheckIcon className={`me-1.5 size-3.5 shrink-0 ${value === o.id ? 'opacity-100' : 'opacity-0'}`} />
+                  <span className="min-w-0">
+                    <span className="block truncate">{o.id}</span>
+                    {o.owner ? <span className="text-muted-foreground block truncate text-xs">{o.owner}</span> : null}
+                  </span>
                 </CommandItem>
               ))}
             </CommandGroup>
+            {data && data.total > options.length ? <p className="text-muted-foreground border-t px-3 py-2 text-xs">{t('insights.workspaces.showingOf', { shown: options.length, total: data.total })}</p> : null}
           </CommandList>
         </Command>
       </PopoverContent>
@@ -149,7 +182,6 @@ function InsightsPage() {
     [scope.range, scope.start, scope.end]
   )
   const status = useData(() => insightsApi.status(), [])
-  const directory = useData(() => (status.data?.available ? insightsApi.workspaces({ days: 90 }) : Promise.resolve({ rows: [] })), [status.data?.available])
   const head = useData(
     () => (status.data?.available ? insightsApi.overview({ ...params, workspace: scope.workspace }) : Promise.resolve(null)),
     [status.data?.available, JSON.stringify(params), scope.workspace],
@@ -190,7 +222,7 @@ function InsightsPage() {
                 <Seg label={t('insights.control.purpose')} value={scope.purpose} onChange={(purpose) => set({ purpose })} options={[{ value: '' as Purpose | '', label: t('insights.all') }, ...PURPOSES.map((p) => ({ value: p as Purpose | '', label: <><Swatch purpose={p} />{t(`insights.purpose.${p}`)}</> }))]} />
               </div>
               <div className="text-muted-foreground flex flex-col gap-0.5 text-xs">{t('insights.control.workspace')}
-                <WorkspacePicker value={scope.workspace} onChange={(workspace) => { set({ workspace }); setExplore({ drill: explore.drill.filter((c) => c.dim !== 'workspace') }) }} options={(directory.data?.rows ?? []).filter((r: any) => !r.deleted).map((r: any) => r.id)} />
+                <WorkspacePicker value={scope.workspace} onChange={(workspace) => { set({ workspace }); setExplore({ drill: explore.drill.filter((c) => c.dim !== 'workspace') }) }} />
               </div>
               <div className="text-muted-foreground flex flex-col gap-0.5 text-xs">{t('insights.control.range')}
                 <Seg label={t('insights.control.range')} value={scope.range} onChange={(range) => set(range === 'custom' ? { range, start: scope.start || new Date(Date.now() - 13 * 864e5).toISOString().slice(0, 10), end: scope.end || new Date().toISOString().slice(0, 10) } : { range })} options={[{ value: 1 as number | 'custom', label: t('insights.control.today') }, { value: 7, label: t('insights.control.days', { count: 7 }) }, { value: 30, label: t('insights.control.days', { count: 30 }) }, { value: 90, label: t('insights.control.days', { count: 90 }) }, { value: 'custom', label: t('insights.control.custom') }]} />

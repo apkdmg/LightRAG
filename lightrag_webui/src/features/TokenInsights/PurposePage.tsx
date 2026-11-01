@@ -62,7 +62,7 @@ export default function PurposePage({ data }: { data: any }) {
           <Kv k={t('insights.purposePage.runs')}>{t(`insights.purposePage.when.${id}`)}</Kv>
           <Kv k={t('insights.purposePage.model')}><span className="font-mono">{page?.model || row.model || '–'}{(page?.billing || row.billing) === 'byo' ? ' (BYO)' : ''}</span></Kv>
           <Kv k={t('insights.purposePage.slot')}>{t(`insights.purposePage.slotName.${id}`)}</Kv>
-          <Kv k={t('insights.purposePage.onByo')}>{page ? `${fmtPct(page.byo_share)}${page.byo_workspaces.length ? ` · ${page.byo_workspaces.join(', ')}` : ''}` : '–'}</Kv>
+          <Kv k={t('insights.purposePage.onByo')}>{page ? `${fmtPct(page.byo_share)}${page.byo_workspaces.length ? ` · ${page.byo_workspaces.join(', ')}${page.byo_workspace_count > page.byo_workspaces.length ? ` ${t('insights.purposePage.andMore', { count: page.byo_workspace_count - page.byo_workspaces.length })}` : ''}` : ''}` : '–'}</Kv>
           <Kv k={t('insights.purposePage.today')}><StatusLabel status={row.status} /></Kv>
         </div>
       </Card>
@@ -95,6 +95,7 @@ export default function PurposePage({ data }: { data: any }) {
                 <span className="text-muted-foreground text-xs">{t('insights.purposePage.perUnit', { value: fmtTokens(w.per_unit), unit })}{w.ratio >= 1.25 ? ` · ${t('insights.purposePage.above')}` : w.ratio !== null && w.ratio <= 0.85 ? ` · ${t('insights.purposePage.belowOthers')}` : ''}</span>
               </RowButton>
             ))}
+            {page.workspace_count > page.workspaces.length ? <button type="button" className="hover:bg-muted mt-2 min-h-9 rounded-lg border px-3 text-[13px]" onClick={() => set({ tab: 'workspaces' })}>{t('insights.purposePage.allWorkspaces', { count: page.workspace_count })}</button> : null}
           </Card>
           <Card>
             <Title sub={t('insights.purposePage.modelsSub')}>{t('insights.purposePage.models', { name: t(`insights.purpose.${id}`) })}</Title>
