@@ -1490,9 +1490,6 @@ def create_email_routes(
     combined_auth = get_combined_auth_dependency(api_key)
     _default_rag = rag
     _vision_model_func = _system_vision_func(rag) if vision_enabled else None
-    _vision_cache_identity = (
-        _system_vision_cache_identity(rag) if vision_enabled else None
-    )
 
     @router.post(
         "/email",
@@ -1612,7 +1609,10 @@ is not ingested. The response is 200 with `status` set to `skipped`.
                 rag_instance,
                 _vision_model_func,
                 resync_queue=resync_queue,
-                vision_cache_identity=_vision_cache_identity,
+                # An admin can change the vision model at runtime.
+                vision_cache_identity=(
+                    _system_vision_cache_identity(rag) if vision_enabled else None
+                ),
             )
             logger.info("Using LightRAG email ingestion service")
 

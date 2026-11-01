@@ -11,6 +11,8 @@
  * they remain usable even if a provider renames a model.
  */
 
+import type { ProviderSlotKey } from '@/api/lightrag'
+
 export interface ProviderPreset {
   /** Stable identifier stored as `preset_id`. */
   id: string
@@ -88,3 +90,10 @@ export const presetForBaseUrl = (baseUrl: string | null | undefined): ProviderPr
   }
   return getPreset(CUSTOM_PRESET_ID)
 }
+
+/** The three role-group slots, with their locale keys under providerSettings. */
+export const PROVIDER_SLOT_META: { key: ProviderSlotKey; titleKey: string; descKey: string }[] = [
+  { key: 'extraction', titleKey: 'extractionTitle', descKey: 'extractionDescription' },
+  { key: 'query', titleKey: 'queryTitle', descKey: 'queryDescription' },
+  { key: 'vision', titleKey: 'visionTitle', descKey: 'visionDescription' }
+]

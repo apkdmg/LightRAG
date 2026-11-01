@@ -490,14 +490,31 @@ def create_app(args):
             # Note: initialize_storages() now auto-initializes pipeline_status for rag.workspace
             await rag.initialize_storages()
 
-            # Apply any BYO provider override stored for the default workspace.
+            # Multi-tenant: this instance runs on the server default and never on
+            # a workspace's provider, because email images use it for every
+            # workspace. The default workspace gets its own managed instance.
             store = getattr(app.state, "workspace_provider_store", None)
             if store is not None:
                 from lightrag.api.workspace_providers import (
                     apply_workspace_provider_overrides,
+                    reconcile_system_provider,
+                    watch_system_provider,
                 )
 
-                await apply_workspace_provider_overrides(rag, args.workspace, store)
+                if args.enable_multi_tenancy:
+                    reconcile_system_provider(
+                        rag, None, store, app.state.env_role_llm_settings
+                    )
+                    app.state.system_provider_watch_task = asyncio.create_task(
+                        watch_system_provider(
+                            rag,
+                            app.state.workspace_manager,
+                            store,
+                            app.state.env_role_llm_settings,
+                        )
+                    )
+                else:
+                    await apply_workspace_provider_overrides(rag, args.workspace, store)
 
             # Data migration regardless of storage implementation
             await rag.check_and_migrate_data()
@@ -545,6 +562,11 @@ def create_app(args):
                 )
 
                 remove_provider_rejection_listener(notifier)
+
+            watch_task = getattr(app.state, "system_provider_watch_task", None)
+            if watch_task is not None:
+                watch_task.cancel()
+                await asyncio.gather(watch_task, return_exceptions=True)
 
             # Stop resumed runs before the storages they use are finalized.
             resume_task = getattr(app.state, "startup_resume_task", None)
@@ -1774,6 +1796,7 @@ def create_app(args):
         from lightrag.api.workspace_providers import (
             WorkspaceProviderStore,
             apply_workspace_provider_overrides,
+            reconcile_system_provider,
         )
 
         workspace_provider_store = WorkspaceProviderStore(
@@ -1781,6 +1804,8 @@ def create_app(args):
             get_secret=lambda: args.workspace_provider_secret,
         )
         app.state.workspace_provider_store = workspace_provider_store
+        # The role settings .env alone gives; the server default falls back here.
+        app.state.env_role_llm_settings = resolve_role_llm_settings
         if not workspace_provider_store.has_secret():
             logger.warning(
                 "ENABLE_WORKSPACE_PROVIDERS is on but WORKSPACE_PROVIDER_SECRET "
@@ -1789,6 +1814,12 @@ def create_app(args):
             )
 
         async def _on_instance_ready(rag_instance, workspace_id):
+            reconcile_system_provider(
+                rag_instance,
+                workspace_id,
+                workspace_provider_store,
+                resolve_role_llm_settings,
+            )
             await apply_workspace_provider_overrides(
                 rag_instance, workspace_id, workspace_provider_store
             )
@@ -1904,6 +1935,11 @@ def create_app(args):
     if args.enable_multi_tenancy and args.enable_workspace_providers:
         from lightrag.api.routers.provider_routes import create_provider_routes
 
+        from lightrag.api.routers.system_provider_routes import (
+            create_system_provider_routes,
+        )
+
+        app.include_router(create_system_provider_routes())
         app.include_router(create_provider_routes(api_key=api_key))
         logger.info(
             "Per-workspace provider routes enabled (/workspace/provider-config)"

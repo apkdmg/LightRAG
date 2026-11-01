@@ -171,6 +171,41 @@ class _RoleLLMMixin:
             if state.wrapped is not None
         }
 
+    def current_role_llm_func(self, role: str) -> Callable[..., object]:
+        """Return a callable that finds the role's wrapper on every call.
+
+        For anything that holds a role function across awaits, such as a running
+        pipeline batch. A wrapper retired by a runtime config update refuses new
+        calls, so a captured wrapper would fail the work still using it. Calls
+        already queued on the old wrapper finish there.
+        """
+        role = self._normalize_llm_role(role)
+
+        async def call_current_wrapper(*args, **kwargs):
+            return await self._role_llm_states[role].wrapped(*args, **kwargs)
+
+        return call_current_wrapper
+
+    def role_llm_config_matches(
+        self,
+        role: str,
+        *,
+        binding: str | None,
+        model: str | None,
+        host: str | None,
+        api_key: str | None,
+        provider_options: dict[str, Any] | None,
+    ) -> bool:
+        """True when the role already runs with exactly these settings."""
+        metadata = self._role_llm_states[self._normalize_llm_role(role)].metadata
+        return (
+            metadata.get("binding") == binding
+            and metadata.get("model") == model
+            and metadata.get("host") == host
+            and (metadata.get("api_key") or "") == (api_key or "")
+            and (metadata.get("provider_options") or {}) == (provider_options or {})
+        )
+
     @property
     def role_llm_kwargs(self) -> Mapping[str, dict[str, Any] | None]:
         """Read-only mapping of role name → effective LLM kwargs (None means inherit base)."""

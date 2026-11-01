@@ -483,6 +483,82 @@ async def test_sync_update_tracks_retired_queue_cleanup(tmp_path):
     assert not rag._retired_llm_queue_cleanup_tasks
 
 
+@pytest.mark.asyncio
+async def test_captured_global_config_follows_a_runtime_swap(tmp_path):
+    """A running pipeline batch keeps working across a provider switch."""
+
+    async def old_func(*args, **kwargs):
+        return "old"
+
+    async def new_func(*args, **kwargs):
+        return "new"
+
+    rag = _make_rag(tmp_path, extract_llm_model_func=old_func)
+    captured = rag._build_global_config()["role_llm_funcs"]["extract"]
+    assert await captured("before") == "old"
+
+    retired = rag._role_llm_states["extract"].wrapped
+    rag.update_llm_role_config("extract", model_func=new_func)
+    await rag.wait_for_retired_llm_queues()
+
+    # The retired wrapper refuses new work, so holding it would fail the batch.
+    with pytest.raises(RuntimeError, match="shutting down"):
+        await retired("after")
+    assert await captured("after") == "new"
+
+
+@pytest.mark.asyncio
+async def test_swap_lets_calls_already_sent_finish_on_the_old_function(tmp_path):
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def old_func(*args, **kwargs):
+        started.set()
+        await release.wait()
+        return "old"
+
+    async def new_func(*args, **kwargs):
+        return "new"
+
+    rag = _make_rag(tmp_path, extract_llm_model_func=old_func)
+    captured = rag._build_global_config()["role_llm_funcs"]["extract"]
+    in_flight = asyncio.create_task(captured("first"))
+    await started.wait()
+
+    rag.update_llm_role_config("extract", model_func=new_func)
+    assert await captured("second") == "new"
+
+    release.set()
+    assert await in_flight == "old"
+    await rag.wait_for_retired_llm_queues()
+
+
+def test_role_llm_config_matches_compares_the_settings_in_use(tmp_path):
+    settings = {
+        "binding": "openai",
+        "model": "m1",
+        "host": "https://a.example/v1",
+        "api_key": "sk-1",
+        "provider_options": {"temperature": 0.0},
+    }
+
+    async def query_func(*args, **kwargs):
+        return "query"
+
+    rag = _make_rag(
+        tmp_path,
+        role_llm_configs={
+            "query": RoleLLMConfig(func=query_func, metadata=dict(settings))
+        },
+    )
+    assert rag.role_llm_config_matches("query", **settings)
+    assert not rag.role_llm_config_matches("query", **{**settings, "model": "m2"})
+    assert not rag.role_llm_config_matches("query", **{**settings, "api_key": "sk-2"})
+    assert not rag.role_llm_config_matches(
+        "query", **{**settings, "provider_options": {}}
+    )
+
+
 def test_sync_update_without_event_loop_skips_cleanup(
     tmp_path, caplog, lightrag_logger_propagating
 ):

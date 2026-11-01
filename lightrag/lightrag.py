@@ -783,13 +783,16 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
         global_config.pop("_addon_params_dirty", None)
         global_config.pop("_cached_entity_extraction_use_json", None)
         global_config["addon_params"] = dict(self._addon_params)
-        # Inject runtime per-role wrapped LLM funcs (callable; not part of asdict
-        # because they live in the private _role_llm_states map). The first
-        # _build_global_config() call from __post_init__ runs before the role
-        # state is built, so fall back to an empty dict in that case.
+        # Inject runtime per-role LLM funcs (callable; not part of asdict because
+        # they live in the private _role_llm_states map). A config can outlive a
+        # runtime role update, so these find the current wrapper on every call.
+        # The first _build_global_config() call from __post_init__ runs before
+        # the role state is built, so fall back to an empty dict in that case.
         states = getattr(self, "_role_llm_states", None) or {}
         global_config["role_llm_funcs"] = {
-            spec.name: states[spec.name].wrapped if spec.name in states else None
+            spec.name: self.current_role_llm_func(spec.name)
+            if spec.name in states
+            else None
             for spec in ROLES
         }
         global_config["llm_cache_identities"] = {

@@ -1427,6 +1427,89 @@ export const getEffectiveRoleConfig = async (
   return response.data
 }
 
+/** One slot of the server default, with what's in use and the .env fallback. */
+export type ServerProviderSlot = Omit<ProviderSlotMasked, 'effective'> & {
+  effective: Omit<ProviderEffective, 'source'> & {
+    source: 'webui' | 'env'
+    api_key_preview: string
+  }
+  env: {
+    binding: string | null
+    host: string | null
+    model: string | null
+    api_key_preview: string
+  }
+}
+
+export type ServerProviderPause = {
+  workspace: string
+  slot: ProviderSlotKey
+  kind: string | null
+  status_code: number | null
+  since: number | null
+}
+
+export type ServerProviderView = {
+  extraction: ServerProviderSlot
+  query: ServerProviderSlot
+  vision: ServerProviderSlot
+  updated_at: string | null
+  updated_by: string | null
+  status: 'ok' | 'unreadable' | 'no_secret'
+  impact: {
+    total_workspaces: number
+    own_provider: Record<ProviderSlotKey, string[]>
+  }
+  paused: ServerProviderPause[]
+  /** Set on a change: how many workspaces resumed ingestion because of it. */
+  resumed?: number
+}
+
+export type ServerProviderTestResult = {
+  ok: boolean
+  outcome:
+    | 'ok'
+    | 'invalid_key'
+    | 'spend_limit'
+    | 'model_rejected'
+    | 'unreachable'
+    | 'provider_error'
+  status_code: number | null
+  message: string
+  latency_ms: number
+  can_apply_anyway: boolean
+}
+
+/** Admin-only: the server default provider and who a change would affect. */
+export const getServerProvider = async (): Promise<ServerProviderView> => {
+  const response = await axiosInstance.get('/admin/system-provider')
+  return response.data
+}
+
+/** Admin-only: try a slot as it stands in the form. Saves nothing. */
+export const testServerProvider = async (
+  slot: ProviderSlotKey,
+  input: ProviderSlotInput
+): Promise<ServerProviderTestResult> => {
+  const response = await axiosInstance.post('/admin/system-provider/test', { slot, ...input })
+  return response.data
+}
+
+/** Admin-only: set the server default for a slot. It applies immediately. */
+export const updateServerProvider = async (
+  slot: ProviderSlotKey,
+  input: ProviderSlotInput
+): Promise<ServerProviderView> => {
+  const response = await axiosInstance.put('/admin/system-provider', { [slot]: input })
+  return response.data
+}
+
+/** Admin-only: return a slot to the .env configuration. */
+export const clearServerProvider = async (slot: ProviderSlotKey): Promise<ServerProviderView> => {
+  const response = await axiosInstance.delete('/admin/system-provider', { params: { slot } })
+  return response.data
+}
+
 /** A workspace as listed by the admin endpoint. */
 export type AdminWorkspace = {
   workspace_id: string
