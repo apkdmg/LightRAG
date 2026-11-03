@@ -264,7 +264,10 @@ class DeferredResyncQueue:
             else:
                 logger.info(f"[{prefix_base}] Queued email re-sync applied")
 
-        if any(plan.insert for _, _, plan in loaded):
+        if loaded:
+            # Run the pipeline even when nothing was enqueued: while this batch
+            # held the destructive slot, other processing requests (startup
+            # resume, uploads) were told "request queued" and wait for it.
             task = asyncio.create_task(rag.apipeline_process_enqueue_documents())
             self._background.add(task)
             task.add_done_callback(self._background.discard)
