@@ -15,8 +15,22 @@ export function randomColor() {
   return code
 }
 
+/**
+ * Text for an error toast or panel. An API error also names its request ID
+ * ("Ref: <id>"), which support pastes into the Operations search to find the
+ * matching server log line.
+ */
 export function errorMessage(error: any) {
-  return error instanceof Error ? error.message : `${error}`
+  const message = error instanceof Error ? error.message : `${error}`
+  const ref = errorRequestId(error)
+  return ref && !message.includes(`Ref: ${ref}`) ? `${message}\nRef: ${ref}` : message
+}
+
+/** The X-Request-ID the API returned with this error, when it carries one. */
+export function errorRequestId(error: any): string | null {
+  return error && typeof error === 'object' && typeof error.requestId === 'string' && error.requestId
+    ? error.requestId
+    : null
 }
 
 /**

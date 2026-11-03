@@ -469,9 +469,11 @@ generate_docker_compose "$REPO_ROOT/docker-compose.final.yml\"
     )
     assert "        max_attempts: 10\n\n    volumes:\n" in generated_compose
     assert (
-        '      - "./data/prompts:/app/data/prompts"\n\n  sidecar:\n'
-        in generated_compose
-    )
+        '      - "./data/prompts:/app/data/prompts"\n'
+        '      - "./data/logs:/app/data/logs"\n'
+    ) in generated_compose
+    # The log upgrade (mount, LOG_DIR, caps) stays inside the lightrag service.
+    assert '      LOG_DIR: "/app/data/logs"\n\n  sidecar:\n' in generated_compose
 
 
 def test_generate_docker_compose_preserves_non_managed_named_volumes(
@@ -616,7 +618,8 @@ generate_docker_compose "$REPO_ROOT/docker-compose.final.yml\"
     assert "  vllm-rerank:" not in result
     assert "__WIZARD_MANAGED_SERVICES__" not in result
     assert "depends_on:" not in result
-    assert "        max_attempts: 10\n\nnetworks:\n" in result
+    assert '      LOG_DIR: "/app/data/logs"\n\nnetworks:\n' in result
+    assert "\n\n\n" not in result
 
 
 def test_generate_docker_compose_keeps_blank_line_between_managed_service_and_top_level_sections(
@@ -651,12 +654,104 @@ generate_docker_compose "$REPO_ROOT/docker-compose.final.yml\"
     result = (tmp_path / "docker-compose.final.yml").read_text(encoding="utf-8")
     assert "  vllm-embed:" in result
     assert (
-        """        max_attempts: 10
+        """      LOG_DIR: "/app/data/logs"
     depends_on:
 """
         in result
     )
     assert "    restart: unless-stopped\n\nnetworks:\n" in result
+
+
+_PRE_LOG_DIR_LIGHTRAG = [
+    "services:",
+    "  lightrag:",
+    "    image: example/lightrag:test",
+    "    ports:",
+    '      - "9621:9621"',
+    "    volumes:",
+    "      - ./data/rag_storage:/app/data/rag_storage",
+    "      - ./data/inputs:/app/data/inputs",
+    "      - ./data/prompts:/app/data/prompts",
+    "      - ./.env:/app/.env",
+    "    deploy:",
+    "      restart_policy:",
+    "        condition: on-failure",
+    "        max_attempts: 10",
+    "    extra_hosts:",
+    '      - "host.docker.internal:host-gateway"',
+    "    environment:",
+    '      WORKING_DIR: "/app/data/rag_storage"',
+    '      INPUT_DIR: "/app/data/inputs"',
+    '      PROMPT_DIR: "/app/data/prompts"',
+    '      HOST: "0.0.0.0"',
+    '      PORT: "9621"',
+]
+
+
+def _generate_existing_compose(tmp_path: Path, lines: list[str]) -> str:
+    write_text_lines(tmp_path / "docker-compose.final.yml", lines)
+    write_text_lines(
+        tmp_path / "env.example",
+        (REPO_ROOT / "env.example").read_text(encoding="utf-8").splitlines(),
+    )
+    run_bash(f"""
+set -euo pipefail
+source "{REPO_ROOT}/scripts/setup/setup.sh"
+REPO_ROOT="{tmp_path}"
+reset_state
+
+generate_docker_compose "$REPO_ROOT/docker-compose.final.yml\"
+""")
+    return (tmp_path / "docker-compose.final.yml").read_text(encoding="utf-8")
+
+
+def test_generate_docker_compose_upgrades_existing_compose_with_log_dir(
+    tmp_path: Path,
+) -> None:
+    """A compose file generated before LOG_DIR existed gets the log mount,
+    LOG_DIR (container path, compose only) and the json-file caps."""
+    result = _generate_existing_compose(tmp_path, _PRE_LOG_DIR_LIGHTRAG)
+    assert (
+        '      - "./data/logs:/app/data/logs"\n'
+        in result[: result.index("    deploy:")]
+    )
+    assert (
+        """    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+    environment:
+"""
+        in result
+    )
+    assert '      LOG_DIR: "/app/data/logs"\n' in result
+    assert result.count("LOG_DIR") == 1
+    # Regenerating changes nothing more.
+    again = _generate_existing_compose(tmp_path, result.splitlines())
+    assert again == result
+    # The container path never reaches the host-usable .env.
+    env_file = tmp_path / ".env"
+    if env_file.exists():
+        assert "/app/data/logs" not in env_file.read_text(encoding="utf-8")
+
+
+def test_generate_docker_compose_keeps_user_log_settings(tmp_path: Path) -> None:
+    """User-chosen LOG_DIR, log mount and logging driver are left as they are."""
+    lines = list(_PRE_LOG_DIR_LIGHTRAG)
+    lines.insert(
+        lines.index("      - ./.env:/app/.env"), "      - /srv/logs:/var/log/rag"
+    )
+    lines.insert(lines.index("    environment:"), "    logging:")
+    lines.insert(lines.index("    environment:"), "      driver: local")
+    lines.append('      LOG_DIR: "/var/log/rag"')
+    result = _generate_existing_compose(tmp_path, lines)
+    assert "json-file" not in result
+    assert "      driver: local\n" in result
+    assert '      LOG_DIR: "/var/log/rag"\n' in result
+    assert result.count("LOG_DIR") == 1
+    assert "/srv/logs:/var/log/rag" in result
+    assert "/app/data/logs" not in result
 
 
 def test_generate_docker_compose_keeps_single_blank_line_before_generated_volumes(

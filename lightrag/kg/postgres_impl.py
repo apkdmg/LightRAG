@@ -106,6 +106,33 @@ def _safe_index_name(table_name: str, index_suffix: str) -> str:
     return shortened_name
 
 
+def describe_sql_params(params: Any) -> str:
+    """Describe SQL parameters for an error log without their values.
+
+    Values can hold document text, file names or email content, so a log line
+    gets only each parameter's type and size: ``{workspace: str/12, ids:
+    list/3}``.
+    """
+
+    def _shape(value: Any) -> str:
+        kind = type(value).__name__
+        if value is None or isinstance(value, (bool, int, float)):
+            return kind
+        try:
+            return f"{kind}/{len(value)}"
+        except TypeError:
+            return kind
+
+    if params is None:
+        return "{}"
+    if isinstance(params, dict):
+        items = ", ".join(f"{key}: {_shape(value)}" for key, value in params.items())
+        return "{" + items + "}"
+    if isinstance(params, (list, tuple)):
+        return "[" + ", ".join(_shape(value) for value in params) + "]"
+    return _shape(params)
+
+
 def _timing_details_suffix(**details: Any) -> str:
     parts = [f"{key}={value}" for key, value in details.items()]
     return f" {' '.join(parts)}" if parts else ""
@@ -2221,7 +2248,10 @@ class PostgreSQLDB:
                 timing_label=timing_label,
             )
         except Exception as e:
-            logger.error(f"PostgreSQL database,\nsql:{sql},\ndata:{data},\nerror:{e}")
+            logger.error(
+                f"PostgreSQL database,\nsql:{sql},\n"
+                f"params:{describe_sql_params(data)},\nerror:{e}"
+            )
             raise
 
 
@@ -2836,7 +2866,8 @@ class PGKVStorage(BaseKVStorage):
             return new_keys
         except Exception as e:
             logger.error(
-                f"[{self.workspace}] PostgreSQL database,\nsql:{sql},\nparams:{params},\nerror:{e}"
+                f"[{self.workspace}] PostgreSQL database,\nsql:{sql},\n"
+                f"params:{describe_sql_params(params)},\nerror:{e}"
             )
             raise
 
@@ -4181,7 +4212,8 @@ class PGDocStatusStorage(DocStatusStorage):
             return new_keys
         except Exception as e:
             logger.error(
-                f"[{self.workspace}] PostgreSQL database,\nsql:{sql},\nparams:{params},\nerror:{e}"
+                f"[{self.workspace}] PostgreSQL database,\nsql:{sql},\n"
+                f"params:{describe_sql_params(params)},\nerror:{e}"
             )
             raise
 

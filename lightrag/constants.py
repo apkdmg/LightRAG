@@ -325,8 +325,8 @@ DEFAULT_RERANK_MAX_ASYNC = DEFAULT_MAX_ASYNC
 DEFAULT_RERANK_TIMEOUT = 30
 
 # Logging configuration defaults
-DEFAULT_LOG_MAX_BYTES = 10485760  # Default 10MB
-DEFAULT_LOG_BACKUP_COUNT = 5  # Default 5 backups
+DEFAULT_LOG_MAX_BYTES = 52428800  # Default 50MB
+DEFAULT_LOG_BACKUP_COUNT = 10  # Default 10 backups
 DEFAULT_LOG_FILENAME = "lightrag.log"  # Default log filename
 
 # Ollama server configuration defaults

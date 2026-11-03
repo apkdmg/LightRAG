@@ -1169,6 +1169,7 @@ generate_docker_compose() {
   local lightrag_env_entries=()
   local key
   local root_service
+  local from_existing_output="no"
 
   # Prefer the existing generated compose as the starting point to preserve
   # any user customisations to the lightrag service.  Fall back to the base
@@ -1177,6 +1178,7 @@ generate_docker_compose() {
     _refresh_existing_managed_root_service_set_from_compose "$output_file"
     _collect_top_level_volume_blocks "$output_file"
     cp "$output_file" "$tmp_file"
+    from_existing_output="yes"
     # Strip wizard-managed services and top-level volumes. User-managed
     # services are preserved, while volumes are rebuilt from final service
     # references after managed templates are appended.
@@ -1215,6 +1217,21 @@ generate_docker_compose() {
     lightrag_mounts+=("./data/prompts:/app/data/prompts")
   fi
 
+  # The text log lives on the host under ./data/logs (the base compose file
+  # carries the mount, LOG_DIR and the json-file log caps). A compose file
+  # generated before they existed is upgraded in place: it gets the mount,
+  # LOG_DIR pointing at the container path (compose only; never persisted to
+  # .env) and the caps. A LOG_DIR or logging block the user already set means
+  # they chose their own layout, and it is kept.
+  local add_log_dir="no"
+  if [[ "$from_existing_output" == "yes" ]] && \
+     ! _lightrag_environment_has_key "$tmp_file" "LOG_DIR"; then
+    add_log_dir="yes"
+    if ! _lightrag_volumes_have_container_target "$tmp_file" "/app/data/logs"; then
+      lightrag_mounts+=("./data/logs:/app/data/logs")
+    fi
+  fi
+
   append_lightrag_ssl_mount lightrag_mounts "${COMPOSE_ENV_OVERRIDES[SSL_CERTFILE]:-}" || return 1
   append_lightrag_ssl_mount lightrag_mounts "${COMPOSE_ENV_OVERRIDES[SSL_KEYFILE]:-}" || return 1
   if ((${#lightrag_mounts[@]} > 0)); then
@@ -1224,8 +1241,14 @@ generate_docker_compose() {
   for key in "${!COMPOSE_ENV_OVERRIDES[@]}"; do
     lightrag_env_entries+=("${key}=${COMPOSE_ENV_OVERRIDES[$key]}")
   done
+  if [[ "$add_log_dir" == "yes" ]]; then
+    lightrag_env_entries+=("LOG_DIR=/app/data/logs")
+  fi
   if ((${#lightrag_env_entries[@]} > 0)); then
     inject_lightrag_environment_overrides "$tmp_file" "${lightrag_env_entries[@]}"
+  fi
+  if [[ "$from_existing_output" == "yes" ]]; then
+    inject_lightrag_logging_defaults "$tmp_file"
   fi
 
   repair_misplaced_lightrag_depends_on "$tmp_file"
@@ -1725,6 +1748,126 @@ _lightrag_volumes_have_container_target() {
   done < "$compose_file"
 
   return 1
+}
+
+# Return success when the lightrag service's environment sets KEY, in either
+# the mapping ("KEY: value") or the list ("- KEY=value") style.
+_lightrag_environment_has_key() {
+  local compose_file="$1"
+  local key="$2"
+  local line
+  local in_lightrag="no"
+  local in_environment="no"
+
+  if [[ ! -f "$compose_file" || -z "$key" ]]; then
+    return 1
+  fi
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    if [[ "$in_lightrag" == "yes" ]]; then
+      if [[ "$line" =~ ^[[:space:]]{2}[^[:space:]] && "$line" != "  lightrag:" ]] || \
+         [[ "$line" =~ ^[^[:space:]] ]]; then
+        in_lightrag="no"
+        in_environment="no"
+      elif [[ "$line" == "    environment:" ]]; then
+        in_environment="yes"
+      elif [[ "$in_environment" == "yes" && "$line" =~ ^[[:space:]]{4}[^[:space:]-] ]]; then
+        in_environment="no"
+      elif [[ "$in_environment" == "yes" ]]; then
+        if [[ "$line" =~ ^[[:space:]]{6}${key}: ]] || \
+           [[ "$line" =~ ^[[:space:]]{6}-[[:space:]]+[\"\']?${key}= ]]; then
+          return 0
+        fi
+      fi
+    fi
+
+    if [[ "$line" == "  lightrag:" ]]; then
+      in_lightrag="yes"
+      in_environment="no"
+    fi
+  done < "$compose_file"
+
+  return 1
+}
+
+# Add the json-file log caps to the lightrag service unless it already has a
+# logging block (a user-chosen driver or caps are kept as they are). The block
+# goes before the service's environment block, or at the end of the service.
+inject_lightrag_logging_defaults() {
+  local compose_file="$1"
+  local tmp_file="${compose_file}.logging"
+  _FILE_OPS_CLEANUP_TMP+=("$tmp_file")
+  local line
+  local in_lightrag="no"
+  local has_logging="no"
+  local inserted="no"
+  local pending_blank=0
+  local i
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    if [[ "$in_lightrag" == "yes" ]]; then
+      if [[ "$line" =~ ^[[:space:]]{2}[^[:space:]] || "$line" =~ ^[^[:space:]] ]]; then
+        in_lightrag="no"
+      elif [[ "$line" =~ ^[[:space:]]{4}logging: ]]; then
+        has_logging="yes"
+      fi
+    fi
+    if [[ "$line" == "  lightrag:" ]]; then
+      in_lightrag="yes"
+    fi
+  done < "$compose_file"
+
+  if [[ "$has_logging" == "yes" ]] || ! grep -qx '  lightrag:' "$compose_file"; then
+    return 0
+  fi
+
+  : > "$tmp_file"
+  in_lightrag="no"
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    if [[ "$in_lightrag" == "yes" && "$inserted" == "no" ]]; then
+      if [[ -z "$line" ]]; then
+        # Blank lines may end the service; hold them until we know.
+        pending_blank=$((pending_blank + 1))
+        continue
+      fi
+      if [[ "$line" == "    environment:" ]] || \
+         [[ "$line" =~ ^[[:space:]]{2}[^[:space:]] || "$line" =~ ^[^[:space:]] ]]; then
+        _write_lightrag_logging_block "$tmp_file"
+        inserted="yes"
+        in_lightrag="no"
+      fi
+      for ((i = 0; i < pending_blank; i++)); do
+        printf '\n' >> "$tmp_file"
+      done
+      pending_blank=0
+    fi
+
+    printf '%s\n' "$line" >> "$tmp_file"
+
+    if [[ "$line" == "  lightrag:" ]]; then
+      in_lightrag="yes"
+    fi
+  done < "$compose_file"
+
+  if [[ "$in_lightrag" == "yes" && "$inserted" == "no" ]]; then
+    _write_lightrag_logging_block "$tmp_file"
+  fi
+  for ((i = 0; i < pending_blank; i++)); do
+    printf '\n' >> "$tmp_file"
+  done
+
+  mv "$tmp_file" "$compose_file"
+}
+
+_write_lightrag_logging_block() {
+  cat >> "$1" <<'LOGGING_BLOCK'
+    # Cap the console log Docker keeps for this container (json-file driver).
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+LOGGING_BLOCK
 }
 
 # Return success when a volume mount entry is a wizard-managed SSL cert/key

@@ -25,6 +25,7 @@ import {
 import DeleteWorkspaceCard from '@/components/DeleteWorkspaceCard'
 import { useProvidersStore } from '@/stores/providers'
 import { useAuthStore } from '@/stores/state'
+import { errorMessage } from '@/lib/utils'
 import { PROVIDER_SLOT_META, getPreset, presetForBaseUrl } from '@/features/providerPresets'
 import ProviderSlotFields, { type SlotDraft } from '@/features/ProviderSlotFields'
 import ManageWorkspaceSelector from '@/features/ManageWorkspaceSelector'
@@ -89,7 +90,7 @@ function ProviderSlotForm({ slot, masked, targetWorkspace, onSaved }: SlotFormPr
       toast.success(t('providerSettings.saved'))
       onSaved()
     } catch (err: any) {
-      toast.error(err?.message || t('providerSettings.errors.saveFailed'))
+      toast.error(err?.message ? errorMessage(err) : t('providerSettings.errors.saveFailed'))
     } finally {
       setBusy(false)
     }
@@ -103,7 +104,7 @@ function ProviderSlotForm({ slot, masked, targetWorkspace, onSaved }: SlotFormPr
       toast.success(t('providerSettings.cleared'))
       onSaved()
     } catch (err: any) {
-      toast.error(err?.message || t('providerSettings.errors.clearFailed'))
+      toast.error(err?.message ? errorMessage(err) : t('providerSettings.errors.clearFailed'))
     } finally {
       setBusy(false)
     }
@@ -197,7 +198,7 @@ export default function ProviderSettings() {
         setDisabled(true)
         setConfig(null)
       } else {
-        toast.error(err?.message || t('providerSettings.errors.loadFailed'))
+        toast.error(err?.message ? errorMessage(err) : t('providerSettings.errors.loadFailed'))
       }
     } finally {
       setLoading(false)

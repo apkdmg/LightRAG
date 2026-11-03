@@ -524,15 +524,49 @@ axiosInstance.interceptors.response.use(
         navigationService.navigateToLogin();
         return Promise.reject(new Error('Authentication required'));
       }
-      throw new Error(
-        `${error.response.status} ${error.response.statusText}\n${JSON.stringify(
-          error.response.data
-        )}\n${error.config?.url}`
-      )
+      throw toApiError(error.response, error.config?.url)
     }
     throw error
   }
 )
+
+/**
+ * An HTTP error from the API. The message keeps the long-standing
+ * "<status> <statusText>\n<body>\n<url>" format that callers match on;
+ * the fields carry the parts so a view can map them without parsing.
+ */
+export type ApiError = Error & {
+  status: number
+  detail: unknown
+  requestId: string | null
+}
+
+type ErrorResponseLike = {
+  status: number
+  statusText?: string
+  data?: unknown
+  headers?: unknown
+}
+
+const readHeader = (headers: unknown, name: string): string | null => {
+  if (!headers || typeof headers !== 'object') return null
+  const h = headers as { get?: (key: string) => unknown } & Record<string, unknown>
+  // AxiosHeaders exposes get(); plain objects (tests, adapters) use lower-case keys.
+  const value = typeof h.get === 'function' ? h.get(name) : h[name] ?? h[name.toLowerCase()]
+  return typeof value === 'string' && value ? value : null
+}
+
+export const toApiError = (response: ErrorResponseLike, url?: string): ApiError => {
+  const err = new Error(
+    `${response.status} ${response.statusText ?? ''}\n${JSON.stringify(response.data)}\n${url}`
+  ) as ApiError
+  const data = response.data as { detail?: unknown; request_id?: unknown } | null | undefined
+  const bodyRequestId = data && typeof data === 'object' && typeof data.request_id === 'string' ? data.request_id : null
+  err.status = response.status
+  err.detail = data && typeof data === 'object' && 'detail' in data ? data.detail : null
+  err.requestId = readHeader(response.headers, 'x-request-id') ?? bodyRequestId
+  return err
+}
 
 // API methods
 export const queryGraphs = async (

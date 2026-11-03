@@ -25,7 +25,7 @@ import tempfile
 import traceback
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from email import policy
 from email.utils import getaddresses, parsedate_to_datetime
 from html.parser import HTMLParser
@@ -47,6 +47,8 @@ from fastapi import (
 from pydantic import BaseModel, Field
 
 from lightrag.api.dependencies import resolve_workspace_from_request
+from lightrag.api.ops.context import bind_log_workspace
+from lightrag.api.ops.redact import mask_path, text_ref
 from lightrag.api.provider_alerts import is_own_alert_email
 from lightrag.api.utils_api import get_combined_auth_dependency
 from lightrag.constants import DEFAULT_MM_ANALYSIS_PRIORITY, DEFAULT_MM_IMAGE_MIN_PIXEL
@@ -405,7 +407,7 @@ async def _mark_deletion_job(rag: Any, bundle_key: str, count: int) -> None:
         ps.update(
             {
                 "job_name": f"Deleting email bundle {bundle_key} ({count} documents)",
-                "job_start": datetime.now().isoformat(),
+                "job_start": datetime.now(timezone.utc).isoformat(),
                 "docs": count,
                 "batchs": count,
                 "cur_batch": 0,
@@ -883,7 +885,7 @@ class EmailIngestionService:
                 )
             except Exception as e:
                 logger.warning(
-                    f"Failed to process inline image {inline_img.filename}: {e}"
+                    f"Failed to process inline image {mask_path(inline_img.filename)}: {e}"
                 )
                 keep_paths.append(
                     _component_file_path(
@@ -932,7 +934,7 @@ class EmailIngestionService:
                 )
             except Exception as e:
                 logger.warning(
-                    f"Failed to process attachment {attachment.filename}: {e}"
+                    f"Failed to process attachment {mask_path(attachment.filename)}: {e}"
                 )
                 keep_paths.append(
                     _component_file_path(
@@ -1205,7 +1207,7 @@ Attachments ({len(all_attachments)} files):
             raise _ComponentFailed(f"{result.status} ({result.note})")
         if not result.ok:
             logger.info(
-                f"Skipping inline image {image.filename}: "
+                f"Skipping inline image {mask_path(image.filename)}: "
                 f"{result.status} ({result.note})"
             )
             return None
@@ -1245,7 +1247,7 @@ Image Description:
             raise _ComponentFailed(f"{result.status} ({result.note})")
         if not result.ok:
             logger.info(
-                f"Skipping attachment {attachment.filename}: "
+                f"Skipping attachment {mask_path(attachment.filename)}: "
                 f"{result.status} ({result.note})"
             )
             return None
@@ -1320,7 +1322,9 @@ Content:
                 cache_type="analysis",
             )
         except Exception as e:
-            logger.warning(f"Image cache read failed for {image.filename}: {e}")
+            logger.warning(
+                f"Image cache read failed for {mask_path(image.filename)}: {e}"
+            )
             cached = None
         if cached is not None:
             return ExtractionResult(cached[0], "ok")
@@ -1330,7 +1334,7 @@ Content:
             if not (response and response.strip()):
                 return ExtractionResult(None, "empty", "empty vision response")
         except Exception as e:
-            logger.warning(f"Vision model failed for {image.filename}: {e}")
+            logger.warning(f"Vision model failed for {mask_path(image.filename)}: {e}")
             rejection = classify_provider_rejection(e)
             if rejection is not None:
                 # Email images always use the system vlm role, i.e. the system key.
@@ -1360,7 +1364,9 @@ Content:
                     ),
                 )
             except Exception as e:
-                logger.warning(f"Image cache write failed for {image.filename}: {e}")
+                logger.warning(
+                    f"Image cache write failed for {mask_path(image.filename)}: {e}"
+                )
         return ExtractionResult(response, "ok")
 
     async def _extract_attachment_content(
@@ -1450,7 +1456,9 @@ Content:
                 return ExtractionResult("\n\n".join(text_parts), "ok")
             return ExtractionResult(None, "empty", "no extractable text")
         except Exception as e:
-            logger.warning(f"PDF extraction failed for {attachment.filename}: {e}")
+            logger.warning(
+                f"PDF extraction failed for {mask_path(attachment.filename)}: {e}"
+            )
             return ExtractionResult(None, "failed", "PDF extraction error")
 
     async def _extract_docx_text(
@@ -1469,7 +1477,9 @@ Content:
                 return ExtractionResult("\n\n".join(paragraphs), "ok")
             return ExtractionResult(None, "empty", "no extractable text")
         except Exception as e:
-            logger.warning(f"DOCX extraction failed for {attachment.filename}: {e}")
+            logger.warning(
+                f"DOCX extraction failed for {mask_path(attachment.filename)}: {e}"
+            )
             return ExtractionResult(None, "failed", "DOCX extraction error")
 
 
@@ -1586,6 +1596,7 @@ async def get_lightrag_for_request(request: Request, rag_instance=None):
     if workspace_manager is not None:
         # Multi-tenant mode - get workspace-specific LightRAG instance
         workspace = await resolve_workspace_from_request(request)
+        bind_log_workspace(workspace)
         return await workspace_manager.get_lightrag_instance(workspace)
     else:
         # Single-instance mode - use the provided rag instance
@@ -1784,7 +1795,7 @@ is not ingested. The response is 200 with `status` set to `skipped`.
             temp_file_path = None
             if email_file and email_file.filename:
                 # Mode 1: Raw .eml file - use streaming for large file support
-                logger.info(f"Processing .eml file: {email_file.filename}")
+                logger.info(f"Processing .eml file: {mask_path(email_file.filename)}")
 
                 try:
                     # Stream upload to temp file (handles up to 100MB)
@@ -1910,7 +1921,10 @@ is not ingested. The response is 200 with `status` set to `skipped`.
             # here. Indexing them adds noise and spends tokens on LightRAG's own
             # mail, most of all during the outages they report.
             if is_own_alert_email(parsed_email.from_address, parsed_email.subject):
-                logger.info(f"Skipped LightRAG's own email: {parsed_email.subject}")
+                logger.info(
+                    "Skipped LightRAG's own email "
+                    f"(subject {text_ref(parsed_email.subject)})"
+                )
                 return EmailIngestionResponse(
                     status="skipped",
                     bundle_id=bundle_id,
@@ -1931,7 +1945,8 @@ is not ingested. The response is 200 with `status` set to `skipped`.
                 """Background task to ingest email."""
                 try:
                     logger.info(
-                        f"[{t_id}] Starting background email ingestion for: {email.subject}"
+                        f"[{t_id}] Starting background email ingestion "
+                        f"(subject {text_ref(email.subject)})"
                     )
                     result = await svc.ingest_email(
                         email, bundle_id=b_id, track_id=t_id, source_override=src

@@ -4,6 +4,7 @@ import AppSettings from '@/components/AppSettings'
 import { TabsList, TabsTrigger } from '@/components/ui/Tabs'
 import { useSettingsStore } from '@/stores/settings'
 import { useAuthStore } from '@/stores/state'
+import { useAdminCapability } from '@/hooks/useAdminCapability'
 import { cn } from '@/lib/utils'
 import { useTranslation } from 'react-i18next'
 import { navigationService } from '@/services/navigation'
@@ -33,7 +34,8 @@ function NavigationTab({ value, currentTab, children }: NavigationTabProps) {
 
 function TabsNavigation() {
   const currentTab = useSettingsStore.use.currentTab()
-  const { isGuestMode, role } = useAuthStore()
+  const { isGuestMode } = useAuthStore()
+  const isAdmin = useAdminCapability()
   const { t } = useTranslation()
 
   return (
@@ -57,10 +59,15 @@ function TabsNavigation() {
             {t('header.providers')}
           </NavigationTab>
         )}
-        {/* The server enforces the admin role on every Insights request. */}
-        {role === 'admin' && (
+        {/* The server enforces the admin role on every Insights and Operations request. */}
+        {isAdmin && (
           <NavigationTab value="insights" currentTab={currentTab}>
             {t('header.insights')}
+          </NavigationTab>
+        )}
+        {isAdmin && (
+          <NavigationTab value="operations" currentTab={currentTab}>
+            {t('header.operations')}
           </NavigationTab>
         )}
       </TabsList>

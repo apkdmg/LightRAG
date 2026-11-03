@@ -144,7 +144,8 @@ async def anthropic_complete_if_cache(
 
     logger.debug("===== Sending Query to Anthropic LLM =====")
     logger.debug(f"Model: {model}   Base URL: {base_url}")
-    logger.debug(f"Additional kwargs: {kwargs}")
+    # Keys only: values can hold API keys, headers and prompt content.
+    logger.debug(f"Additional kwargs keys: {sorted(kwargs.keys())}")
     verbose_debug(f"Query: {prompt}")
     verbose_debug(f"System prompt: {system_prompt}")
 
@@ -176,7 +177,8 @@ async def anthropic_complete_if_cache(
             extra_parts.append(f"Request URL: {req.url}")
         extra = ("\n" + "\n".join(extra_parts)) if extra_parts else ""
         logger.error(
-            f"Anthropic API Call Failed,\nModel: {model},\nParams: {kwargs}, Got: {e}{extra}"
+            f"Anthropic API Call Failed,\nModel: {model},\n"
+            f"Param keys: {sorted(kwargs.keys())}, Got: {e}{extra}"
         )
         raise
 
