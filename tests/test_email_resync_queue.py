@@ -295,6 +295,38 @@ async def test_queued_version_already_stored_deletes_nothing(tmp_path, monkeypat
         await rag.finalize_storages()
 
 
+async def test_unchanged_batch_still_runs_waiting_documents(tmp_path):
+    rag = await _build_rag(tmp_path)
+    queue = _queue(tmp_path, rag)
+    svc = EmailIngestionService(rag, resync_queue=queue)
+    try:
+        await svc.ingest_email(_email("a.txt"), track_id="v1")
+        stored = await rag.doc_status.get_docs_by_statuses(list(DocStatus))
+        components = [
+            ((await rag.full_docs.get_by_id(doc_id))["content"], str(st.file_path))
+            for doc_id, st in stored.items()
+        ]
+        # A document left waiting, as after a restart: its processing request
+        # was refused while the batch held the destructive slot.
+        await rag.apipeline_enqueue_documents(
+            ["A document waiting since the restart."], file_paths=["waiting.txt"]
+        )
+
+        await queue.defer(
+            rag.workspace, components[0][1].split("__")[0], "v2", components
+        )
+        await _wait_drained(queue, rag.workspace)
+
+        docs = await rag.doc_status.get_docs_by_statuses(list(DocStatus))
+        waiting = [st for st in docs.values() if st.file_path == "waiting.txt"]
+        assert [str(getattr(st.status, "value", st.status)) for st in waiting] == [
+            "processed"
+        ]
+    finally:
+        await queue.stop()
+        await rag.finalize_storages()
+
+
 async def test_version_1_record_still_applies(tmp_path):
     rag = await _build_rag(tmp_path)
     queue = _queue(tmp_path, rag)
