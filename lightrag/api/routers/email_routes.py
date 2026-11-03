@@ -31,7 +31,7 @@ from email.utils import getaddresses, parsedate_to_datetime
 from html.parser import HTMLParser
 from io import BytesIO
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import aiofiles
 from fastapi import (
@@ -114,6 +114,14 @@ class ExtractionResult:
     @property
     def ok(self) -> bool:
         return self.status == "ok" and bool(self.text and self.text.strip())
+
+
+class _ComponentFailed(Exception):
+    """Processing a component failed this time (e.g. the vision call errored).
+
+    Unlike a component with no genuine content (too small, unsupported), a
+    failure says nothing about the copy already stored, so a re-sync keeps it.
+    """
 
 
 def _vlm_image_limits() -> Tuple[int, int]:
@@ -269,28 +277,117 @@ async def _get_bundle_lock(bundle_key: str) -> asyncio.Lock:
         return _bundle_locks.setdefault(bundle_key, asyncio.Lock())
 
 
-async def _enumerate_bundle_doc_ids(rag: Any, prefix: str) -> List[str]:
-    """All doc_ids whose stored file_path starts with the bundle prefix.
-
-    O(N) scan of doc_status (acceptable at current scale; a
-    ``get_doc_ids_by_file_path_prefix`` storage method is the flagged follow-up).
-    """
-    from lightrag.base import DocStatus
-
-    docs = await rag.doc_status.get_docs_by_statuses(list(DocStatus))
-    return _bundle_doc_ids(docs, prefix)
+def _entry_field(entry: Any, name: str) -> Any:
+    """Read a field from a doc_status entry, stored as an object or a dict."""
+    value = getattr(entry, name, None)
+    if value is None and isinstance(entry, dict):
+        value = entry.get(name)
+    return value
 
 
 def _bundle_doc_ids(docs: Dict[str, Any], prefix: str) -> List[str]:
     """Filter a doc_status snapshot down to one bundle's doc_ids."""
     result: List[str] = []
     for did, st in docs.items():
-        fp = getattr(st, "file_path", None)
-        if fp is None and isinstance(st, dict):
-            fp = st.get("file_path")
+        fp = _entry_field(st, "file_path")
         if isinstance(fp, str) and fp.startswith(prefix):
             result.append(did)
     return result
+
+
+def _component_doc_id(file_path: str) -> str:
+    """The doc_id a bundle component is stored under (derived from its path)."""
+    from lightrag.utils import compute_mdhash_id
+    from lightrag.utils_pipeline import normalize_document_file_path
+
+    return compute_mdhash_id(normalize_document_file_path(file_path), prefix="doc-")
+
+
+# A stored component in one of these states ends up holding its current text
+# without another ingest: it is done, or still on its way through the pipeline.
+_REUSABLE_DOC_STATUSES = frozenset(
+    {"pending", "parsing", "analyzing", "processing", "processed"}
+)
+
+
+@dataclass
+class BundleSyncPlan:
+    """What one sync of an email bundle has to change in storage."""
+
+    delete_ids: List[str] = field(default_factory=list)
+    insert: List[Tuple[str, str]] = field(default_factory=list)  # (content, path)
+
+    @property
+    def unchanged(self) -> bool:
+        return not self.delete_ids and not self.insert
+
+
+def plan_bundle_sync(
+    stored: Dict[str, Tuple[str, Optional[str]]],
+    components: List[Tuple[str, str]],
+    keep_paths: Iterable[str] = (),
+) -> BundleSyncPlan:
+    """Diff a freshly built bundle against the documents stored for it.
+
+    ``stored`` maps each stored doc_id of the bundle to ``(status,
+    content_hash)``. A component whose stored copy holds the same text and has
+    not failed is left alone. Deleting it would make LightRAG re-summarise
+    every entity the email mentions, only for the same text to bring the same
+    descriptions back, so an unchanged re-sync changes nothing at all.
+
+    Changed or failed components are replaced and new ones added. Stored
+    components the email no longer produces are removed, except those in
+    ``keep_paths``: they failed to process this time, which says nothing
+    about the stored copy.
+    """
+    from lightrag.utils_pipeline import raw_document_content_hash
+
+    plan = BundleSyncPlan()
+    produced = set()
+    for content, file_path in components:
+        doc_id = _component_doc_id(file_path)
+        produced.add(doc_id)
+        current = stored.get(doc_id)
+        if current is not None:
+            status, content_hash = current
+            if (
+                status in _REUSABLE_DOC_STATUSES
+                and content_hash == raw_document_content_hash(content)
+            ):
+                continue
+            plan.delete_ids.append(doc_id)
+        plan.insert.append((content, file_path))
+    kept = {_component_doc_id(fp) for fp in keep_paths}
+    plan.delete_ids.extend(d for d in stored if d not in produced and d not in kept)
+    return plan
+
+
+async def _stored_bundle_state(
+    rag: Any, docs: Dict[str, Any], prefix: str
+) -> Dict[str, Tuple[str, Optional[str]]]:
+    """``(status, content_hash)`` of each stored document of one bundle.
+
+    ``docs`` is a doc_status snapshot. A document stored before content hashes
+    were recorded gets one computed from its stored text.
+    """
+    from lightrag.utils_pipeline import compute_text_content_hash
+
+    state: Dict[str, Tuple[str, Optional[str]]] = {}
+    for doc_id in _bundle_doc_ids(docs, prefix):
+        entry = docs[doc_id]
+        status = _entry_field(entry, "status")
+        state[doc_id] = (
+            str(getattr(status, "value", status) or ""),
+            _entry_field(entry, "content_hash") or None,
+        )
+    missing = [doc_id for doc_id, (_, digest) in state.items() if digest is None]
+    if missing:
+        # Stored text is already sanitized, so it is hashed as-is.
+        for doc_id, full in zip(missing, await rag.full_docs.get_by_ids(missing)):
+            content = (full or {}).get("content")
+            if content:
+                state[doc_id] = (state[doc_id][0], compute_text_content_hash(content))
+    return state
 
 
 async def _mark_deletion_job(rag: Any, bundle_key: str, count: int) -> None:
@@ -743,8 +840,10 @@ class EmailIngestionService:
         Every component (master body, inline images, attachments) is given a
         stable, unique ``file_path`` keyed on the bundle so re-synced emails map
         to the same doc_ids.  All components are inserted in one batched
-        ``ainsert`` under a single ``track_id``.  On re-sync, prior bundle docs
-        are deleted first (overwrite semantics).
+        ``ainsert`` under a single ``track_id``.  On re-sync only what changed
+        is replaced: an unchanged component stays as stored, a changed one is
+        deleted and re-added, and one the email no longer has is removed (see
+        :func:`plan_bundle_sync`).
 
         Args:
             parsed_email: The parsed email with all components.
@@ -764,6 +863,8 @@ class EmailIngestionService:
 
         components: List[Tuple[str, str]] = []  # (content, file_path)
         outcomes: List[Dict[str, Any]] = []
+        # Components that failed this time: a re-sync keeps their stored copy.
+        keep_paths: List[str] = []
 
         # 1. Master email document (always present).
         components.append(
@@ -783,6 +884,11 @@ class EmailIngestionService:
             except Exception as e:
                 logger.warning(
                     f"Failed to process inline image {inline_img.filename}: {e}"
+                )
+                keep_paths.append(
+                    _component_file_path(
+                        prefix_base, "inline", idx, inline_img.filename
+                    )
                 )
                 outcomes.append(
                     {
@@ -828,6 +934,11 @@ class EmailIngestionService:
                 logger.warning(
                     f"Failed to process attachment {attachment.filename}: {e}"
                 )
+                keep_paths.append(
+                    _component_file_path(
+                        prefix_base, "attachment", idx, attachment.filename
+                    )
+                )
                 outcomes.append(
                     {
                         "kind": "attachment",
@@ -862,33 +973,36 @@ class EmailIngestionService:
                 }
             )
 
-        # 4. Overwrite-on-resync + single batched insert under one track_id.
-        #    If an older re-sync of this bundle is still queued, queue this
-        #    one behind it so the versions apply in order.
+        # 4. Sync the stored bundle: unchanged components stay, changed ones
+        #    are replaced, all inserts share one track_id. If an older re-sync
+        #    of this bundle is still queued, queue this one behind it so the
+        #    versions apply in order (unless it is that same version).
         queue = self.resync_queue
         workspace = self.rag.workspace
         lock = await _get_bundle_lock(f"{workspace}:{prefix_base}")
         async with lock:
-            deferred = queue is not None and queue.has_pending(workspace, prefix_base)
-            if not deferred:
-                deferred = not await self._overwrite_bundle(
-                    prefix_base, can_defer=queue is not None
+            if queue is not None and queue.has_pending(workspace, prefix_base):
+                if await queue.pending_matches(
+                    workspace, prefix_base, components, keep_paths
+                ):
+                    outcome, written = "unchanged", 0
+                else:
+                    outcome = "deferred"
+            else:
+                outcome, written = await self._sync_bundle(
+                    prefix_base,
+                    components,
+                    keep_paths,
+                    track_id,
+                    can_defer=queue is not None,
                 )
-            if not deferred:
-                try:
-                    await self.rag.ainsert(
-                        input=[content for content, _ in components],
-                        file_paths=[fp for _, fp in components],
-                        track_id=track_id,
-                    )
-                except EnqueueRefusedError:
-                    # Another bundle's overwrite (or a scan) holds the slot;
-                    # nothing was written, so keep the email for later.
-                    if queue is None:
-                        raise
-                    deferred = True
-            if deferred:
-                await queue.defer(workspace, prefix_base, track_id, components)
+            if outcome == "deferred":
+                await queue.defer(
+                    workspace, prefix_base, track_id, components, keep_paths
+                )
+                written = len(components)
+        if outcome == "unchanged":
+            logger.info(f"[{prefix_base}] Email unchanged, nothing to re-index")
 
         inline_ok = sum(
             1 for o in outcomes if o["kind"] == "inline_image" and o["status"] == "ok"
@@ -899,63 +1013,93 @@ class EmailIngestionService:
         return {
             "bundle_id": bundle_id,
             "track_id": track_id,
-            "deferred": deferred,
-            "documents_created": len(components),
+            "deferred": outcome == "deferred",
+            "unchanged": outcome == "unchanged",
+            "documents_created": written,
             "email_subject": parsed_email.subject,
             "attachments_processed": att_ok,
             "inline_images_processed": inline_ok,
             "components": outcomes,
         }
 
-    async def _overwrite_bundle(self, prefix_base: str, *, can_defer: bool) -> bool:
-        """Delete all prior docs for this bundle so a re-sync overwrites cleanly.
+    async def _plan_sync(
+        self,
+        prefix_base: str,
+        components: List[Tuple[str, str]],
+        keep_paths: List[str],
+    ) -> BundleSyncPlan:
+        """Plan this sync against what is stored for the bundle.
 
         Cheap O(1) precheck via the deterministic master doc_id: only re-syncs
-        (existing master) pay the full prefix scan + destructive reservation;
-        first-time ingests return immediately and go straight to enqueue.
-
-        Returns False when the destructive slot stayed unavailable and
-        ``can_defer`` is set (the caller queues the re-sync); without a queue
-        that case raises, as there is nowhere to keep the update.
+        (existing master) pay the full prefix scan, an O(N) read of doc_status
+        (acceptable at current scale; a ``get_doc_ids_by_file_path_prefix``
+        storage method is the flagged follow-up). A first-time ingest just
+        inserts everything.
         """
-        from lightrag.utils import compute_mdhash_id
-        from lightrag.utils_pipeline import normalize_document_file_path
+        from lightrag.base import DocStatus
 
         rag = self.rag
-        master_fp = _component_file_path(prefix_base, "master", 0, None)
-        master_id = compute_mdhash_id(
-            normalize_document_file_path(master_fp), prefix="doc-"
+        master_id = _component_doc_id(
+            _component_file_path(prefix_base, "master", 0, None)
         )
         if await rag.doc_status.get_by_id(master_id) is None:
-            return True  # first-time ingest: nothing to overwrite
+            return BundleSyncPlan(insert=list(components))
+        docs = await rag.doc_status.get_docs_by_statuses(list(DocStatus))
+        stored = await _stored_bundle_state(rag, docs, f"{prefix_base}__")
+        return plan_bundle_sync(stored, components, keep_paths)
 
-        # Lazy import avoids app-factory circular-import ordering issues.
-        from lightrag.api.routers.document_routes import (
-            _acquire_destructive_busy,
-            _release_destructive_busy,
-        )
+    async def _sync_bundle(
+        self,
+        prefix_base: str,
+        components: List[Tuple[str, str]],
+        keep_paths: List[str],
+        track_id: str,
+        *,
+        can_defer: bool,
+    ) -> Tuple[str, int]:
+        """Bring the stored bundle in line with ``components``.
 
-        prefix = f"{prefix_base}__"
-        # Short bounded retry rides out brief contention (another upload's
-        # enqueue); a processing run can hold the slot for much longer, in
-        # which case the caller queues the re-sync instead.
-        acquired = False
-        reason: Optional[str] = None
-        attempts = 3 if can_defer else 5
-        for attempt in range(attempts):
-            acquired, reason = await _acquire_destructive_busy(rag)
-            if acquired:
-                break
-            await asyncio.sleep(_OVERWRITE_RETRY_BASE_SECONDS * (attempt + 1))
-        if not acquired:
-            if can_defer:
-                return False
-            raise RuntimeError(f"Cannot overwrite email bundle {prefix_base}: {reason}")
-        try:
-            existing = await _enumerate_bundle_doc_ids(rag, prefix)
-            if existing:
-                await _mark_deletion_job(rag, prefix_base, len(existing))
-                for did in existing:
+        Returns ``(outcome, documents written)``, the outcome being
+        "unchanged", "applied" or "deferred". Only a sync that deletes needs
+        the destructive slot; it is "deferred" when that slot (or the enqueue)
+        stayed unavailable and ``can_defer`` is set, so the caller queues it.
+        Without a queue that case raises, as there is nowhere to keep it.
+        """
+        rag = self.rag
+        plan = await self._plan_sync(prefix_base, components, keep_paths)
+        if plan.unchanged:
+            return "unchanged", 0
+
+        if plan.delete_ids:
+            # Lazy import avoids app-factory circular-import ordering issues.
+            from lightrag.api.routers.document_routes import (
+                _acquire_destructive_busy,
+                _release_destructive_busy,
+            )
+
+            # Short bounded retry rides out brief contention (another upload's
+            # enqueue); a processing run can hold the slot for much longer, in
+            # which case the caller queues the re-sync instead.
+            acquired = False
+            reason: Optional[str] = None
+            attempts = 3 if can_defer else 5
+            for attempt in range(attempts):
+                acquired, reason = await _acquire_destructive_busy(rag)
+                if acquired:
+                    break
+                await asyncio.sleep(_OVERWRITE_RETRY_BASE_SECONDS * (attempt + 1))
+            if not acquired:
+                if can_defer:
+                    return "deferred", 0
+                raise RuntimeError(
+                    f"Cannot overwrite email bundle {prefix_base}: {reason}"
+                )
+            try:
+                # Plan again under the slot: the first snapshot may be stale.
+                plan = await self._plan_sync(prefix_base, components, keep_paths)
+                if plan.delete_ids:
+                    await _mark_deletion_job(rag, prefix_base, len(plan.delete_ids))
+                for did in plan.delete_ids:
                     res = await rag.adelete_by_doc_id(did, delete_llm_cache=False)
                     status = getattr(res, "status", None)
                     if status not in ("success", "not_found"):
@@ -963,9 +1107,25 @@ class EmailIngestionService:
                             f"[{prefix_base}] delete {did}: {status} "
                             f"{getattr(res, 'message', '')}"
                         )
-        finally:
-            await _release_destructive_busy(rag)
-        return True
+            finally:
+                await _release_destructive_busy(rag)
+            if plan.unchanged:
+                return "unchanged", 0
+
+        if plan.insert:
+            try:
+                await rag.ainsert(
+                    input=[content for content, _ in plan.insert],
+                    file_paths=[fp for _, fp in plan.insert],
+                    track_id=track_id,
+                )
+            except EnqueueRefusedError:
+                # Another bundle's overwrite (or a scan) holds the slot; nothing
+                # was written, so keep the email for later.
+                if not can_defer:
+                    raise
+                return "deferred", 0
+        return "applied", len(plan.insert)
 
     @staticmethod
     def _email_body_text(email: ParsedEmail) -> str:
@@ -1041,6 +1201,8 @@ Attachments ({len(all_attachments)} files):
             operation="email_inline",
             source="email",
         )
+        if result.status == "failed":
+            raise _ComponentFailed(f"{result.status} ({result.note})")
         if not result.ok:
             logger.info(
                 f"Skipping inline image {image.filename}: "
@@ -1079,6 +1241,8 @@ Image Description:
         # are skipped (not written as "[Extraction failed: ...]" prose that would
         # otherwise become bogus entities).
         result = await self._extract_attachment_content(attachment)
+        if result.status == "failed":
+            raise _ComponentFailed(f"{result.status} ({result.note})")
         if not result.ok:
             logger.info(
                 f"Skipping attachment {attachment.filename}: "
@@ -1777,6 +1941,9 @@ is not ingested. The response is 200 with `status` set to `skipped`.
                             f"[{t_id}] Email re-sync queued until the pipeline "
                             f"is free: {result['documents_created']} documents"
                         )
+                        return
+                    if result.get("unchanged"):
+                        logger.info(f"[{t_id}] Email unchanged: nothing re-indexed")
                         return
                     logger.info(
                         f"[{t_id}] Email ingestion completed: {result['documents_created']} documents, "

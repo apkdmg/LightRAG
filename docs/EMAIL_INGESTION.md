@@ -312,6 +312,26 @@ If the email has no `Message-ID` (or you omit `message_id` in Mode 2), the
 server generates a synthetic one (`<uuid@lightrag.local>`) first, so a Bundle ID
 always exists. The same input email therefore always yields the same Bundle ID.
 
+### Re-syncing an email
+
+Posting an email whose Bundle ID is already stored is a re-sync. The server
+compares each part it builds (master, inline images, attachments) with the
+stored copy, by content hash:
+
+- **Nothing changed:** nothing is deleted or re-indexed, and the background log
+  reads `Email unchanged: nothing re-indexed`. No LLM calls are made.
+- **Some parts changed:** only those parts are replaced. A part the email no
+  longer has is removed. Parts that are the same stay as stored.
+- **A part failed this time** (for example the vision call errored): its stored
+  copy is kept rather than removed, and the next re-sync tries it again.
+- **A stored part had failed:** it is ingested again.
+
+Replacing a part means deleting it first, and deleting makes LightRAG
+re-summarise every entity the part mentioned, so a re-sync that replaces
+everything costs far more than the part itself. Clients should still send only
+new or changed mail, for example by keeping a watermark of the last message
+processed, rather than re-posting a window of recent mail on every run.
+
 ### How parts relate in the graph
 
 Every document produced from one email carries the Bundle ID inline in its text:

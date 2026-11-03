@@ -2716,6 +2716,8 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
                     ),
                     operation="rebuild",
                     purpose="extract",
+                    # Bill the rebuild to the document whose removal caused it.
+                    doc_id=doc_id,
                 )
             except Exception as e:
                 logger.error(f"[purge] Failed to rebuild knowledge from chunks: {e}")
@@ -3477,6 +3479,8 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
                         ),
                         operation="rebuild",
                         purpose="extract",
+                        # Bill the rebuild to the document whose removal caused it.
+                        doc_id=doc_id,
                     )
 
                 except Exception as e:
