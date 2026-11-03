@@ -1757,3 +1757,18 @@ Added at the admin's request: an animated topology view (§2.13) and a motion sp
 4. **nginx also routes `/vllm/rerank/` and `/vllm/embed/` to outside callers.** vLLM `/metrics` queue depth therefore includes traffic LightRAG never sees. Flow 4 compares vLLM waiting with `_record_dep_latency` counts before blaming LightRAG load.
 5. **§2.9 lists six on-call flows, not five.** The sixth is "emails stopped arriving", traced through `email_ingest_silence` to the email connector.
 6. **Line fix:** `_apply_batch` starts at `email_resync_queue.py:184`, not `:207`.
+
+## Appendix: PR-0 pre-flight results (2026-11-03)
+
+These checks were settled from the repository, not on the server: reading the prod server from the implementation session was not permitted. Where a check needs the server, the code detects the answer at runtime or ships a safe default with an override, and the command to confirm it is listed.
+
+| # | Result | How the code handles it | Confirm on the server |
+|---|---|---|---|
+| V1 | **Single Uvicorn process.** `Dockerfile:110` and no `command:` override in `docker-compose-full.yml`. | `/status.process.mode` is detected at runtime (`uvicorn` or `gunicorn`); Gunicorn-only features hide themselves. | `docker exec lightrag-enterprise-lightrag-1 sh -c 'for p in /proc/[0-9]*; do printf "%s " "${p#/proc/}"; tr "\0" " " < $p/cmdline | cut -c1-60; echo; done'` |
+| V2 | **Neo4j** (`LIGHTRAG_GRAPH_STORAGE: "Neo4JStorage"` pinned in `docker-compose-full.yml`). | The graph probe follows `graph_storage`: Neo4j driver for Neo4j, the Postgres probe for PG graph, `unknown` otherwise. | `grep -E '^LIGHTRAG_GRAPH_STORAGE=' /opt/lightrag-enterprise/.env` |
+| V3 | **Not measured.** | The index builder runs once in the background under an advisory lock, `CONCURRENTLY`, never blocking startup. Write budgets are measured after deploy (`OPS_LOG_SINK` off by default). | `SELECT count(*), count(*) FILTER (WHERE id LIKE 'dup-%') FROM LIGHTRAG_DOC_STATUS; SELECT count(*) FROM LIGHTRAG_USAGE_CALLS WHERE ts > now()-interval '1 day';` |
+| V4 | **Not checked.** | vLLM probes treat `/health` 200 as ok. A 401 or 404 on `/metrics` marks metrics unavailable in `detail` without failing the dependency. | `docker exec lightrag-enterprise-lightrag-1 python -c "import urllib.request as u; print(u.urlopen('http://vllm-embed:8001/health',timeout=3).status)"` |
+| V5 | **No compose or Dockerfile health check calls LightRAG `/health`.** nginx config lives only on the server. | D6 ships with `HEALTH_DETAIL=authenticated` as the default: anonymous callers still get 200 with `{status, version}`. `HEALTH_DETAIL=all` restores today's output. | `grep -n health /opt/lightrag-enterprise/nginx/conf.d/rag.conf` |
+| V6 | **nginx config is not in the repo.** | `OPS_TRUSTED_PROXIES` defaults to empty, so LightRAG always generates its own request ID and keeps a client-sent one as `client_request_id`. To trust nginx, add `proxy_set_header X-Request-ID $request_id;` and set `OPS_TRUSTED_PROXIES` to the proxy's network address. | `grep -n -i request_id /opt/lightrag-enterprise/nginx/conf.d/rag.conf` |
+| V7 | **Not checked.** | Detected at runtime (`pg_available_extensions`). Log substring search stays limited to 24 h until `pg_trgm` is installed (Phase 2). | `SELECT name, installed_version FROM pg_available_extensions WHERE name='pg_trgm';` |
+| V8 | **Not answered.** | `OPS_OPERATOR_ACCOUNTS` stays unset, so every admin is an operator (D8 default). | Ask the admin, then set `OPS_OPERATOR_ACCOUNTS` in `.env`. |
