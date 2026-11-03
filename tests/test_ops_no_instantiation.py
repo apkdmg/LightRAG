@@ -14,9 +14,11 @@ from fastapi.testclient import TestClient
 from lightrag.api.workspace_manager import WorkspaceManager
 from lightrag.kg import shared_storage
 from tests.ops_fixtures import (
+    WORKER_ID,
     FakeRegistry,
     build_app,
     ops_routes,
+    seed_health,
     seeded_store,
     shared_state,
 )
@@ -61,23 +63,35 @@ _PARAMS = {
 
 
 def _concrete(path: str) -> str:
-    return path.replace("{ws}", "fsktm").replace("{doc_id}", "doc-aaaa0007")
+    return (
+        path.replace("{ws}", "fsktm")
+        .replace("{doc_id}", "doc-aaaa0007")
+        .replace("{dep}", "postgres")
+        .replace("{worker_id}", WORKER_ID)
+    )
 
 
 def test_every_get_answers_without_instantiating(guarded):
     manager = WorkspaceManager(instance_factory=_forbidden("instance_factory"))
+    store = seeded_store()
     app = build_app(
-        seeded_store(),
+        store,
         registry=FakeRegistry({"fsktm": "a.bin@unimas.my"}),
         manager=manager,
     )
+    # Probe results and heartbeats, so the Health and Workers GETs read data.
+    seed_health(app, store)
     client = TestClient(app, raise_server_exceptions=True)
     gets = [r for r in ops_routes.router.routes if "GET" in r.methods]
-    assert len(gets) >= 15
+    assert len(gets) >= 20
     for route in gets:
         path = _concrete(route.path)
         response = client.get(path, params=_PARAMS.get(route.path))
         assert response.status_code == 200, (path, response.text)
+    # Health and workers views carry data, still without loading anything.
+    assert len(client.get("/admin/ops/health").json()["deps"]) >= 4
+    assert client.get("/admin/ops/workers").json()["items"]
+    assert client.get("/admin/ops/overview").json()["deps"]
     # Workspace-scoped routes on a workspace never loaded anywhere.
     for path in (
         "/admin/ops/workspaces/hr_office",

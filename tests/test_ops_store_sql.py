@@ -157,3 +157,117 @@ async def test_memory_store_kv_cas_and_merge():
     assert await store.kv_get("resync:ws") == {"a": 1, "b": 2}
     await store.kv_delete(["resync:ws"])
     assert await store.kv_get("resync:ws", "gone") == "gone"
+
+
+class _DedicatedConn:
+    def __init__(self):
+        self.calls: list[tuple[str, tuple]] = []
+
+    def is_closed(self):
+        return False
+
+    async def fetch(self, sql, *args, timeout=None):
+        self.calls.append((sql, args))
+        return []
+
+    async def close(self):
+        pass
+
+
+async def test_heartbeats_use_their_own_connection_and_the_database_clock():
+    from datetime import datetime, timezone
+
+    store = PostgresOpsStore()
+    store._db = SimpleNamespace(pool=None)
+    beat = _DedicatedConn()
+    store._beat_conn = beat
+
+    @asynccontextmanager
+    async def no_pool():
+        raise AssertionError("heartbeats must not use the shared pool")
+        yield
+
+    store._conn = no_pool
+    row = {
+        "worker_id": "a" * 32,
+        "host": "lightrag-1",
+        "pid": 812,
+        "pid_create_time": 1.5,
+        "mode": "uvicorn",
+        "version": "0295",
+        "started_at": datetime.now(timezone.utc),
+        "leases_held": ["ops:probes"],
+        "snapshot": {"rss": 1},
+    }
+    await store.worker_beat(row, {"cpu_pct": 1.0, "rss": 1})
+    await store.supersede_workers("lightrag-1", "a" * 32, row["started_at"], 45)
+    await store.worker_exited("a" * 32)
+    await store.cleanup_workers(24, 7)
+    sqls = [sql for sql, _ in beat.calls]
+    assert "heartbeat_at = now()" in sqls[0] and "superseded = false" in sqls[0]
+    assert "date_trunc('minute', now())" in sqls[1]
+    assert "heartbeat_at < now() - make_interval(secs => $4::float8)" in sqls[2]
+    assert "exited_at = now()" in sqls[3]
+    assert "make_interval(hours => $1::int)" in sqls[4]
+    assert "make_interval(days => $1::int)" in sqls[5]
+    assert beat.calls[0][1][0] == "a" * 32 and beat.calls[0][1][7] == ["ops:probes"]
+
+
+async def test_probe_reads_are_bounded_and_parameterised():
+    conn = _Conn()
+    store = _store(conn)
+    await store.probe_strips(24, 1800)
+    await store.probe_series("neo4j'; DROP TABLE x;--", 24, 600)
+    await store.probe_recent("neo4j", 50)
+    await store.probe_error_classes("neo4j", 24)
+    await store.workers(200)
+    await store.worker_history("a" * 32, 24, 60)
+    assert conn.readonly is True
+    for sql, args in conn.fetched:
+        assert "DROP TABLE" not in sql
+    assert conn.fetched[1][1][0] == "neo4j'; DROP TABLE x;--"
+    assert all(s == "SET LOCAL statement_timeout = 3000" for s in conn.executed)
+
+
+async def test_supersede_with_a_liveness_veto_updates_only_dead_candidates():
+    from datetime import datetime, timezone
+
+    class Candidates(_DedicatedConn):
+        async def fetch(self, sql, *args, timeout=None):
+            self.calls.append((sql, args))
+            if sql.lstrip().startswith("SELECT"):
+                return [
+                    {"worker_id": "a-live", "pid": 10, "pid_create_time": 1.0},
+                    {"worker_id": "b-dead", "pid": 11, "pid_create_time": 2.0},
+                ]
+            return [{"worker_id": "b-dead"}]
+
+    store = PostgresOpsStore()
+    store._db = SimpleNamespace(pool=None)
+    beat = Candidates()
+    store._beat_conn = beat
+    count = await store.supersede_workers(
+        "lightrag-1",
+        "c" * 32,
+        datetime.now(timezone.utc),
+        45,
+        alive=lambda pid, create_time: pid == 10,
+    )
+    assert count == 1
+    select, update = beat.calls
+    assert "heartbeat_at < now() - make_interval(secs => $4::float8)" in select[0]
+    assert "worker_id = ANY($5::uuid[])" in update[0]
+    assert update[1][4] == ["b-dead"]
+    # Nothing dead: no UPDATE at all.
+    beat.calls.clear()
+    assert (
+        await store.supersede_workers(
+            "lightrag-1",
+            "c" * 32,
+            datetime.now(timezone.utc),
+            45,
+            alive=lambda *a: True,
+        )
+        == 0
+    )
+    assert len(beat.calls) == 1

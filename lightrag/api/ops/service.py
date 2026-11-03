@@ -25,9 +25,24 @@ from collections import OrderedDict
 from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable, Optional
 from urllib.parse import urlencode
+from uuid import UUID
 
 from lightrag.api.insights.analytics import document_label
+from lightrag.api.ops.health import (
+    DEPLOY_SUPPRESS_S,
+    build_strips,
+    dep_card,
+    deps_summary,
+    derived_deps,
+    health_attention,
+    host_info,
+    order_workers,
+    strip_cell_status,
+    worker_item,
+)
+from lightrag.api.ops.heartbeat import ALIVE_WITHIN_S
 from lightrag.api.ops.pauses import OwnProviderCache, read_pauses
+from lightrag.api.ops.probes import STRIP_SLOT_S, ProbeSpec
 from lightrag.api.ops.queue_scan import SCAN_INTERVAL_S, SUMMARY_KEY
 from lightrag.api.ops.redact import mask_path, redact, redact_pipeline
 from lightrag.api.ops.snapshot import LIVE_KEYS, NamespaceReader
@@ -55,6 +70,15 @@ DOC_CALLS_LIMIT = 50
 EVENTS_LIMIT = 500
 EVENTS_MAX_DAYS = 7
 OVERVIEW_TIMELINE_HOURS = 6
+OVERVIEW_WORKERS = 20
+WORKER_ROWS_LIMIT = 200
+RECENT_PROBES = 50
+STRIP_HOURS = 24
+ATTENTION_KEY = "attention"
+# The leased snapshot is used while it is younger than three reconcile cycles.
+ATTENTION_FRESH_S = 180.0
+# Health cards read from heartbeats rather than probes.
+DERIVED_DEPS = ("manager", "recorder")
 
 TTL = {
     "totals": 10.0,
@@ -74,6 +98,12 @@ TTL = {
     "events": 15.0,
     "llm": 30.0,
     "overview": 5.0,
+    "workers": 5.0,
+    "probes": 5.0,
+    "strips": 30.0,
+    "dependency": 15.0,
+    "worker_history": 30.0,
+    "attention": 5.0,
 }
 
 DEFAULT_THRESHOLDS = {
@@ -101,6 +131,7 @@ _EVENT_DETAIL_KEYS = ("old", "new", "status", "byo", "slot", "version", "paused"
 _WORKSPACE_ID = re.compile(r"^[A-Za-z0-9_.\-]{1,255}$")
 _JOB_FILES = re.compile(r"^(?P<prefix>.*?)(?:\.\.\.)?\[(?P<count>\d+) files\]$", re.S)
 _SEVERITY_RANK = {"warning": 1, "serious": 2, "critical": 3}
+_DEP_ID = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
 
 RUNBOOK = {
     "stale_docs": "Open the workspace; if its pipeline is not busy, run the pipeline "
@@ -115,9 +146,28 @@ RUNBOOK = {
     "is processing, or whether it is paused.",
     "llm_error_rate_15m": "Open Performance > LLM to see which model fails, then "
     "Failures grouped by model.",
-    "manager_unresponsive": "Shared pipeline state is not answering; restart the "
-    "container if it persists.",
-    "pg_probe": "Postgres is not answering ops queries; check the database container.",
+    "manager_rtt": "Shared pipeline state is slow or not answering; check the "
+    "workers' CPU and restart the container if it persists.",
+    "pg_probe": "Postgres is slow or not answering; check the database container "
+    "and its connections.",
+    "pg_connections": "Find the clients holding connections (Health > Postgres) "
+    "before raising max_connections.",
+    "pg_blocked": "Open Health > Postgres for the blocking backend's statement "
+    "type and fingerprint.",
+    "pg_pool_wait": "Look for long queries holding pool connections, then the "
+    "pool size.",
+    "dependency_down": "Open the dependency in Health and check its container; "
+    "processing that needs it waits or fails until it is back.",
+    "vllm_waiting": "Compare vLLM's queue with LightRAG's own call rate before "
+    "blaming LightRAG load: outside callers reach vLLM through the proxy.",
+    "smtp_probe": "Check the SMTP server and SMTP_* settings; alert emails "
+    "cannot be delivered meanwhile.",
+    "tls_cert_expiry": "Renew the certificate before it expires.",
+    "disk_free": "Free space on the volume holding the working directory or the logs.",
+    "workers_below_expected": "Open Health > Workers and check the container; a "
+    "worker that stopped reporting may have crashed.",
+    "log_sink_or_recorder_drops_5m": "Usage records are being lost; check "
+    "Postgres health and write volume.",
 }
 
 
@@ -154,6 +204,10 @@ class OpsCache:
 
     def clear(self) -> None:
         self._entries.clear()
+
+    def forget(self, key: tuple) -> None:
+        """Drop one cached value (after a write that changes it)."""
+        self._entries.pop(key, None)
 
     async def get(
         self, key: tuple, ttl: float, compute: Callable[[], Awaitable[Any]]
@@ -215,6 +269,29 @@ def _age_s(moment: Optional[datetime], now: float) -> Optional[float]:
     if moment is None:
         return None
     return max(0.0, now - moment.timestamp())
+
+
+def _epoch_of(value: Any) -> Optional[float]:
+    """Epoch seconds of an ISO timestamp (naive means UTC)."""
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        moment = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    return moment.timestamp()
+
+
+def _probe_row_view(row: dict[str, Any], ts: Optional[str]) -> dict[str, Any]:
+    return {
+        "ts": ts,
+        "status": row.get("status"),
+        "latency_ms": row.get("latency_ms"),
+        "error_class": row.get("error_class"),
+        "detail": row.get("detail") or {},
+    }
 
 
 def _epoch_iso(value: Any) -> Optional[str]:
@@ -298,6 +375,11 @@ class OpsService:
         self.own_providers = own_providers
         self.clock = clock
         self.cache = cache or OpsCache()
+        self.started_at = clock()
+        # Set by the ops runtime when the features run in this process.
+        self.probes: Any = None
+        self.heartbeat: Any = None
+        self.worker_id: Optional[str] = None
 
     # -- availability --------------------------------------------------------
     @property
@@ -1316,6 +1398,297 @@ class OpsService:
             "kinds": wanted,
         }
 
+    # -- health and workers ------------------------------------------------------------------
+    async def _worker_items(self) -> Optional[list[dict[str, Any]]]:
+        """Worker rows: host-wide from heartbeats, else this process only."""
+        if self.available:
+            rows = await self._cached(
+                ("workers",),
+                "workers",
+                lambda: self.store.workers(WORKER_ROWS_LIMIT),
+            )
+            return [worker_item(r, self.worker_id) for r in rows]
+        heartbeat = self.heartbeat
+        if heartbeat is not None and heartbeat.last_beat_at is not None:
+            return [worker_item(heartbeat.local_row(), self.worker_id)]
+        return None
+
+    async def live_workers(self) -> Optional[int]:
+        """Workers with a fresh heartbeat (at least this one), when stored."""
+        if not self.available:
+            return None
+        try:
+            items = await self._worker_items()
+        except OpsDataUnavailable:
+            return None
+        return max(1, sum(1 for item in items or [] if item["alive"]))
+
+    async def _probe_records(self) -> tuple[dict[str, Any], Optional[dict], bool]:
+        """Latest probe records and cycle; ``partial`` when only this
+        process's own results could be read."""
+        if self.probes is None:
+            return {}, None, False
+        if not self.available:
+            records, cycle = await self.probes.read_latest()
+            return records, cycle, False
+        try:
+            records, cycle = await self._cached(
+                ("probe_records",), "probes", self.probes.read_latest
+            )
+            return records, cycle, False
+        except OpsDataUnavailable:
+            return dict(self.probes.latest), self.probes.cycle, True
+
+    async def _strips(self, now: float) -> dict[str, list[dict[str, Any]]]:
+        if self.probes is None or not self.available:
+            return {}
+        try:
+            rows = await self._cached(
+                ("probe_strips",),
+                "strips",
+                lambda: self.store.probe_strips(STRIP_HOURS, STRIP_SLOT_S),
+            )
+        except OpsDataUnavailable:
+            return {}
+        return build_strips(rows, now)
+
+    async def _dep_cards(
+        self,
+        *,
+        mode: Optional[str],
+        worker_items: Optional[list[dict[str, Any]]],
+        strips: bool,
+        now: float,
+    ) -> tuple[list[dict[str, Any]], Optional[dict], bool]:
+        records, cycle, partial = await self._probe_records()
+        strip_map = await self._strips(now) if strips else {}
+        cards: list[dict[str, Any]] = []
+        if self.probes is not None:
+            for spec in self.probes.specs.values():
+                card = dep_card(spec, records.get(spec.id), strip_map.get(spec.id), now)
+                if not strips:
+                    card["strip"] = []
+                cards.append(card)
+        cards.extend(derived_deps(worker_items or [], mode or "uvicorn", now))
+        return cards, cycle, partial
+
+    def _cycle_view(self, cycle: Optional[dict], now: float) -> Optional[dict]:
+        if not isinstance(cycle, dict):
+            return None
+        at = cycle.get("at_epoch")
+        return {
+            "at": cycle.get("at"),
+            "duration_ms": cycle.get("duration_ms"),
+            "holder": cycle.get("holder"),
+            "holder_pid": cycle.get("holder_pid"),
+            "holder_self": bool(self.worker_id)
+            and cycle.get("holder") == self.worker_id,
+            "interval_s": cycle.get("interval_s"),
+            "age_s": round(now - at, 1) if isinstance(at, (int, float)) else None,
+        }
+
+    async def health(self, mode: Optional[str]) -> dict[str, Any]:
+        """Dependency grid: latest result, 48-slot strip and detail per dependency."""
+        now = self.clock()
+        try:
+            worker_items = await self._worker_items()
+        except OpsDataUnavailable:
+            worker_items = None
+        cards, cycle, partial = await self._dep_cards(
+            mode=mode, worker_items=worker_items, strips=True, now=now
+        )
+        return {
+            "enabled": self.probes is not None,
+            "durable": self.available,
+            "partial": partial,
+            "cycle": self._cycle_view(cycle, now),
+            "deps": cards,
+            "summary": deps_summary(cards),
+        }
+
+    def known_dep(self, dep: str) -> Optional[ProbeSpec]:
+        if not _DEP_ID.match(dep or ""):
+            raise OpsBadRequest("invalid_dependency")
+        if self.probes is None:
+            return None
+        return self.probes.specs.get(dep)
+
+    async def dependency(
+        self, dep: str, hours: int, mode: Optional[str]
+    ) -> dict[str, Any]:
+        """Dependency drawer: latency series, recent results, error classes."""
+        now = self.clock()
+        spec = self.known_dep(dep)
+        empty: dict[str, Any] = {
+            "id": dep,
+            "hours": hours,
+            "dep": None,
+            "latency_series": [],
+            "recent": [],
+            "detail": {},
+            "blocking": [],
+            "error_classes": [],
+            "enabled": self.probes is not None,
+        }
+        if spec is None and dep in DERIVED_DEPS:
+            try:
+                worker_items = await self._worker_items()
+            except OpsDataUnavailable:
+                worker_items = None
+            for card in derived_deps(worker_items or [], mode or "uvicorn", now):
+                if card["id"] == dep:
+                    return {**empty, "dep": card, "detail": card["detail"]}
+            raise OpsNotFound(dep)
+        if spec is None:
+            if self.probes is None:
+                return empty
+            raise OpsNotFound(dep)
+        records, _, _ = await self._probe_records()
+        record = records.get(dep)
+        strip = (await self._strips(now)).get(dep)
+        card = dep_card(spec, record, strip, now)
+        detail = card["detail"]
+        out = {
+            **empty,
+            "dep": card,
+            "detail": detail,
+            "blocking": list(detail.get("blocking") or []) if dep == "postgres" else [],
+        }
+        if not self.available:
+            if isinstance(record, dict) and record.get("checked_at"):
+                out["recent"] = [_probe_row_view(record, record.get("checked_at"))]
+            return out
+        bucket_s = max(300, (hours * 3600 // 144) // 60 * 60)
+
+        async def load() -> tuple[list, list, list]:
+            series = await self.store.probe_series(dep, hours, bucket_s)
+            recent = await self.store.probe_recent(dep, RECENT_PROBES)
+            classes = await self.store.probe_error_classes(dep, hours)
+            return series, recent, classes
+
+        series, recent, classes = await self._cached(
+            ("dependency", dep, hours), "dependency", load
+        )
+        out["latency_series"] = [
+            {
+                "t": int(row["t"]) * 1000,
+                "latency_ms": None
+                if row.get("avg_ms") is None
+                else round(float(row["avg_ms"]), 1),
+                "max_ms": row.get("max_ms"),
+                "status": strip_cell_status(
+                    int(row.get("total") or 0)
+                    - int(row.get("down") or 0)
+                    - int(row.get("warn") or 0),
+                    int(row.get("warn") or 0),
+                    int(row.get("down") or 0),
+                    int(row.get("total") or 0),
+                ),
+                "total": row.get("total"),
+                "failed": row.get("down"),
+            }
+            for row in series
+        ]
+        out["recent"] = [_probe_row_view(row, utc_iso(row.get("ts"))) for row in recent]
+        out["error_classes"] = [
+            {"key": row["key"], "count": int(row["count"])} for row in classes
+        ]
+        return out
+
+    async def workers_view(self, process: dict[str, Any]) -> dict[str, Any]:
+        """Workers table: every process that reported in the last 24 h."""
+        items = await self._worker_items()
+        ordered = order_workers(items or [])
+        alive = sum(1 for item in ordered if item["alive"])
+        return {
+            "items": ordered,
+            "host": host_info(ordered),
+            "mode": process.get("mode"),
+            "expected": process.get("expected"),
+            "live": max(alive, 1) if items is not None else process.get("live"),
+            "alive_within_s": ALIVE_WITHIN_S,
+            "heartbeats": self.available,
+        }
+
+    async def worker_history(self, worker_id: str, hours: int) -> dict[str, Any]:
+        """Per-minute samples of one worker (hourly-ish buckets beyond a day)."""
+        try:
+            normalized = UUID(worker_id).hex
+        except (ValueError, AttributeError, TypeError) as e:
+            raise OpsBadRequest("invalid_worker_id") from e
+        bucket_s = 60 if hours <= 24 else 600
+        rows = await self._cached(
+            ("worker_history", normalized, hours),
+            "worker_history",
+            lambda: self.store.worker_history(normalized, hours, bucket_s),
+        )
+        return {
+            "worker_id": normalized,
+            "hours": hours,
+            "bucket_s": bucket_s,
+            "items": [
+                {
+                    "t": int(row["t"]) * 1000,
+                    "rss": row.get("rss"),
+                    "cpu": None
+                    if row.get("cpu") is None
+                    else round(float(row["cpu"]), 1),
+                    "loop_lag": row.get("loop_lag"),
+                    "pool_wait": row.get("pool_wait"),
+                }
+                for row in rows
+            ],
+        }
+
+    # -- attention snapshot (leased, see reconcile.py) ---------------------------------------
+    async def _attention_snapshot(self, now: float) -> Optional[dict[str, Any]]:
+        """The latest leased attention snapshot, when it is fresh."""
+        if not self.available:
+            return None
+
+        async def load():
+            return await self.store.kv_get(ATTENTION_KEY)
+
+        try:
+            snapshot = await self._cached(("attention",), "attention", load)
+        except OpsDataUnavailable:
+            return None
+        if not isinstance(snapshot, dict) or not isinstance(
+            snapshot.get("items"), list
+        ):
+            return None
+        at = snapshot.get("at_epoch")
+        if not isinstance(at, (int, float)) or now - at > ATTENTION_FRESH_S:
+            return None
+        return snapshot
+
+    async def compute_attention_snapshot(
+        self, workers: dict[str, Any], holder: str
+    ) -> dict[str, Any]:
+        """Evaluate every rule once for the host (the leased reconcile cycle)."""
+        now = self.clock()
+        inputs = await self._gather(workers, now)
+        try:
+            previous = await self._q(lambda: self.store.kv_get(ATTENTION_KEY))
+        except OpsDataUnavailable:
+            previous = None
+        streaks = previous.get("streaks") if isinstance(previous, dict) else None
+        items, new_streaks = self._attention(
+            inputs, now, streaks=streaks if isinstance(streaks, dict) else {}
+        )
+        worst = max(
+            (a["severity"] for a in items), key=_SEVERITY_RANK.get, default=None
+        )
+        return {
+            "at": datetime.fromtimestamp(now, timezone.utc).isoformat(),
+            "at_epoch": now,
+            "holder": holder,
+            "items": items,
+            "worst": worst,
+            "streaks": new_streaks,
+            "failed_sections": inputs["failed_sections"],
+        }
+
     # -- overview ------------------------------------------------------------------------------
     async def overview(self, workers: dict[str, Any]) -> dict[str, Any]:
         return await self.cache.get(
@@ -1329,9 +1702,8 @@ class OpsService:
             lambda: self._overview(workers),
         )
 
-    async def _overview(self, workers: dict[str, Any]) -> dict[str, Any]:
-        now = self.clock()
-        now_iso = datetime.fromtimestamp(now, timezone.utc).isoformat()
+    async def _gather(self, workers: dict[str, Any], now: float) -> dict[str, Any]:
+        """Everything the KPI tiles and the attention rules read."""
         thresholds = await self.thresholds()
         failed_sections: list[str] = []
         backlog = active = queue = pauses = None
@@ -1373,6 +1745,18 @@ class OpsService:
                 )["items"]
             except (OpsDataUnavailable, OpsBadRequest):
                 failed_sections.append("events")
+        try:
+            worker_items = await self._worker_items()
+        except OpsDataUnavailable:
+            worker_items = None
+            failed_sections.append("workers")
+        process = dict(workers)
+        if worker_items is not None:
+            # This process is answering, so at least one worker is alive.
+            process["live"] = max(1, sum(1 for w in worker_items if w["alive"]))
+        deps, cycle, _ = await self._dep_cards(
+            mode=process.get("mode"), worker_items=worker_items, strips=False, now=now
+        )
         llm = await self.llm_health()
         postgres_ok = self.available and not failed_sections
         # A slow query (a statement timeout on a heavy count) is a degraded
@@ -1381,18 +1765,50 @@ class OpsService:
         postgres_down = (
             self.available and bool(failed_sections) and not await self._probe()
         )
-        attention = self._attention(
-            thresholds=thresholds,
-            backlog=backlog,
-            stale_items=stale_items,
-            stale_total=stale_total,
-            queue=queue,
-            pauses=pauses,
-            llm=llm,
-            workers=workers,
-            postgres_failed=postgres_down,
-            now=now,
+        deploy_recent = any(
+            e.get("kind") == "deployment"
+            and (_epoch_of(e.get("ts")) or 0) >= now - DEPLOY_SUPPRESS_S
+            for e in events
         )
+        return {
+            "thresholds": thresholds,
+            "failed_sections": failed_sections,
+            "backlog": backlog,
+            "active": active,
+            "stale_items": stale_items,
+            "stale_total": stale_total,
+            "queue": queue,
+            "pauses": pauses,
+            "events": events,
+            "llm": llm,
+            "postgres_ok": postgres_ok,
+            "postgres_down": postgres_down,
+            "process": process,
+            "worker_items": worker_items,
+            "deps": deps,
+            "cycle": cycle,
+            "deploy_recent": deploy_recent,
+        }
+
+    async def _overview(self, workers: dict[str, Any]) -> dict[str, Any]:
+        now = self.clock()
+        now_iso = datetime.fromtimestamp(now, timezone.utc).isoformat()
+        inputs = await self._gather(workers, now)
+        failed_sections = inputs["failed_sections"]
+        backlog = inputs["backlog"]
+        active = inputs["active"]
+        stale_total = inputs["stale_total"]
+        queue = inputs["queue"]
+        llm = inputs["llm"]
+        process = inputs["process"]
+        postgres_down = inputs["postgres_down"]
+        snapshot = None if postgres_down else await self._attention_snapshot(now)
+        if snapshot is not None:
+            attention = list(snapshot["items"])
+            attention_source, attention_at = "snapshot", snapshot.get("at")
+        else:
+            attention, _ = self._attention(inputs, now, streaks=None)
+            attention_source, attention_at = "request", now_iso
         worst = max(
             (a["severity"] for a in attention), key=_SEVERITY_RANK.get, default=None
         )
@@ -1402,7 +1818,7 @@ class OpsService:
         }
         if not self.available:
             state = "unknown"
-        elif postgres_down or workers.get("live") == 0:
+        elif postgres_down or process.get("live") == 0:
             state = "down"
         elif worst:
             state = "degraded"
@@ -1421,6 +1837,10 @@ class OpsService:
         stuck_known = "stuck" not in failed_sections and self.docs_available
         # No summary yet (the first scan runs a minute after startup): unknown.
         queue_counts = self._queue_counts(queue) if queue else None
+        deps = inputs["deps"]
+        summary = deps_summary(deps)
+        deps_known = self.probes is not None and summary["total"] > 0
+        worker_items = inputs["worker_items"]
         kpis = {
             "active": {
                 "value": len(running) if active is not None else None,
@@ -1470,12 +1890,18 @@ class OpsService:
                 "window": "15m",
                 "scope": "host",
             },
-            # Dependency probes arrive with the Health tab.
-            "deps": {"available": False, "ok": None, "total": None, "scope": "host"},
+            "deps": {
+                "available": deps_known,
+                "ok": summary["ok"] if deps_known else None,
+                "total": summary["total"] if deps_known else None,
+                "down": summary["down"] if deps_known else None,
+                "scope": "host",
+            },
             "workers": {
-                "live": workers.get("live"),
-                "expected": workers.get("expected"),
-                "mode": workers.get("mode"),
+                "live": process.get("live"),
+                "expected": process.get("expected"),
+                "mode": process.get("mode"),
+                "heartbeats": worker_items is not None,
                 "scope": "host",
             },
         }
@@ -1489,23 +1915,26 @@ class OpsService:
             "maintenance": None,
             "kpis": kpis,
             "attention": attention,
+            "attention_source": attention_source,
+            "attention_at": attention_at,
             "checked": {
                 "workspaces_with_backlog": None,
                 "active_candidates": (active or {}).get("checked"),
                 "email_queue": queue is not None,
                 "at": now_iso,
             },
-            "workers": [],
+            "workers": order_workers(worker_items or [])[:OVERVIEW_WORKERS],
             "timeline": {
                 "buckets": [],
-                "events": events[:100],
+                "events": inputs["events"][:100],
                 "hours": OVERVIEW_TIMELINE_HOURS,
             },
             "active_top": active_runs[:5],
-            "deps": [],
+            "deps": deps,
+            "deps_cycle": self._cycle_view(inputs["cycle"], now),
             "alert_channel": None,
             "approximate": True,
-            "postgres_ok": postgres_ok,
+            "postgres_ok": inputs["postgres_ok"],
             "failed_sections": failed_sections,
             "manager": self.reader.state,
             **(
@@ -1525,24 +1954,41 @@ class OpsService:
 
     def _attention(
         self,
-        *,
-        thresholds: dict[str, Any],
-        backlog: Optional[dict[str, Any]],
-        stale_items: list,
-        stale_total: int,
-        queue: Optional[dict[str, Any]],
-        pauses: Optional[dict[str, Any]],
-        llm: dict[str, Any],
-        workers: dict[str, Any],
-        postgres_failed: bool,
+        inputs: dict[str, Any],
         now: float,
-    ) -> list[dict[str, Any]]:
+        *,
+        streaks: Optional[dict[str, int]],
+    ) -> tuple[list[dict[str, Any]], dict[str, int]]:
+        """Attention items (worst first) and the updated rule streaks."""
+        thresholds = inputs["thresholds"]
+        backlog = inputs["backlog"]
+        stale_items = inputs["stale_items"]
+        stale_total = inputs["stale_total"]
+        queue = inputs["queue"]
+        pauses = inputs["pauses"]
+        llm = inputs["llm"]
+        process = inputs["process"]
         items: list[dict[str, Any]] = []
+        seen: set[str] = set()
 
-        def add(rule, severity, title, link, *, params=None, since=None, count=None):
+        def add(
+            rule,
+            severity,
+            title,
+            link,
+            *,
+            params=None,
+            since=None,
+            count=None,
+            item_id=None,
+        ):
+            key = item_id or rule
+            if key in seen:
+                return
+            seen.add(key)
             items.append(
                 {
-                    "id": rule,
+                    "id": key,
                     "rule": rule,
                     "severity": severity,
                     "title": title,
@@ -1554,16 +2000,16 @@ class OpsService:
                 }
             )
 
-        if postgres_failed:
+        if inputs["postgres_down"]:
             add(
                 "pg_probe",
                 "critical",
                 "Postgres is not answering ops queries",
-                _hash_link(otab="health"),
+                _hash_link(otab="health", odep="postgres"),
             )
-        if self.reader.state == "unresponsive" and workers.get("mode") == "gunicorn":
+        if self.reader.state == "unresponsive" and process.get("mode") == "gunicorn":
             add(
-                "manager_unresponsive",
+                "manager_rtt",
                 "critical",
                 "Shared pipeline state is not answering",
                 _hash_link(otab="health", osub="workers"),
@@ -1679,8 +2125,18 @@ class OpsService:
                     _hash_link(otab="performance", osub="llm"),
                     params={"error_rate": rate, "calls": llm.get("calls")},
                 )
+        new_streaks = health_attention(
+            add,
+            deps=inputs["deps"],
+            workers=inputs["worker_items"],
+            process=process,
+            now=now,
+            streaks=streaks,
+            deploy_recent=inputs["deploy_recent"],
+            uptime_s=now - self.started_at,
+        )
         items.sort(key=lambda a: -_SEVERITY_RANK[a["severity"]])
-        return items
+        return items, new_streaks
 
 
 _TILE_RULES = {
@@ -1689,6 +2145,22 @@ _TILE_RULES = {
     "email_queue": ("email_queue_bad", "email_queue_stalled"),
     "llm": ("llm_error_rate_15m",),
     "active": ("provider_paused",),
+    "deps": (
+        "pg_probe",
+        "pg_connections",
+        "pg_blocked",
+        "dependency_down",
+        "vllm_waiting",
+        "smtp_probe",
+        "tls_cert_expiry",
+        "disk_free",
+    ),
+    "workers": (
+        "workers_below_expected",
+        "manager_rtt",
+        "pg_pool_wait",
+        "log_sink_or_recorder_drops_5m",
+    ),
 }
 
 
@@ -1705,7 +2177,12 @@ def _tile_state(
             return "unknown"
         if live <= 0:
             return "critical"
-        return "warning" if live < expected else "ok"
+        severities = [
+            a["severity"] for a in attention if a["rule"] in _TILE_RULES[name]
+        ]
+        if live < expected:
+            severities.append("warning")
+        return max(severities, key=_SEVERITY_RANK.get, default="ok")
     if name in ("llm", "deps"):
         if not tile.get("available"):
             return "unknown"

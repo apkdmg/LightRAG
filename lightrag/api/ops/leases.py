@@ -23,6 +23,22 @@ logger = logging.getLogger("lightrag.api.ops")
 Cycle = Callable[["LeasedLoop"], Awaitable[None]]
 
 
+def being_cancelled() -> bool:
+    """Whether the running task itself has a pending cancellation request.
+
+    Distinguishes a real ``task.cancel()`` from a ``CancelledError`` that
+    leaked out of an awaited future someone else cancelled. Python 3.10 has
+    no ``Task.cancelling()``; there every CancelledError counts as real.
+    """
+    task = asyncio.current_task()
+    if task is None:
+        return True
+    cancelling = getattr(task, "cancelling", None)
+    if cancelling is None:
+        return True
+    return cancelling() > 0
+
+
 class LeasedLoop:
     def __init__(
         self,
@@ -79,7 +95,12 @@ class LeasedLoop:
             await asyncio.wait_for(self._cycle(self), timeout=self.cycle_timeout_s)
             self.cycles += 1
         except asyncio.CancelledError:
-            raise
+            if being_cancelled():
+                raise
+            # A future cancelled by someone else inside the cycle: one bad
+            # cycle must not end a singleton loop for the life of the process.
+            self.failures += 1
+            logger.warning("Ops loop %s cycle was cancelled from inside", self.name)
         except asyncio.TimeoutError:
             self.failures += 1
             logger.warning(
@@ -119,3 +140,17 @@ class LeasedLoop:
                     "Ops lease %s release failed (%s)", self.name, type(e).__name__
                 )
             self.held = False
+
+
+class LocalLeases:
+    """Stand-in lease store for a loop that runs without the ops database.
+
+    Every lease is granted: without shared storage each process does the
+    work for itself (only the probes run this way).
+    """
+
+    async def try_lease(self, name: str, holder: str, ttl_s: float) -> bool:
+        return True
+
+    async def release_lease(self, name: str, holder: str) -> None:
+        return None

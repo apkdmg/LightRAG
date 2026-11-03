@@ -122,13 +122,17 @@ export type HashTarget = {
   workspace?: string | null
   doc_id?: string | null
   run_id?: string | null
+  /** A dependency id (opens the Dependency drawer). */
+  dep?: string | null
+  /** A worker id (opens the Worker drawer). */
+  worker_id?: string | null
 }
 
 /**
  * The view a target opens, starting from the current one: a valid tab and
- * sub-view switch the page, a workspace (and doc) opens its drawer. Run
- * drawers arrive with run tracking, so a run target falls back to its
- * workspace. Anything malformed is ignored, never trusted.
+ * sub-view switch the page, a workspace (and doc), dependency or worker opens
+ * its drawer. Run drawers arrive with run tracking, so a run target falls
+ * back to its workspace. Anything malformed is ignored, never trusted.
  */
 export function viewForTarget(base: OpsHash, target: HashTarget | null | undefined): OpsHash {
   if (!target) return base
@@ -136,9 +140,13 @@ export function viewForTarget(base: OpsHash, target: HashTarget | null | undefin
   const sub = target.sub && OPS_SUBS[tab].includes(target.sub) ? target.sub : tab === base.tab ? base.sub : null
   const workspace = cleanId(target.workspace ?? null)
   const docId = cleanId(target.doc_id ?? null)
+  const dep = cleanId(target.dep ?? null)
+  const worker = cleanId(target.worker_id ?? null)
   let drawer: Drawer | null = tab === base.tab ? base.drawer : null
   if (workspace && docId) drawer = { kind: 'document', workspace, id: docId }
   else if (workspace) drawer = { kind: 'workspace', id: workspace }
+  else if (dep) drawer = { kind: 'dependency', id: dep }
+  else if (worker) drawer = { kind: 'worker', id: worker }
   return { tab, sub, drawer, logQuery: null }
 }
 

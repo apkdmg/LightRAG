@@ -573,3 +573,74 @@ class RedactFilter(logging.Filter):
             record.exc_text = redact_traceback(record.exc_text, self.exc_max)
         if record.stack_info:
             record.stack_info = redact_traceback(record.stack_info, self.exc_max)
+
+
+# -- configuration values shown to admins (/health, /admin/ops/config) ----------
+
+_SECRET_KEY_NAME = re.compile(
+    r"(?i)(api[_-]?key|apikey|password|passwd|secret|token|credential|authorization"
+    r"|private[_-]?key|access[_-]?key)"
+)
+# A URL ends at whitespace, a quote, or a list separator (``,`` / ``;``), so
+# each URL of a comma-joined cluster URI is cleaned on its own.
+_URL_IN_TEXT = re.compile(r"[a-zA-Z][a-zA-Z0-9+.-]{1,20}://[^\s'\"<>,;]+")
+# Everything between ``scheme://`` and the last ``@`` of that URL, even when
+# the password holds ``/``, ``?`` or ``#`` (which ``urlsplit`` would read as
+# the path, query or fragment and leave part of the password behind).
+_URL_USERINFO = re.compile(
+    r"(?<![A-Za-z0-9+.-])([a-zA-Z][a-zA-Z0-9+.-]{1,20}://)[^\s'\"<>@,;]*@"
+)
+_CONFIG_MAX_DEPTH = 8
+
+
+def strip_userinfo(url: Any) -> Any:
+    """``scheme://user:pass@host:port/path?query`` -> ``scheme://host:port/path``.
+
+    The query string and fragment go too, because providers accept keys
+    there. Every URL in the text is cleaned, also in comma- or
+    semicolon-separated lists. A ``@`` later in a URL (``/path@x``) is read as
+    the end of userinfo, which may drop more than needed but never leaves a
+    credential. Values that are not URLs come back unchanged.
+    """
+    if not isinstance(url, str) or "://" not in url:
+        return url
+    url = _URL_USERINFO.sub(r"\1", url)
+    from urllib.parse import urlsplit, urlunsplit
+
+    def clean(match: re.Match[str]) -> str:
+        text = match.group(0)
+        try:
+            parts = urlsplit(text)
+        except ValueError:
+            return _DSN_USERINFO.sub(r"\1<redacted>@", text)
+        netloc = parts.netloc.rsplit("@", 1)[-1]
+        return urlunsplit((parts.scheme, netloc, parts.path, "", ""))
+
+    return _URL_IN_TEXT.sub(clean, url)
+
+
+def sanitize_config(value: Any, *, _depth: int = 0) -> Any:
+    """A configuration tree safe to show: secrets redacted, URLs without userinfo.
+
+    A key whose name looks like a secret (``api_key``, ``password``,
+    ``token``, …) keeps only whether it is set; every string that holds a URL
+    loses its userinfo and query string.
+    """
+    if _depth > _CONFIG_MAX_DEPTH:
+        return None
+    if isinstance(value, dict):
+        out: dict[str, Any] = {}
+        for key, item in value.items():
+            name = str(key)
+            if _SECRET_KEY_NAME.search(name) and not isinstance(
+                item, (bool, int, float, dict, list, tuple)
+            ):
+                out[name] = _REDACTED if item else item
+            else:
+                out[name] = sanitize_config(item, _depth=_depth + 1)
+        return out
+    if isinstance(value, (list, tuple)):
+        return [sanitize_config(item, _depth=_depth + 1) for item in value]
+    if isinstance(value, str):
+        return strip_userinfo(value)
+    return value

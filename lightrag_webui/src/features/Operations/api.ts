@@ -13,6 +13,7 @@ import {
   normalizeSummary,
   normalizeWorkspace
 } from './normalize'
+import { normalizeConfig, normalizeDepDetail, normalizeHealth, normalizeProbeResult, normalizeSmtpTest, normalizeWorkerHistory, normalizeWorkers } from './health/model'
 
 /**
  * Operations API client. Every route lives under /admin/ops behind the
@@ -99,6 +100,8 @@ export type OpsTarget = {
   workspace?: string | null
   doc_id?: string | null
   run_id?: string | null
+  dep?: string | null
+  worker_id?: string | null
 }
 
 export type AttentionItem = {
@@ -113,6 +116,9 @@ export type AttentionItem = {
   since?: string | null
   count?: Num
   workspace?: string | null
+  /** The dependency or worker the item is about (rules on probes and heartbeats). */
+  dep?: string | null
+  worker_id?: string | null
   target?: OpsTarget | null
 }
 
@@ -136,10 +142,12 @@ export type OpsOverview = Generated & {
   attention: AttentionItem[]
   /** What the attention check covered, for the "No issues. Checked …" sentence. */
   checked?: { workspaces?: Num; active?: Num; email_queue?: boolean; at?: string | null } | null
-  workers?: unknown[]
+  /** Worker rows from heartbeats (same shape as /workers items). */
+  workers?: OpsWorker[]
   timeline?: { buckets?: TimelineBucket[]; events?: OpsEvent[] } | null
   active_top?: ActiveRun[]
-  deps?: { id: string; status: string }[]
+  /** Dependency summary from the latest probe cycle (same shape as /health deps, strip optional). */
+  deps?: DepHealth[]
   alert_channel?: { ok: boolean | null; reason?: string | null } | null
   approximate?: boolean
 }
@@ -424,6 +432,164 @@ export type DocumentDetail = Generated & {
   logs?: { count: number | null; first: unknown[] } | null
 }
 
+// ---------- health and workers ----------
+
+/** A probe outcome (§3.5 LIGHTRAG_OPS_PROBES.status); `unprobed` is a dependency nothing checks (etcd, MinIO). */
+export type ProbeStatus = 'ok' | 'warn' | 'down' | 'unknown' | 'unprobed'
+
+/** One half-hour cell of the 48-cell (24 h) availability strip. */
+export type StripCell = {
+  /** Slot start (epoch ms): from the server, or counted back from the latest cycle. */
+  start: number | null
+  status: Exclude<ProbeStatus, 'unprobed'>
+  /** Probe results in the slot, when the server counts them. */
+  total: number | null
+  failed: number | null
+  slow: number | null
+}
+
+export type DepHealth = {
+  id: string
+  /** Display name from the server ("Neo4j"); the i18n name of the id otherwise. */
+  name?: string | null
+  /** What it is (graph, vector, embed, …): picks the topology node for store-agnostic ids. */
+  kind?: string | null
+  /** Where it is checked ("neo4j:7687"), without credentials. */
+  target?: string | null
+  status: ProbeStatus
+  /** The server has no result for it yet. */
+  stale?: boolean
+  latency_ms?: Num
+  /** When it was last checked (the cycle that produced `status`). */
+  checked_at?: string | null
+  last_ok_at?: string | null
+  consecutive_failures?: Num
+  error_class?: string | null
+  /** Dependency-specific safe detail (whitelisted on the server; URLs carry no userinfo). */
+  detail: Record<string, unknown>
+  /** 48 half-hour cells, oldest first; empty when the server sent none (the Overview summary). */
+  strip: StripCell[]
+  /** Seconds between checks: 30 for most, 900 for SMTP and TLS, 300 for the IdP (§2.13). */
+  interval_s?: Num
+  /** Health is read from real traffic (the LLM provider), so there is nothing to re-check. */
+  passive?: boolean
+}
+
+export type OpsHealth = Generated & {
+  /** The latest probe cycle: when, how long, and which worker (lease holder) ran it. */
+  cycle: { at: string | null; duration_ms: Num; holder: string | null; holder_pid: Num; interval_s: Num } | null
+  deps: DepHealth[]
+  /** False when OPS_PROBES_ENABLED is off on the server. */
+  enabled?: boolean
+}
+
+export type ProbeResult = {
+  ts: string
+  status: ProbeStatus
+  latency_ms?: Num
+  error_class?: string | null
+  detail?: Record<string, unknown> | null
+}
+
+/**
+ * One blocked or blocking Postgres backend: durations, statement type and a
+ * query fingerprint and length. Never query text or parameters (§2.6).
+ */
+export type PgBlocking = {
+  pid: Num
+  blocked_by: number[]
+  duration_s: Num
+  state?: string | null
+  statement_type?: string | null
+  fingerprint?: string | null
+  query_length?: Num
+  wait_event?: string | null
+}
+
+export type DepDetail = Generated & {
+  id: string
+  /** The dependency's current card, when the server includes it. */
+  dep?: DepHealth | null
+  latency_series: { t: number; latency_ms: number | null; status: ProbeStatus }[]
+  recent: ProbeResult[]
+  detail: Record<string, unknown>
+  /** Postgres only: blocked and blocking backends. */
+  blocking: PgBlocking[]
+  error_classes: { key: string; count: number }[]
+}
+
+export type QueueCounts = { running: Num; queued: Num; in_flight?: Num }
+
+/** Whitelisted per-worker numbers from the heartbeat (§3.6). Missing ones read "–". */
+export type WorkerSnapshot = {
+  rss: Num
+  cpu_pct: Num
+  fds: Num
+  threads: Num
+  instances: Num
+  loop_lag_ms: Num
+  manager_rtt_ms: Num
+  /** local | ok | unresponsive (multi-worker: the shared-state Manager). */
+  manager_state?: string | null
+  pool: { size: Num; idle: Num; max: Num; wait_ms: Num } | null
+  queues: { llm?: QueueCounts | null; embed?: QueueCounts | null; rerank?: QueueCounts | null }
+  recorder: { buffer: Num; last_flush_ok_at: string | null; flush_failures: Num; lost_rows: Num; dropped_events: Num } | null
+  log_sink: { buffer: Num; dropped: Num; rate_limited: Num } | null
+  drainers: { workspace: string; state?: string | null; backoff_until?: string | null }[]
+  /** Per-role queues in the StatusCard shape, when the heartbeat carries them. */
+  llm_queue_status?: Record<string, unknown> | null
+  embedding_queue_status?: Record<string, unknown> | null
+  rerank_queue_status?: Record<string, unknown> | null
+}
+
+export type OpsWorker = {
+  worker_id: string
+  pid: Num
+  host?: string | null
+  mode?: string | null
+  version?: string | null
+  started_at: string | null
+  heartbeat_age_s: Num
+  alive: boolean | null
+  superseded: boolean
+  exited_at: string | null
+  leases_held: string[]
+  /** The worker that answered this request. */
+  self?: boolean
+  snapshot: WorkerSnapshot
+}
+
+/** Container and host numbers (§3.6): cgroup v2 memory and CPU, load average (host-wide), disk use. */
+export type HostInfo = {
+  mem_used: Num
+  mem_limit: Num
+  cpu_pct: Num
+  load: number[] | null
+  disks: { path: string; used: Num; total: Num }[]
+  sampled_at?: string | null
+}
+
+export type OpsWorkers = Generated & {
+  items: OpsWorker[]
+  host: HostInfo | null
+  mode?: string | null
+  expected?: Num
+  live?: Num
+}
+
+export type WorkerSample = { t: number; rss: number | null; cpu: number | null; loop_lag: number | null; pool_wait: number | null }
+
+/** `LightragStatus.configuration` with URLs stripped of userinfo and secrets redacted on the server. */
+export type OpsConfig = Generated & {
+  configuration: Record<string, unknown>
+  working_directory?: string | null
+  input_directory?: string | null
+  core_version?: string | null
+  api_version?: string | null
+}
+
+export type SmtpTestResult = { ok: boolean; error_class?: string | null; latency_ms?: Num; detail?: Record<string, unknown> | null }
+
 // ---------- the client ----------
 
 const enc = encodeURIComponent
@@ -452,7 +618,18 @@ export const opsApi = {
     normalizeDocuments(await get(`/workspaces/${enc(ws)}/documents`, params, signal)),
   document: async (ws: string, docId: string, signal?: AbortSignal) =>
     normalizeDocument(await get(`/workspaces/${enc(ws)}/documents/${enc(docId)}`, undefined, signal)),
-  events: async (params: Params, signal?: AbortSignal) => normalizeEvents(await get('/events', params, signal))
+  events: async (params: Params, signal?: AbortSignal) => normalizeEvents(await get('/events', params, signal)),
+  health: async (signal?: AbortSignal) => normalizeHealth(await get('/health', undefined, signal)),
+  dependency: async (dep: string, hours: number, signal?: AbortSignal) =>
+    normalizeDepDetail(dep, await get(`/health/${enc(dep)}`, { hours }, signal)),
+  workers: async (signal?: AbortSignal) => normalizeWorkers(await get('/workers', undefined, signal)),
+  workerHistory: async (workerId: string, hours: number, signal?: AbortSignal) =>
+    normalizeWorkerHistory(await get(`/workers/${enc(workerId)}/history`, { hours }, signal)),
+  config: async (signal?: AbortSignal) => normalizeConfig(await get('/config', undefined, signal)),
+  /** Re-check one dependency now (rate-limited on the server: one per 10 s per dependency, host-wide). */
+  recheck: async (dep: string) => normalizeProbeResult(dep, await post(`/health/${enc(dep)}/probe`)),
+  /** EHLO, STARTTLS and NOOP against the configured SMTP server; never sends mail (1 per minute). */
+  smtpTest: async () => normalizeSmtpTest(await post('/smtp/test'))
 }
 
 /** Pause counts as flat rows, whichever of the two server shapes arrives. */

@@ -4,7 +4,7 @@ import { DrawerKind } from '../hashState'
 
 /**
  * A drawer link for an entity whose drawer ships later (run, log entry,
- * dependency, worker, alert). Old links still open the page; they say so
+ * alert). Old links still open the page; they say so
  * instead of failing.
  */
 export default function UnsupportedDrawer({ kind }: { kind: DrawerKind }) {

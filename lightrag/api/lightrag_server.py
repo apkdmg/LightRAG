@@ -28,6 +28,7 @@ from contextlib import asynccontextmanager
 from dotenv import load_dotenv
 from lightrag.api.utils_api import (
     get_combined_auth_dependency,
+    get_request_authenticator,
     display_splash_screen,
     check_env_file,
 )
@@ -66,7 +67,7 @@ from lightrag.api.ops.context import (
     RequestIdMiddleware,
     ServerErrorBoundary,
 )
-from lightrag.api.ops.redact import text_ref
+from lightrag.api.ops.redact import sanitize_config, text_ref
 from lightrag.api.routers.ops_routes import configure_ops
 from lightrag.api.routers.ops_routes import router as ops_router
 from lightrag.api.insights.runtime import start_insights as _start_insights
@@ -81,7 +82,7 @@ from lightrag.kg.shared_storage import (
     get_namespace_data,
     get_default_workspace,
     # set_default_workspace,
-    cleanup_keyed_lock,
+    get_keyed_lock_status,
     finalize_share_data,
 )
 from fastapi.security import OAuth2PasswordRequestForm
@@ -1958,6 +1959,8 @@ def create_app(args):
         rag=rag,
         workers=getattr(args, "workers", None),
         version=api_version_display,
+        # Defined with /health below; called only once the server serves.
+        status_provider=lambda: _status_block(get_default_workspace()),
     )
     app.include_router(ops_router)
 
@@ -2485,6 +2488,90 @@ def create_app(args):
         logger.info("SSO logout initiated, redirecting to Keycloak logout")
         return response
 
+    # D6: anonymous callers get liveness only (plus what /auth-status already
+    # tells anyone); any authenticated caller, admin or not, gets the detail
+    # the WebUI reads. HEALTH_DETAIL=all gives everyone the detail again.
+    health_detail_for_all = (
+        os.getenv("HEALTH_DETAIL", "authenticated").strip().lower() == "all"
+    )
+    request_is_authenticated = get_request_authenticator(api_key)
+
+    def _keyed_lock_view() -> dict:
+        """Read-only lock counts in the shape StatusCard and lightrag.ts read.
+
+        /health no longer cleans up expired locks (an unauthenticated GET must
+        not mutate state); releases clean up after themselves.
+        """
+        current = dict(get_keyed_lock_status())
+        process_id = current.pop("process_id", os.getpid())
+        return {
+            "process_id": process_id,
+            "cleanup_performed": {"mp_cleaned": 0, "async_cleaned": 0},
+            "current_status": {
+                key: int(current.get(key, 0) or 0)
+                for key in (
+                    "total_mp_locks",
+                    "pending_mp_cleanup",
+                    "total_async_locks",
+                    "pending_async_cleanup",
+                )
+            },
+        }
+
+    def _status_block(default_workspace: str) -> dict:
+        """Configuration and versions (secrets and URL userinfo removed)."""
+        configuration = {
+            # LLM configuration binding/host address (if applicable)/model (if applicable)
+            "llm_binding": args.llm_binding,
+            "llm_binding_host": args.llm_binding_host,
+            "llm_model": args.llm_model,
+            # embedding model configuration binding/host address (if applicable)/model (if applicable)
+            "embedding_binding": args.embedding_binding,
+            "embedding_binding_host": args.embedding_binding_host,
+            "embedding_model": args.embedding_model,
+            "summary_max_tokens": args.summary_max_tokens,
+            "summary_context_size": args.summary_context_size,
+            "kv_storage": args.kv_storage,
+            "doc_status_storage": args.doc_status_storage,
+            "graph_storage": args.graph_storage,
+            "vector_storage": args.vector_storage,
+            "enable_llm_cache_for_extract": args.enable_llm_cache_for_extract,
+            "enable_llm_cache": args.enable_llm_cache,
+            "vlm_process_enable": args.vlm_process_enable,
+            "workspace": default_workspace,
+            "storage_workspaces": _get_storage_workspaces(rag),
+            "max_graph_nodes": args.max_graph_nodes,
+            # Rerank configuration
+            "enable_rerank": rerank_model_func is not None,
+            "rerank_binding": args.rerank_binding,
+            "rerank_model": args.rerank_model if rerank_model_func else None,
+            "rerank_binding_host": args.rerank_binding_host
+            if rerank_model_func
+            else None,
+            "rerank_max_async": args.rerank_max_async,
+            "rerank_timeout": args.rerank_timeout,
+            # Environment variable status (requested configuration)
+            "summary_language": args.summary_language,
+            "force_llm_summary_on_merge": args.force_llm_summary_on_merge,
+            "max_parallel_insert": args.max_parallel_insert,
+            "cosine_threshold": args.cosine_threshold,
+            "min_rerank_score": args.min_rerank_score,
+            "related_chunk_number": args.related_chunk_number,
+            "max_async": args.max_async,
+            "llm_timeout": args.llm_timeout,
+            "embedding_func_max_async": args.embedding_func_max_async,
+            "embedding_batch_num": args.embedding_batch_num,
+            "embedding_timeout": args.embedding_timeout,
+            "role_llm_config": rag.get_llm_role_config(),
+        }
+        return {
+            "working_directory": str(args.working_dir),
+            "input_directory": str(args.input_dir),
+            "configuration": sanitize_config(configuration),
+            "core_version": core_version,
+            "api_version": api_version_display,
+        }
+
     @app.get(
         "/health",
         dependencies=[Depends(combined_auth)],
@@ -2526,7 +2613,19 @@ def create_app(args):
     )
     async def get_status(request: Request):
         """Get current system status including WebUI availability"""
+        auth_mode = "enabled" if auth_configured else "disabled"
         try:
+            if not health_detail_for_all and not request_is_authenticated(request):
+                # Liveness only. The LIGHTRAG-WORKSPACE header is not read.
+                return {
+                    "status": "healthy",
+                    "version": api_version_display,
+                    "auth_mode": auth_mode,
+                    "core_version": core_version,
+                    "api_version": api_version_display,
+                    "webui_title": webui_title,
+                    "webui_description": webui_description,
+                }
             workspace = get_workspace_from_request(request)
             default_workspace = get_default_workspace()
             if workspace is None:
@@ -2549,71 +2648,21 @@ def create_app(args):
                 or pipeline_destructive_busy
                 or pipeline_pending_enqueues > 0
             )
-
-            if not auth_configured:
-                auth_mode = "disabled"
-            else:
-                auth_mode = "enabled"
-
-            # Cleanup expired keyed locks and get status
-            keyed_lock_info = cleanup_keyed_lock()
+            status_block = _status_block(default_workspace)
 
             return {
                 "status": "healthy",
                 "webui_available": webui_assets_exist,
-                "working_directory": str(args.working_dir),
-                "input_directory": str(args.input_dir),
-                "configuration": {
-                    # LLM configuration binding/host address (if applicable)/model (if applicable)
-                    "llm_binding": args.llm_binding,
-                    "llm_binding_host": args.llm_binding_host,
-                    "llm_model": args.llm_model,
-                    # embedding model configuration binding/host address (if applicable)/model (if applicable)
-                    "embedding_binding": args.embedding_binding,
-                    "embedding_binding_host": args.embedding_binding_host,
-                    "embedding_model": args.embedding_model,
-                    "summary_max_tokens": args.summary_max_tokens,
-                    "summary_context_size": args.summary_context_size,
-                    "kv_storage": args.kv_storage,
-                    "doc_status_storage": args.doc_status_storage,
-                    "graph_storage": args.graph_storage,
-                    "vector_storage": args.vector_storage,
-                    "enable_llm_cache_for_extract": args.enable_llm_cache_for_extract,
-                    "enable_llm_cache": args.enable_llm_cache,
-                    "vlm_process_enable": args.vlm_process_enable,
-                    "workspace": default_workspace,
-                    "storage_workspaces": _get_storage_workspaces(rag),
-                    "max_graph_nodes": args.max_graph_nodes,
-                    # Rerank configuration
-                    "enable_rerank": rerank_model_func is not None,
-                    "rerank_binding": args.rerank_binding,
-                    "rerank_model": args.rerank_model if rerank_model_func else None,
-                    "rerank_binding_host": args.rerank_binding_host
-                    if rerank_model_func
-                    else None,
-                    "rerank_max_async": args.rerank_max_async,
-                    "rerank_timeout": args.rerank_timeout,
-                    # Environment variable status (requested configuration)
-                    "summary_language": args.summary_language,
-                    "force_llm_summary_on_merge": args.force_llm_summary_on_merge,
-                    "max_parallel_insert": args.max_parallel_insert,
-                    "cosine_threshold": args.cosine_threshold,
-                    "min_rerank_score": args.min_rerank_score,
-                    "related_chunk_number": args.related_chunk_number,
-                    "max_async": args.max_async,
-                    "llm_timeout": args.llm_timeout,
-                    "embedding_func_max_async": args.embedding_func_max_async,
-                    "embedding_batch_num": args.embedding_batch_num,
-                    "embedding_timeout": args.embedding_timeout,
-                    "role_llm_config": rag.get_llm_role_config(),
-                },
+                "working_directory": status_block["working_directory"],
+                "input_directory": status_block["input_directory"],
+                "configuration": status_block["configuration"],
                 "auth_mode": auth_mode,
                 "pipeline_busy": pipeline_busy,
                 "pipeline_active": pipeline_active,
                 "pipeline_scanning": pipeline_scanning,
                 "pipeline_destructive_busy": pipeline_destructive_busy,
                 "pipeline_pending_enqueues": pipeline_pending_enqueues,
-                "keyed_locks": keyed_lock_info,
+                "keyed_locks": _keyed_lock_view(),
                 "llm_queue_status": await rag.get_llm_queue_status(include_base=True),
                 "embedding_queue_status": await rag.get_embedding_queue_status(),
                 "rerank_queue_status": await rag.get_rerank_queue_status(),
@@ -2623,8 +2672,10 @@ def create_app(args):
                 "webui_description": webui_description,
             }
         except Exception as e:
-            logger.error(f"Error getting health status: {str(e)}")
-            raise HTTPException(status_code=500, detail=str(e))
+            # The exception text can carry hosts or credentials; log it
+            # (redacted by the handlers) and answer with a fixed message.
+            logger.error(f"Error getting health status: {type(e).__name__}: {e}")
+            raise HTTPException(status_code=500, detail="Health check failed")
 
     # Pre-render the runtime-config <script> once. The browser-visible URL
     # prefixes are NOT baked into the bundle anymore — index.html ships with

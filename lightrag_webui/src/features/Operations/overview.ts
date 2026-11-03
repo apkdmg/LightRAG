@@ -47,17 +47,27 @@ export const RULE_TARGETS: Record<string, HashTarget> = {
   embed_rerank_error_rate_15m: { tab: 'performance', sub: 'deps' },
   http_5xx_rate_5m: { tab: 'performance', sub: 'http' },
   workers_below_expected: { tab: 'health', sub: 'workers' },
+  worker_heartbeat: { tab: 'health', sub: 'workers' },
+  worker_unresponsive: { tab: 'health', sub: 'workers' },
+  dependency_down: { tab: 'health', sub: 'deps' },
+  pg_probe: { tab: 'health', sub: 'deps', dep: 'postgres' },
+  smtp_probe: { tab: 'health', sub: 'deps', dep: 'smtp' },
+  tls_expiry: { tab: 'health', sub: 'deps' },
+  recorder_lost_rows: { tab: 'health', sub: 'deps' },
   manager_rtt: { tab: 'health', sub: 'workers' },
   pg_pool_wait: { tab: 'health', sub: 'workers' },
   signin_failures_15m: { tab: 'health', sub: 'signin' },
   disk_free: { tab: 'health', sub: 'host' }
 }
 
-/** An attention item's drill target: the server's, else its workspace on the rule's view. */
+/** An attention item's drill target: the server's, else its workspace, dependency or worker on the rule's view. */
 export function attentionTarget(item: AttentionItem): HashTarget {
   if (item.target) return item.target
   const base = RULE_TARGETS[item.rule] ?? { tab: 'health', sub: 'deps' }
-  return item.workspace ? { ...base, workspace: item.workspace } : base
+  if (item.workspace) return { ...base, workspace: item.workspace }
+  if (item.dep) return { ...base, dep: item.dep }
+  if (item.worker_id) return { ...base, worker_id: item.worker_id }
+  return base
 }
 
 const num = (n: unknown): number | null => (typeof n === 'number' && Number.isFinite(n) ? n : null)

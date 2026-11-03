@@ -9,8 +9,10 @@ import { Panel } from './components/Panel'
 import ProcessChip from './components/ProcessChip'
 import { StatusChip, ToneChip } from './components/StatusChip'
 import TimelinePanel from './components/TimelinePanel'
+import WorkersCard from './components/WorkersCard'
 import { useOpsNav, useOpsOverview, useOpsShell } from './context'
 import { fmtAge, fmtClock, fmtCount, fmtLatency, fmtPercent } from './format'
+import { depState, sortDeps } from './health/model'
 import { viewForTarget } from './hashState'
 import { useStale } from './hooks'
 import { KPI_TARGETS, KpiId, OVERVIEW_REFRESH_SECONDS, kpiState, stuckTotal } from './overview'
@@ -20,9 +22,9 @@ import { isMultiWorker } from './severity'
 const FEATURE_ORDER: (keyof OpsFeatures)[] = ['durable', 'runs', 'logs', 'probes', 'alerts', 'release_busy', 'gpu', 'insights']
 const TOP_ACTIVE = 5
 
-/** Why a feature is off: Insights can be switched off, release busy needs Gunicorn, the rest ships later. */
+/** Why a feature is off: Insights and probes can be switched off, release busy needs Gunicorn, the rest ships later. */
 const offLabel = (key: keyof OpsFeatures, singleProcess: boolean) => {
-  if (key === 'insights') return 'operations.feature.off'
+  if (key === 'insights' || key === 'probes') return 'operations.feature.off'
   if (key === 'release_busy' && singleProcess) return 'operations.feature.multiWorkerOnly'
   return 'operations.feature.later'
 }
@@ -253,9 +255,11 @@ function ProcessingNow({ poll }: { poll: OpsPoll<OpsOverview> }) {
   )
 }
 
+/** The latest probe result per dependency (§2.3); each chip opens its Dependency drawer. */
 function DepsSummary({ data }: { data: OpsOverview | null }) {
   const { t } = useTranslation()
-  const deps = data?.deps ?? []
+  const nav = useOpsNav()
+  const deps = sortDeps(data?.deps ?? [])
   return (
     <Card className="flex min-w-0 flex-col gap-2">
       <Title>{t('operations.overview.deps')}</Title>
@@ -263,13 +267,22 @@ function DepsSummary({ data }: { data: OpsOverview | null }) {
         <ul className="m-0 flex list-none flex-wrap gap-1.5 p-0">
           {deps.map((d) => (
             <li key={d.id}>
-              <StatusChip state={d.status}>{t(`operations.dep.${d.id}`, { defaultValue: d.id })}</StatusChip>
+              <OpsLink to={{ ...nav.view, drawer: { kind: 'dependency', id: d.id } }} className="no-underline">
+                <StatusChip state={depState(d.status)}>
+                  {d.name ?? t(`operations.dep.${d.id}`, { defaultValue: d.id })}
+                  {typeof d.latency_ms === 'number' && d.status === 'ok' ? <span className="font-mono font-medium"> {fmtLatency(d.latency_ms)}</span> : null}
+                  {d.status === 'unprobed' ? <span className="font-medium"> · {t('operations.topology.notProbed')}</span> : null}
+                </StatusChip>
+              </OpsLink>
             </li>
           ))}
         </ul>
       ) : (
         <p className="text-muted-foreground m-0 text-sm">{t('operations.overview.depsLater')}</p>
       )}
+      <OpsLink to={viewForTarget(nav.view, { tab: 'health', sub: 'deps' })} className="text-xs underline-offset-2 hover:underline">
+        {t('operations.overview.openHealth')}
+      </OpsLink>
     </Card>
   )
 }
@@ -287,12 +300,16 @@ export default function OverviewTab() {
 
 function OverviewContent({ poll }: { poll: OpsPoll<OpsOverview> }) {
   const data = poll.data
+  const { status } = useOpsShell()
   return (
     <div className="flex flex-col gap-4">
       {data && data.available !== false ? <KpiRow data={data} poll={poll} /> : null}
       <div className="grid items-start gap-4 lg:grid-cols-[minmax(0,1.4fr)_minmax(0,1fr)]">
         <AttentionPanel poll={poll} />
-        <ServerCard />
+        <div className="flex min-w-0 flex-col gap-4">
+          {data && data.available !== false ? <WorkersCard workers={data.workers} now={poll.updatedAt} multiWorker={isMultiWorker(status?.process.mode)} /> : null}
+          <ServerCard />
+        </div>
       </div>
       <TimelinePanel buckets={data?.timeline?.buckets} events={data?.timeline?.events} />
       <div className="grid items-start gap-4 lg:grid-cols-[minmax(0,1.4fr)_minmax(0,1fr)]">

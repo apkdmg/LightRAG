@@ -25,9 +25,10 @@ const ICONS: Record<IconId, typeof CheckCircle2Icon> = {
   wrench: WrenchIcon
 }
 
-export function StateIcon({ icon, className }: { icon: IconId; className?: string }) {
+/** A status icon; inside an SVG (the topology map) pass x, y, width and height to place it. */
+export function StateIcon({ icon, className, ...place }: { icon: IconId; className?: string; x?: number; y?: number; width?: number; height?: number }) {
   const Icon = ICONS[icon]
-  return <Icon className={cn('size-3.5 flex-none', className)} aria-hidden="true" />
+  return <Icon {...place} className={cn('size-3.5 flex-none', className)} aria-hidden="true" />
 }
 
 /** A tone-coloured chip: icon plus text, never colour alone (§2.2). */

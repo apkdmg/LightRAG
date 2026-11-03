@@ -210,15 +210,17 @@ export function useRingToken(key: string): number {
  * grows by at most 8 px per side. The per-axis scale comes from the element's
  * size via ResizeObserver, never from a layout read in an animation frame.
  * Two alternating classes restart the animation without a forced reflow.
+ * An element whose size is known up front (an SVG node box) passes
+ * `measure: false` and sets --ring-sx / --ring-sy itself.
  */
-export function useRing<T extends HTMLElement>(token: number) {
+export function useRing<T extends HTMLElement | SVGElement>(token: number, { measure = true }: { measure?: boolean } = {}) {
   const ref = useRef<T | null>(null)
   const { reduced } = useOpsMotion()
   const seen = useRef(token)
 
   useEffect(() => {
     const el = ref.current
-    if (!el || typeof ResizeObserver === 'undefined') return
+    if (!measure || !el || typeof ResizeObserver === 'undefined') return
     const ro = new ResizeObserver(([entry]) => {
       const box = entry.contentRect
       el.style.setProperty('--ring-sx', (1 + 16 / Math.max(box.width, 1)).toFixed(3))
@@ -226,7 +228,7 @@ export function useRing<T extends HTMLElement>(token: number) {
     })
     ro.observe(el)
     return () => ro.disconnect()
-  }, [])
+  }, [measure])
 
   useEffect(() => {
     const el = ref.current

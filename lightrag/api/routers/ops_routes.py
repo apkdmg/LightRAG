@@ -32,6 +32,8 @@ from fastapi.routing import APIRoute
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from lightrag.api.dependencies import UserInfo, require_admin
+from lightrag.api.ops.auth import require_live_admin, require_ops_client
+from lightrag.api.ops.health import dep_card
 from lightrag.api.ops.context import (
     REQUEST_ID_HEADER,
     current_request_id,
@@ -47,6 +49,8 @@ from lightrag.api.ops.service import (
     OpsService,
     SEARCH_MAX_LENGTH,
 )
+from lightrag.api.ops.probes import SMTP_TEST_INTERVAL_S, recheck_limit
+from lightrag.api.ops.redact import sanitize_config
 from lightrag.api.ops.snapshot import NamespaceReader
 from lightrag.api.ops.store import BACKLOG_STATUSES, Page
 from lightrag.kg import shared_storage
@@ -80,12 +84,24 @@ class OpsServerInfo:
     rag: Any
     workers: Optional[int]
     version: str
+    # Returns the server's status block (``/health`` configuration shape).
+    status_provider: Optional[Callable[[], Any]] = None
 
 
-def configure_ops(app: Any, *, rag: Any, workers: Optional[int], version: Any) -> None:
+def configure_ops(
+    app: Any,
+    *,
+    rag: Any,
+    workers: Optional[int],
+    version: Any,
+    status_provider: Optional[Callable[[], Any]] = None,
+) -> None:
     """Record the server's own LightRAG instance and process settings."""
     app.state.ops_server = OpsServerInfo(
-        rag=rag, workers=workers, version=str(version or "")
+        rag=rag,
+        workers=workers,
+        version=str(version or ""),
+        status_provider=status_provider,
     )
 
 
@@ -363,6 +379,9 @@ async def status(
     expected = _expected_workers(mode, info.workers if info else None)
     workers_live = 1 if mode == "uvicorn" else _count_gunicorn_workers()
     service = _service(request)
+    heartbeat_live = await service.live_workers()
+    if heartbeat_live is not None:
+        workers_live = heartbeat_live
     payload: dict[str, Any] = {
         "generated_at": _generated_at(),
         "available": available,
@@ -371,7 +390,8 @@ async def status(
             "processing": service.docs_available,
             "runs": False,
             "logs": False,
-            "probes": False,
+            "probes": service.probes is not None,
+            "heartbeats": service.heartbeat is not None,
             "alerts": False,
             "insights": getattr(request.app.state, "insights", None) is not None,
             "release_busy": False,
@@ -646,3 +666,156 @@ async def events(
         {"items": [], "kinds": [*EVENT_KINDS, AUDIT_EVENT_KIND]},
         needs_docs=False,
     )
+
+
+# -- Health and workers ----------------------------------------------------------
+
+
+@router.get("/health")
+async def health(request: Request) -> dict[str, Any]:
+    """Dependency grid: latest probe, 48-slot availability strip, detail."""
+    service = _service(request)
+    return _payload(service, await service.health(process_mode()), needs_docs=False)
+
+
+@router.get("/health/{dep}")
+async def health_dependency(
+    request: Request, dep: str, hours: int = Query(24, ge=1, le=168)
+) -> dict[str, Any]:
+    """Dependency drawer: latency series, recent results, error classes and,
+    for Postgres, blocked and blocking backends (never query text)."""
+    service = _service(request)
+    try:
+        body = await service.dependency(dep, hours, process_mode())
+    except OpsBadRequest as e:
+        return _err(400, e.code)
+    except OpsNotFound:
+        return _err(404, "not_found")
+    except OpsDataUnavailable:
+        return _err(503, "data_unavailable")
+    return _payload(service, body, needs_docs=False)
+
+
+@router.get("/workers")
+async def workers(request: Request) -> dict[str, Any]:
+    """Every worker that reported in the last day, live ones first."""
+    service = _service(request)
+    try:
+        body = await service.workers_view(_workers(request))
+    except OpsDataUnavailable:
+        return _err(503, "data_unavailable")
+    return _payload(service, body, needs_docs=False)
+
+
+@router.get("/workers/{worker_id}/history")
+async def worker_history(
+    request: Request, worker_id: str, hours: int = Query(24, ge=1, le=168)
+) -> dict[str, Any]:
+    """Per-minute RSS, CPU, loop lag and pool wait of one worker."""
+    service = _service(request)
+    return await _answer(
+        service,
+        lambda: service.worker_history(worker_id, hours),
+        {"worker_id": worker_id, "hours": hours, "items": []},
+        needs_docs=False,
+    )
+
+
+@router.get("/config")
+async def config(request: Request) -> dict[str, Any]:
+    """The server's configuration block: secrets redacted, URLs without userinfo."""
+    info = _server_info(request)
+    provider = info.status_provider if info is not None else None
+    if provider is None:
+        return {
+            "generated_at": _generated_at(),
+            "configuration": {},
+            "unavailable_reason": "not_configured",
+        }
+    status_block = provider()
+    if hasattr(status_block, "__await__"):
+        status_block = await status_block
+    status_block = sanitize_config(dict(status_block or {}))
+    return {
+        "generated_at": _generated_at(),
+        "configuration": status_block.get("configuration") or {},
+        "working_directory": status_block.get("working_directory"),
+        "input_directory": status_block.get("input_directory"),
+        "core_version": status_block.get("core_version"),
+        "api_version": status_block.get("api_version"),
+    }
+
+
+_POST_GUARDS = [Depends(require_live_admin), Depends(require_ops_client)]
+
+
+def _rate_limited(retry_after: float) -> JSONResponse:
+    return _err(429, "rate_limited", headers={"Retry-After": str(int(retry_after))})
+
+
+@router.post("/health/{dep}/probe", dependencies=_POST_GUARDS)
+async def recheck_dependency(request: Request, dep: str) -> dict[str, Any]:
+    """Check one dependency now.
+
+    Host-wide limit: once per 10 s per dependency; once a minute for the
+    slow-cadence probes, and SMTP shares the SMTP test's once-a-minute claim.
+    """
+    service = _service(request)
+    runner = service.probes
+    if runner is None:
+        return _err(503, "probes_disabled")
+    try:
+        spec = service.known_dep(dep)
+    except OpsBadRequest as e:
+        return _err(400, e.code)
+    if spec is None:
+        return _err(404, "not_found")
+    if not spec.checkable or spec.passive:
+        return _err(400, "not_checkable")
+    claim, interval_s = recheck_limit(spec)
+    if not await runner.claim(claim, interval_s):
+        return _rate_limited(interval_s)
+    record = await runner.probe_now(dep)
+    service.cache.forget(("probe_records",))
+    service.cache.forget(("dependency", dep, 24))
+    if record is None:
+        return _err(503, "probe_failed")
+    card = dep_card(spec, record, None, service.clock())
+    card.pop("strip", None)
+    return {"generated_at": _generated_at(), **card}
+
+
+@router.post("/smtp/test", dependencies=_POST_GUARDS)
+async def smtp_test(request: Request) -> dict[str, Any]:
+    """Connect, EHLO, STARTTLS and NOOP against the configured SMTP server.
+
+    Never logs in and never sends mail. Host-wide limit: once a minute.
+    """
+    service = _service(request)
+    runner = service.probes
+    if runner is None:
+        return _err(503, "probes_disabled")
+    spec = runner.specs.get("smtp")
+    if spec is None:
+        return {
+            "generated_at": _generated_at(),
+            "ok": False,
+            "error_class": "not_configured",
+            "latency_ms": None,
+            "detail": {"configured": False},
+        }
+    if not await runner.claim("smtp_test", SMTP_TEST_INTERVAL_S):
+        return _rate_limited(SMTP_TEST_INTERVAL_S)
+    record = await runner.probe_now("smtp")
+    service.cache.forget(("probe_records",))
+    if record is None:
+        return _err(503, "probe_failed")
+    return {
+        "generated_at": _generated_at(),
+        "ok": record["status"] in ("ok", "warn"),
+        "status": record["status"],
+        "error_class": record.get("error_class"),
+        "latency_ms": record.get("latency_ms"),
+        "detail": record.get("detail") or {},
+        "checked_at": record.get("checked_at"),
+    }

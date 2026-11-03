@@ -814,10 +814,9 @@ def test_health_role_llm_config_uses_runtime_snapshot(tmp_path, monkeypatch):
         AsyncMock(return_value={"busy": False}),
     )
     monkeypatch.setattr(lightrag_server, "get_default_workspace", lambda: "default")
+    # /health reads lock counts without cleaning up (D6).
     monkeypatch.setattr(
-        lightrag_server,
-        "cleanup_keyed_lock",
-        lambda: {"cleanup_performed": {}, "current_status": {}},
+        lightrag_server, "get_keyed_lock_status", lambda: {"process_id": 1}
     )
 
     app = lightrag_server.create_app(_make_args(tmp_path))
@@ -902,10 +901,9 @@ def test_health_pipeline_active_derivation(
         AsyncMock(return_value=pipeline_state),
     )
     monkeypatch.setattr(lightrag_server, "get_default_workspace", lambda: "default")
+    # /health reads lock counts without cleaning up (D6).
     monkeypatch.setattr(
-        lightrag_server,
-        "cleanup_keyed_lock",
-        lambda: {"cleanup_performed": {}, "current_status": {}},
+        lightrag_server, "get_keyed_lock_status", lambda: {"process_id": 1}
     )
 
     app = lightrag_server.create_app(_make_args(tmp_path))

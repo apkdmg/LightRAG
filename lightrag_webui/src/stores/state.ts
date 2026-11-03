@@ -3,6 +3,7 @@ import { createSelectors } from '@/lib/utils'
 import { checkHealth, LightragStatus } from '@/api/lightrag'
 import { useSettingsStore } from './settings'
 import { healthCheckInterval } from '@/lib/constants'
+import { hasHealthDetail } from '@/lib/healthDetail'
 
 interface BackendState {
   health: boolean
@@ -75,6 +76,13 @@ const useBackendStateStoreBase = create<BackendState>()((set, get) => ({
           'webui_title' in health ? (health.webui_title ?? null) : null,
           'webui_description' in health ? (health.webui_description ?? null) : null
         );
+      }
+
+      // Liveness only (no session detail): the server is up, but keep the last
+      // detailed status and pipeline flags instead of replacing them with nothing.
+      if (!hasHealthDetail(health)) {
+        set({ health: true, message: null, messageTitle: null, lastCheckTime: Date.now() })
+        return true
       }
 
       // Extract and store backend max graph nodes limit

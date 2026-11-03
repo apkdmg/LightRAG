@@ -9,9 +9,14 @@ ops store, the background index builder and the leased singleton loops.
 Nothing here may stop the server from starting or serving: every failure is
 logged and the console reports what is unavailable instead.
 
+It also starts this worker's heartbeat (every process) and the dependency
+probes (a leased singleton on Postgres; local to each process without it),
+and, on Postgres, the leased attention snapshot.
+
 Switches (all default on): ``OPS_ENABLED`` (the whole backend),
-``OPS_INDEX_BUILD`` (the background index builder) and ``OPS_QUEUE_SCAN``
-(the email re-sync queue scan).
+``OPS_INDEX_BUILD`` (the background index builder), ``OPS_QUEUE_SCAN``
+(the email re-sync queue scan) and ``OPS_PROBES_ENABLED`` (dependency
+probes).
 """
 
 from __future__ import annotations
@@ -25,7 +30,8 @@ from typing import Any, Optional
 from uuid import uuid4
 
 from lightrag.api.ops.context import set_worker_id
-from lightrag.api.ops.leases import LeasedLoop
+from lightrag.api.ops.heartbeat import Heartbeat
+from lightrag.api.ops.leases import LeasedLoop, LocalLeases
 from lightrag.api.ops.pauses import OwnProviderCache
 from lightrag.api.ops.service import OpsService
 from lightrag.api.ops.snapshot import NamespaceReader
@@ -56,6 +62,13 @@ class OpsRuntime:
     tasks: set[asyncio.Task] = field(default_factory=set)
     index_task: Optional[asyncio.Task] = None
     index_outcome: Optional[dict[str, str]] = None
+    heartbeat: Optional[Heartbeat] = None
+    probes: Any = None
+
+    def leases_held(self) -> list[str]:
+        return [
+            loop.name for loop in self.loops if loop.held and loop.store is self.store
+        ]
 
     def _spawn(self, coro: Any, name: str) -> asyncio.Task:
         task = asyncio.create_task(coro, name=name)
@@ -106,14 +119,109 @@ async def start_ops(app: Any, rag: Any, args: Any) -> Optional[OpsRuntime]:
     if isinstance(current, OpsRuntime) and current.pid == os.getpid():
         return current
     try:
-        return await _start(app, args)
+        return await _start(app, rag, args)
     except Exception:
         logger.error("Operations console backend could not start", exc_info=True)
         app.state.ops = None
         return None
 
 
-async def _start(app: Any, args: Any) -> OpsRuntime:
+def _process(app: Any) -> dict[str, Any]:
+    """Process mode and expected workers, as the ops routes report them."""
+    from lightrag.api.routers import ops_routes
+
+    info = getattr(app.state, "ops_server", None)
+    mode = ops_routes.process_mode()
+    return {
+        "mode": mode,
+        "expected": ops_routes._expected_workers(
+            mode, info.workers if info is not None else None
+        ),
+        "live": None,
+    }
+
+
+def _start_heartbeat(app: Any, rag: Any, args: Any, runtime: OpsRuntime) -> None:
+    info = getattr(app.state, "ops_server", None)
+    heartbeat = Heartbeat(
+        worker_id=runtime.worker_id,
+        mode=_process(app)["mode"],
+        version=getattr(info, "version", "") or "",
+        store=runtime.store,
+        reader=runtime.reader,
+        app_state=app.state,
+        leases=runtime.leases_held,
+        data_rag=lambda: getattr(app.state, "default_rag", None) or rag,
+        host_paths=_disk_paths(args),
+    )
+    heartbeat.start()
+    runtime.heartbeat = heartbeat
+    runtime.service.heartbeat = heartbeat
+
+
+def _disk_paths(args: Any) -> list[str]:
+    paths = [getattr(args, "working_dir", None), os.getenv("LOG_DIR") or os.getcwd()]
+    return [p for p in paths if isinstance(p, str) and p]
+
+
+def _start_probes(app: Any, args: Any, runtime: OpsRuntime) -> None:
+    from lightrag.api.ops import probes
+
+    specs = probes.build_specs(
+        args,
+        store=runtime.store,
+        app_state=app.state,
+        disk_paths=_disk_paths(args),
+    )
+    runner = probes.ProbeRunner(specs, store=runtime.store, holder=runtime.worker_id)
+
+    async def cycle(loop: LeasedLoop) -> None:
+        await runner.run_cycle(loop)
+
+    loop = LeasedLoop(
+        runtime.store if runtime.store is not None else LocalLeases(),
+        probes.PROBE_LEASE,
+        runtime.worker_id,
+        cycle,
+        ttl_s=probes.PROBE_LEASE_TTL_S,
+        interval_s=probes.PROBE_INTERVAL_S,
+        cycle_timeout_s=probes.PROBE_CYCLE_TIMEOUT_S,
+        initial_delay_s=random.uniform(1.0, 5.0),
+    )
+    loop.start()
+    runtime.loops.append(loop)
+    runtime.probes = runner
+    runtime.service.probes = runner
+    logger.info(
+        "Operations console: probing %d dependencies (%s)",
+        sum(1 for s in specs if s.checkable),
+        "leased" if runtime.store is not None else "this process only",
+    )
+
+
+def _start_reconcile(app: Any, runtime: OpsRuntime) -> None:
+    from lightrag.api.ops import reconcile
+
+    async def cycle(loop: LeasedLoop) -> None:
+        await reconcile.attention_cycle(
+            loop, service=runtime.service, process=lambda: _process(app)
+        )
+
+    loop = LeasedLoop(
+        runtime.store,
+        reconcile.RECONCILE_LEASE,
+        runtime.worker_id,
+        cycle,
+        ttl_s=reconcile.RECONCILE_LEASE_TTL_S,
+        interval_s=reconcile.RECONCILE_INTERVAL_S,
+        cycle_timeout_s=reconcile.RECONCILE_CYCLE_TIMEOUT_S,
+        initial_delay_s=random.uniform(5.0, 15.0),
+    )
+    loop.start()
+    runtime.loops.append(loop)
+
+
+async def _start(app: Any, rag: Any, args: Any) -> OpsRuntime:
     worker_id = uuid4().hex
     set_worker_id(worker_id)
     reader = NamespaceReader()
@@ -170,9 +278,29 @@ async def _start(app: Any, args: Any) -> OpsRuntime:
         service=service,
         store=store,
     )
+    service.worker_id = worker_id
     app.state.ops = runtime
+    if env_flag("OPS_ENABLED"):
+        # Each part is optional: a failure leaves the rest running.
+        try:
+            _start_heartbeat(app, rag, args, runtime)
+        except Exception:
+            logger.error("Operations console heartbeat could not start", exc_info=True)
+        if env_flag("OPS_PROBES_ENABLED"):
+            try:
+                _start_probes(app, args, runtime)
+            except Exception:
+                logger.error("Operations console probes could not start", exc_info=True)
+        else:
+            logger.info(
+                "Operations console: probes disabled by OPS_PROBES_ENABLED=false"
+            )
     if store is None:
         return runtime
+    try:
+        _start_reconcile(app, runtime)
+    except Exception:
+        logger.error("Operations console attention loop could not start", exc_info=True)
 
     add_event_sink(runtime.on_event)
     if env_flag("OPS_INDEX_BUILD"):
@@ -213,6 +341,11 @@ async def stop_ops(app: Any) -> None:
     if not isinstance(runtime, OpsRuntime):
         return
     remove_event_sink(runtime.on_event)
+    if runtime.heartbeat is not None:
+        try:
+            await runtime.heartbeat.stop()
+        except Exception:
+            logger.debug("Ops heartbeat did not stop cleanly", exc_info=True)
     for loop in runtime.loops:
         try:
             await loop.stop()
@@ -224,6 +357,8 @@ async def stop_ops(app: Any) -> None:
     if tasks:
         await asyncio.gather(*tasks, return_exceptions=True)
     runtime.reader.close()
+    if runtime.probes is not None:
+        runtime.probes.close()
     if runtime.store is not None:
         try:
             await runtime.store.finalize()

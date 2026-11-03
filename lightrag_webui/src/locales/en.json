@@ -1427,8 +1427,11 @@
       "owner_alive": "Refused: the worker that owns the run is still alive.",
       "cas_mismatch": "The run changed since you looked. Refresh and try again.",
       "single_process": "Not available when the server runs as a single process.",
-      "rate_limited": "Too soon. Wait a minute and try again.",
-      "feature_disabled": "This action is turned off on this server."
+      "rate_limited": "Too soon. Wait a little and try again.",
+      "feature_disabled": "This action is turned off on this server.",
+      "probes_disabled": "Dependency probes are turned off on this server.",
+      "not_checkable": "This dependency has no probe to run (it is read from real traffic, or not probed).",
+      "probe_failed": "The check could not be run. Try again; if it keeps failing, see the server log."
     },
     "system": {
       "title": "This server",
@@ -1467,10 +1470,6 @@
         "title": "Logs",
         "body": "A searchable view of WARNING and ERROR log lines, redacted when they are written, will appear here. Error messages already show a Ref: request ID that matches the server log line."
       },
-      "health": {
-        "title": "Health",
-        "body": "Dependency checks (PostgreSQL, the graph and vector stores, vLLM, Docling, SMTP and sign-in), a topology map and worker heartbeats will appear here. Until then, the status indicator at the bottom right shows this server's configuration and queues."
-      },
       "performance": {
         "title": "Performance",
         "body": "LLM, embedding and rerank latency, HTTP routes, throughput and concurrency will appear here. Token use and cost stay in Token Insights."
@@ -1482,6 +1481,10 @@
       "runs": {
         "title": "Run history",
         "body": "Thirty days of runs (kind, trigger, duration, documents done and failed, outcome) arrive with run tracking in a later release. Until then, Active shows the interim list, labelled \"Approximate (interim)\"."
+      },
+      "signin": {
+        "title": "Sign-in health",
+        "body": "SSO callback errors, rejected tokens and login lockouts per 15 minutes and 24 hours arrive with the Performance release. Counts carry outcomes only, never usernames."
       }
     },
     "unavailableShort": "Not available: this view needs PostgreSQL KV storage (LIGHTRAG_KV_STORAGE=PGKVStorage).",
@@ -1558,7 +1561,7 @@
       "deps": {
         "label": "Dependencies",
         "sub": "probes passing",
-        "later": "probes arrive with Health"
+        "later": "no probe results yet"
       },
       "workers": {
         "label": "Server",
@@ -1695,7 +1698,8 @@
       "processingNow": "Processing now",
       "allActive": "All active",
       "deps": "Dependencies",
-      "depsLater": "Dependency checks (PostgreSQL, Milvus, Neo4j, vLLM, Docling, SMTP and sign-in) arrive with the Health tab."
+      "depsLater": "No probe results yet. The first probe cycle runs within 30 seconds of start-up; open Health for details.",
+      "openHealth": "Open Health"
     },
     "timeline": {
       "title": "Last {{hours}} hours",
@@ -1992,7 +1996,9 @@
         "dependency": "dependency",
         "worker": "worker",
         "alert": "alert"
-      }
+      },
+      "dependencyTitle": "Dependency {{name}}",
+      "workerTitle": "Worker {{id}}"
     },
     "workspace": {
       "owner": "Owner {{owner}}",
@@ -2077,7 +2083,492 @@
       "llm": "LLM provider",
       "docling": "Docling",
       "smtp": "SMTP",
-      "idp": "Sign-in provider"
+      "idp": "Sign-in provider",
+      "vector": "Vector store",
+      "qdrant": "Qdrant",
+      "faiss": "Faiss",
+      "memgraph": "Memgraph",
+      "mongo": "MongoDB",
+      "redis": "Redis",
+      "embed": "Embeddings",
+      "rerank": "Reranker",
+      "llm_provider": "LLM provider",
+      "keycloak": "Keycloak",
+      "oidc": "Sign-in provider",
+      "tls": "TLS certificate",
+      "tls_proxy": "TLS certificate (proxy)",
+      "proxy": "Reverse proxy",
+      "manager": "Manager",
+      "recorder": "Insights recorder",
+      "insights": "Insights recorder",
+      "log_sink": "Ops log sink",
+      "disk": "Disk",
+      "etcd": "etcd",
+      "minio": "MinIO",
+      "signin": "Sign-in"
+    },
+    "probe": {
+      "ok": "OK",
+      "warn": "Slow",
+      "down": "Down",
+      "unknown": "Unknown",
+      "unprobed": "Not probed"
+    },
+    "strip": {
+      "label": "Availability over 24 hours, in half-hour slots",
+      "labelFor": "{{name}} availability over 24 hours, in half-hour slots",
+      "slot": "Slot",
+      "window": "24 h",
+      "uptime": "{{pct}}% OK",
+      "cell": {
+        "ok": "{{range}}: OK",
+        "okOf": "{{range}}: all {{total}} checks OK",
+        "warn": "{{range}}: slow",
+        "slowOf": "{{range}}: {{slow}} slow of {{total}}",
+        "down": "{{range}}: failed",
+        "failed": "{{range}}: {{failed}} failed of {{total}}",
+        "unknown": "{{range}}: no data"
+      }
+    },
+    "health": {
+      "sub": {
+        "label": "Health view",
+        "deps": "Dependencies",
+        "workers": "Workers",
+        "host": "Host",
+        "config": "Config",
+        "signin": "Sign-in"
+      },
+      "depsTitle": "Dependencies",
+      "noCycle": "No probe cycle has finished yet.",
+      "holderPid": "pid {{pid}}",
+      "probedBy": "Probed by {{holder}} (lease holder) every {{every}} s",
+      "probedEvery": "Probed every {{every}} s",
+      "lastCycle": "last cycle {{time}} ({{duration}})",
+      "recheckAll": "Re-check all",
+      "recheckHint": "Runs the probes now. Each dependency can be re-checked once every 10 seconds; SMTP, TLS and sign-in once a minute, from their own card.",
+      "working": "Working…",
+      "recheckDone": "{{name}} re-checked: {{status}}",
+      "recheckAllDone": "Re-checked {{done}} of {{total}}",
+      "recheckRefused_one": "{{count}} too soon, try again in a few seconds",
+      "recheckRefused_other": "{{count}} too soon, try again in a few seconds",
+      "recheckFailed_one": "{{count}} failed",
+      "recheckFailed_other": "{{count}} failed",
+      "smtpTest": "Test SMTP",
+      "smtpTestHint": "Connects, says EHLO, STARTTLS and NOOP, then quits. No mail is sent. Once a minute.",
+      "smtpOk": "SMTP answered in {{latency}}. No mail was sent.",
+      "smtpFailed": "SMTP test failed: {{error}}. No mail was sent.",
+      "passive": "OK (passive)",
+      "checkedAt": "checked {{time}}",
+      "lastOk": "Last OK",
+      "lastOkAt": "last OK {{time}}",
+      "failures": "Consecutive failures",
+      "staleCard": "No result for more than twice its check interval ({{every}} s).",
+      "summary": "{{ok}} of {{total}} probed dependencies OK",
+      "noDeps": "No dependency results yet. The first probe cycle runs within 30 seconds of start-up.",
+      "probesOff": "Dependency probes are turned off on this server (OPS_PROBES_ENABLED=false). The map and cards show the last known results, if any.",
+      "probesOffEmpty": "Dependency probes are turned off on this server.",
+      "detail": {
+        "conns": "conns {{used}}/{{max}}",
+        "blocked": "blocked {{count}}",
+        "metricsUnavailable": "metrics unavailable",
+        "queue": "running {{running}} · waiting {{waiting}}",
+        "kvCache": "KV cache {{pct}}",
+        "certDays": "cert {{days}} days left",
+        "certSelfSigned": "self-signed · {{days}} days left",
+        "starttls": "STARTTLS",
+        "version": "v{{version}}",
+        "errorRate": "err {{rate}}",
+        "diskUsed": "{{pct}} used",
+        "dbSize": "db {{size}}",
+        "authRequired": "health endpoint needs auth",
+        "lowVolume": "few calls",
+        "diskFree": "{{pct}} free",
+        "rtt": "round trip {{rtt}}",
+        "recorder": "buffer {{buffer}} · lost +{{lost}} · dropped +{{dropped}} (5 min)",
+        "reason": {
+          "covered_by_postgres": "stored in PostgreSQL (see its card)",
+          "local_storage": "local files on this server",
+          "not_configured": "address not readable by the probe",
+          "no_probe": "no probe for this backend"
+        }
+      }
+    },
+    "topology": {
+      "title": "System topology",
+      "layer": "Topology layer",
+      "traffic": "Traffic",
+      "monitoring": "Monitoring layer",
+      "staticNote": "Lines are static for now; live traffic rates arrive with the Performance release.",
+      "svgLabel": "System topology: callers reach the LightRAG server, which depends on {{deps}}.",
+      "noDeps": "no probed dependencies yet",
+      "notProbed": "Not probed",
+      "group": {
+        "container": "LIGHTRAG SERVER · {{mode}}",
+        "services": "MODEL AND VECTOR SERVICES",
+        "external": "EXTERNAL"
+      },
+      "edge": {
+        "sso": "SSO redirect",
+        "llm": "LLM calls",
+        "alertEmail": "alert email",
+        "bypass": "outside callers → vLLM via the proxy",
+        "writes": "OPS_* writes",
+        "reads": "reads",
+        "probes": "probes"
+      },
+      "legend": {
+        "connection": "Connection (static until live rates arrive)",
+        "unprobed": "Not probed (shown dashed)",
+        "down": "Target down, marked ✖",
+        "bypass": "Callers reaching vLLM through the proxy, bypassing LightRAG",
+        "probe": "Probe (Monitoring layer)"
+      },
+      "info": {
+        "role": "Role",
+        "watch": "How it is watched",
+        "latest": "Latest probe",
+        "open": "Open details"
+      },
+      "node": {
+        "idp": {
+          "label": "Sign-in provider",
+          "sub": "single sign-on",
+          "role": "Single sign-on for the WebUI.",
+          "watch": "OIDC discovery every 5 minutes."
+        },
+        "llm": {
+          "label": "LLM provider",
+          "sub": "LLM calls",
+          "role": "Answers extraction, keyword, query and vision calls.",
+          "watch": "Passive only, so no paid test calls: error rate, latency and provider rejections from the usage table."
+        },
+        "smtp": {
+          "label": "SMTP",
+          "sub": "alert email",
+          "role": "Sends provider, budget and operations alert emails.",
+          "watch": "EHLO, STARTTLS and NOOP every 15 minutes. No mail is sent."
+        },
+        "browser": {
+          "label": "Admins and users",
+          "sub": "browser · WebUI",
+          "role": "Everyone reaches the WebUI and the API through the server's HTTP stack.",
+          "watch": "The Operations tab polls /admin/ops only for the visible view and pauses while the browser tab is hidden."
+        },
+        "connector": {
+          "label": "Email connector",
+          "sub": "posts .eml files",
+          "role": "Posts emails to /documents/email. Re-sent emails are deferred to the queue directory.",
+          "watch": "Email queue depth, the oldest record and drain attempts per workspace (Processing › Email queue)."
+        },
+        "clients": {
+          "label": "API clients",
+          "sub": "/query · /v1 · /api",
+          "role": "REST, Ollama-compatible and OpenAI-compatible callers.",
+          "watch": "Request IDs on every response; HTTP latency per route arrives with the Performance release."
+        },
+        "proxy": {
+          "label": "Reverse proxy",
+          "sub": "TLS · 443",
+          "role": "Terminates TLS and forwards requests to LightRAG. It may also route callers straight to vLLM.",
+          "watch": "A TLS certificate expiry check every 15 minutes. Its own logs are out of scope."
+        },
+        "http": {
+          "label": "HTTP stack",
+          "sub": "request ID → middleware → routers",
+          "role": "Uvicorn, the middleware (request ID, usage context, security headers, CORS) and the routers.",
+          "watch": "Every response carries X-Request-ID, and error messages show it as Ref:."
+        },
+        "opsapi": {
+          "label": "/admin/ops API",
+          "sub": "admin only · read-mostly",
+          "role": "The endpoints behind this console, admin-only for the whole router.",
+          "watch": "Short per-process caches keep the cost flat however many admins watch. It never loads a workspace into memory."
+        },
+        "pipeline": {
+          "label": "Ingestion pipeline",
+          "sub": "parse → analyze → extract → merge",
+          "role": "Parses documents, extracts entities with the LLM and merges them into the graph and vector stores. One run per workspace at a time.",
+          "watch": "Active runs, stuck documents and failures (Processing)."
+        },
+        "drainer": {
+          "label": "Email re-sync drainers",
+          "sub": "deferred bundles in batches",
+          "role": "Apply deferred email bundles in batches, with backoff while the workspace is busy.",
+          "watch": "Per-workspace attempts and last result (Processing › Email queue); live drainers per worker (Workers)."
+        },
+        "insights": {
+          "label": "Insights recorder",
+          "sub": "one row per LLM call",
+          "role": "Writes one usage row per LLM call for Token Insights and the LLM health numbers here.",
+          "watch": "Buffer, last flush, lost rows and dropped events from each worker's heartbeat."
+        },
+        "collectors": {
+          "label": "Ops collectors",
+          "sub": "heartbeat every 15 s",
+          "sub2": "leased: probes · attention",
+          "role": "Every process writes its own heartbeat. One leased copy per host runs the probes (30 s) and the attention check.",
+          "watch": "Switch to the Monitoring layer to see what they write and what they probe."
+        },
+        "queue": {
+          "label": "Queue directory",
+          "sub": "deferred email bundles",
+          "role": "One file per deferred email bundle under the working directory.",
+          "watch": "Counted without opening files, so email contents never reach the console."
+        },
+        "postgres": {
+          "label": "PostgreSQL",
+          "sub": "KV · doc status · OPS_*",
+          "role": "KV storage, document status, Insights usage tables and the operations tables.",
+          "watch": "SELECT 1 latency on a dedicated connection; connections against the limit and blocked queries every 5 minutes."
+        },
+        "graph": {
+          "label": "Graph store",
+          "sub": "knowledge graph",
+          "role": "Knowledge graph storage.",
+          "watch": "A connectivity check on its own driver every 30 seconds."
+        },
+        "vector": {
+          "label": "Vector store",
+          "sub": "embeddings index",
+          "role": "Vector storage for chunks, entities and relations.",
+          "watch": "A health check on its own client every 30 seconds. Synchronous client calls also show up as event-loop lag on the workers."
+        },
+        "etcd": {
+          "label": "etcd",
+          "sub": "not probed",
+          "role": "Milvus metadata store.",
+          "watch": "Not probed directly. A Milvus health failure is the signal."
+        },
+        "minio": {
+          "label": "MinIO",
+          "sub": "not probed",
+          "role": "Milvus segment storage.",
+          "watch": "Not probed directly. A Milvus health failure is the signal."
+        },
+        "vembed": {
+          "label": "Embeddings",
+          "sub": "embedding endpoint",
+          "role": "Embeds chunks, entities and queries.",
+          "watch": "/health, plus running, waiting and KV cache from /metrics when it is readable. Waiting includes callers outside LightRAG."
+        },
+        "vrerank": {
+          "label": "Reranker",
+          "sub": "rerank endpoint",
+          "role": "Reranks retrieved chunks for queries.",
+          "watch": "/health, plus running, waiting and KV cache from /metrics when it is readable. Waiting includes callers outside LightRAG."
+        },
+        "docling": {
+          "label": "Docling",
+          "sub": "document parsing",
+          "role": "Parses PDF, Office and other rich documents.",
+          "watch": "/health every 30 seconds."
+        },
+        "redis": {
+          "label": "Redis",
+          "sub": "key-value store",
+          "role": "Key-value storage, when configured.",
+          "watch": "PING every 30 seconds."
+        }
+      }
+    },
+    "worker": {
+      "title": "Workers",
+      "sub": "From heartbeats · refreshed {{time}}",
+      "liveOf": "{{live}} of {{expected}} live",
+      "liveSingle": "{{live}} live",
+      "server": "Server pid {{pid}}",
+      "pid": "pid {{pid}}",
+      "self": "(answered this request)",
+      "none": "No heartbeats yet. Each process writes its first one within 15 seconds of start-up.",
+      "singleNote": "One Uvicorn process. Rows from earlier boots stay visible as superseded for 24 hours, so a restart can be traced.",
+      "heartbeatAge": "heartbeat {{age}} ago",
+      "line": "up {{up}} · {{rss}} · lag {{lag}}",
+      "managerLine": "Manager round trip (slowest worker): {{rtt}}",
+      "open": "Open Workers",
+      "all": "All {{count}} workers",
+      "state": {
+        "alive": "alive",
+        "stale": "no heartbeat",
+        "superseded": "superseded",
+        "exited": "exited"
+      },
+      "col": {
+        "process": "Process",
+        "up": "Up",
+        "heartbeat": "Heartbeat",
+        "cpu": "CPU",
+        "rss": "RSS",
+        "fds": "Files",
+        "instances": "Loaded",
+        "pool": "PG pool (wait)",
+        "loopLag": "Loop lag",
+        "manager": "Manager RTT",
+        "llm": "LLM run/queue",
+        "embed": "Embed",
+        "rerank": "Rerank",
+        "drainers": "Drainers"
+      },
+      "unresponsive": "unresponsive"
+    },
+    "workerDrawer": {
+      "mode": "Mode",
+      "started": "Started",
+      "exited": "Exited",
+      "host": "Host",
+      "threads": "Threads",
+      "queues": "Queues (running / queued)",
+      "queue": "{{running}} / {{queued}}",
+      "recorder": "Insights recorder",
+      "buffer": "Buffer",
+      "lastFlush": "Last good flush",
+      "flushFailures": "Flush failures",
+      "lostRows": "Lost rows",
+      "droppedEvents": "Dropped events",
+      "recorderOff": "The recorder is not running in this process (Token Insights off, or not reported).",
+      "logSink": "Ops log sink: buffer {{buffer}} · dropped {{dropped}} · rate-limited {{limited}}",
+      "drainers": "Email drainers",
+      "noDrainers": "No drainer is running in this process.",
+      "backoff": "backing off until {{time}}",
+      "drainer": {
+        "draining": "draining",
+        "waiting": "waiting",
+        "backoff": "backing off",
+        "idle": "idle"
+      },
+      "leases": "Leases held",
+      "noLeases": "None",
+      "history": "Last {{hours}} hours",
+      "noHistory": "No samples yet. One is written every minute.",
+      "stats": "now {{last}} · min {{min}} · max {{max}}",
+      "metric": {
+        "rss": "Memory (RSS)",
+        "cpu": "CPU",
+        "loop_lag": "Event-loop lag",
+        "pool_wait": "PG pool wait"
+      },
+      "config": "Configuration and queues",
+      "configPartial": "The configuration answer is incomplete, so the status card cannot be shown.",
+      "configNote": "Configuration is the same for every worker; queues are this worker's. URLs carry no credentials and secrets are redacted on the server.",
+      "gone": "This worker is no longer reported. Rows are kept for 24 hours after the last heartbeat.",
+      "privacy": "Command line and environment are never shown."
+    },
+    "host": {
+      "title": "Host and container",
+      "sub": "Container numbers come from cgroup v2; the load average is host-wide.",
+      "memory": "Container memory",
+      "memOf": "{{used}} of {{limit}} ({{pct}}%)",
+      "memNoLimit": "{{used}} (no limit set)",
+      "cpu": "Container CPU",
+      "load": "Host load (1 / 5 / 15 min)",
+      "disk": "Disk {{path}}",
+      "diskOf": "{{used}} of {{total}} ({{pct}}%)",
+      "gpu": "GPU",
+      "gpuNote": "From vLLM metrics only (see the embedding and rerank cards)",
+      "sampled": "Sampled {{time}}",
+      "workers_one": "{{count}} current worker on this host",
+      "workers_other": "{{count}} current workers on this host",
+      "none": "No host numbers yet. They arrive with the next heartbeat.",
+      "pg": {
+        "title": "PostgreSQL",
+        "none": "No Postgres numbers yet. They are read every 5 minutes.",
+        "size": "Database size",
+        "connections": "Connections",
+        "connOf": "{{used}} of {{max}} max_connections ({{pct}}%)",
+        "blocked": "Blocked backends",
+        "blockedFor_one": "{{count}} blocked, longest {{seconds}} s",
+        "blockedFor_other": "{{count}} blocked, longest {{seconds}} s",
+        "noneBlocked": "none",
+        "activity": "Last {{minutes}} min",
+        "delta": "{{commits}} commits · {{rollbacks}} rollbacks · {{deadlocks}} deadlocks · {{temp}} temp files",
+        "cacheHit": "cache hit {{pct}}%",
+        "sampled": "Postgres numbers read {{time}}"
+      }
+    },
+    "config": {
+      "title": "Configuration",
+      "sub": "Read {{time}} · read-only",
+      "versions": "Core {{core}} · API {{api}}",
+      "empty": "The server sent no configuration.",
+      "note": "URLs carry no credentials and secrets are redacted on the server. Changes need a restart.",
+      "group": {
+        "llm": "LLM",
+        "embedding": "Embedding",
+        "rerank": "Rerank",
+        "storage": "Storage",
+        "pipeline": "Ingestion",
+        "query": "Query",
+        "other": "Other"
+      }
+    },
+    "depDrawer": {
+      "checked": "Checked",
+      "errorClass": "Error class",
+      "recheck": "Re-check now",
+      "notFound": "This dependency is not reported by the server.",
+      "latency": "Latency, last {{hours}} hours",
+      "chartLabel": "Probe latency over the last {{hours}} hours",
+      "noSeries": "No probe history yet.",
+      "series": {
+        "latency": "Latency",
+        "down": "Down"
+      },
+      "errorClasses": "Error classes",
+      "detail": "Detail",
+      "recent_one": "Last result",
+      "recent_other": "Last {{count}} results",
+      "noRecent": "No results yet.",
+      "yes": "yes",
+      "no": "no",
+      "key": {
+        "host": "Host",
+        "version": "Version",
+        "connections": "Connections",
+        "max_connections": "Max connections",
+        "blocked": "Blocked sessions",
+        "db_size_bytes": "Database size (bytes)",
+        "metrics_available": "Metrics readable",
+        "running": "Running requests",
+        "waiting": "Waiting requests",
+        "kv_cache": "KV cache use",
+        "starttls": "STARTTLS",
+        "cert_days_left": "Certificate days left",
+        "self_signed": "Self-signed",
+        "http_status": "HTTP status",
+        "backend": "Backend",
+        "timeout_ms": "Timeout"
+      },
+      "pivot": {
+        "deps": "Embed and rerank performance",
+        "llm": "LLM performance"
+      },
+      "blocking": {
+        "title": "Blocked and blocking sessions",
+        "pid": "pid",
+        "blockedBy": "Blocked by",
+        "duration": "Waiting",
+        "statement": "Statement",
+        "fingerprint": "Fingerprint",
+        "length": "Length",
+        "none": "No blocked sessions at the last check.",
+        "note": "Statement type, a query fingerprint and its length only; query text and parameters are never shown."
+      },
+      "note": {
+        "vllm": "Waiting counts every caller of this endpoint, including any that reach it directly through the proxy. Compare it with LightRAG's own call rate before blaming LightRAG load.",
+        "milvus": "Milvus depends on etcd and MinIO; check those containers too. Its client calls are synchronous, so while it hangs the workers' event-loop lag rises.",
+        "vector": "Vector store calls can block the event loop while the store is slow; check the workers' loop lag too.",
+        "llm": "Passive check: no paid test call is made. Health comes from real calls in the usage table: error rate, latency and provider rejections.",
+        "smtp": "The probe and the test connect, say EHLO, STARTTLS and NOOP, then quit. No mail is ever sent.",
+        "postgres": "Probed on a dedicated connection, so a busy pool does not hide the database's own latency."
+      },
+      "target": "Target",
+      "targets": "Certificates",
+      "targetRow": "{{target}}: {{days}} days left",
+      "targetSelfSigned": "self-signed",
+      "targetUntrusted": "not trusted",
+      "targetError": "{{target}}: {{error}}",
+      "paths": "Disks",
+      "pathRow": "{{path}}: {{free}}% free ({{used}} of {{total}})"
     }
   }
 }
