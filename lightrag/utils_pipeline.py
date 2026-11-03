@@ -29,6 +29,7 @@ from lightrag.utils import (
     compute_mdhash_id,
     logger,
     move_file_to_parsed_dir,
+    sanitize_text_for_encoding,
 )
 
 
@@ -289,6 +290,16 @@ def compute_text_content_hash(content: str) -> str:
     filename-derived item ids and asset paths.
     """
     return compute_mdhash_id(normalize_merged_text_for_hash(content), prefix="")
+
+
+def raw_document_content_hash(text: str) -> str:
+    """The ``content_hash`` stored for ``text`` enqueued as a raw document.
+
+    Mirrors the raw branch of ``apipeline_enqueue_documents``, which sanitizes
+    the text before hashing it, so a caller can tell whether a stored document
+    already holds exactly this text without enqueueing it again.
+    """
+    return compute_text_content_hash(sanitize_text_for_encoding(text))
 
 
 def compute_file_content_hash(path_str: str) -> str | None:

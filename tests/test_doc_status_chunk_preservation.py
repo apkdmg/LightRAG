@@ -12,6 +12,7 @@ from lightrag.base import DocStatus
 from lightrag.constants import GRAPH_FIELD_SEP
 from lightrag.kg.shared_storage import get_namespace_data, get_namespace_lock
 from lightrag.lightrag import LightRAG
+from lightrag.usage import current_usage_scope
 from lightrag.utils import (
     EmbeddingFunc,
     Tokenizer,
@@ -513,6 +514,50 @@ async def test_delete_rebuild_failure_prunes_chunk_tracking_before_abort(
             await rag.chunk_entity_relation_graph.get_edge(entity_a, entity_b)
             is not None
         )
+    finally:
+        await rag.finalize_storages()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["delete", "purge"])
+async def test_rebuild_llm_calls_are_billed_to_the_document(
+    tmp_path, monkeypatch, path
+):
+    rag = await _build_rag(tmp_path, f"rebuild_usage_{path}", _deterministic_chunking)
+    try:
+        doc_id = "doc-rebuild-usage"
+        await _seed_delete_retry_state(
+            rag,
+            doc_id=doc_id,
+            status_chunk_ids=["chunk-drop"],
+            tracking_chunk_ids=["chunk-keep", "chunk-drop"],
+            chunk_owners={"chunk-keep": "doc-keep", "chunk-drop": doc_id},
+        )
+        scopes = []
+
+        async def recording_rebuild(**kwargs):
+            scopes.append(current_usage_scope())
+            return await _succeed_rebuild_from_remaining_chunks(**kwargs)
+
+        monkeypatch.setattr(
+            lightrag_module, "rebuild_knowledge_from_chunks", recording_rebuild
+        )
+        if path == "delete":
+            assert (await rag.adelete_by_doc_id(doc_id)).status == "success"
+        else:
+            await rag._purge_doc_chunks_and_kg(
+                doc_id,
+                {"chunk-drop"},
+                pipeline_status=await get_namespace_data(
+                    "pipeline_status", workspace=rag.workspace
+                ),
+                pipeline_status_lock=get_namespace_lock(
+                    "pipeline_status", workspace=rag.workspace
+                ),
+            )
+
+        [scope] = scopes
+        assert scope.operation == "rebuild" and scope.doc_id == doc_id
     finally:
         await rag.finalize_storages()
 
@@ -1338,13 +1383,13 @@ async def test_delete_doc_entries_guard_prevents_zombie_record(tmp_path, monkeyp
         # _update_delete_retry_state (which would upsert the record with
         # deletion_failed=True) when deletion_stage is "delete_doc_entries".
         status_record = await rag.doc_status.get_by_id(doc_id)
-        assert (
-            status_record is not None
-        ), "doc_status should still exist (delete failed)"
+        assert status_record is not None, (
+            "doc_status should still exist (delete failed)"
+        )
         metadata = status_record.get("metadata", {})
-        assert not metadata.get(
-            "deletion_failed"
-        ), "guard failed: zombie record written with deletion_failed=True"
+        assert not metadata.get("deletion_failed"), (
+            "guard failed: zombie record written with deletion_failed=True"
+        )
     finally:
         await rag.finalize_storages()
 
@@ -1593,9 +1638,9 @@ async def test_deletion_fully_completed_prevents_success_override_in_finally(
 
             result = await rag.adelete_by_doc_id(doc_id)
 
-            assert (
-                result.status == "success"
-            ), f"[{scenario}] expected success but got {result.status}: {result.message}"
+            assert result.status == "success", (
+                f"[{scenario}] expected success but got {result.status}: {result.message}"
+            )
         finally:
             monkeypatch.undo()
             await rag.finalize_storages()

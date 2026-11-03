@@ -6,6 +6,7 @@ with dummy LLM/embedding and file-based storages.
 
 import asyncio
 import importlib
+import json
 import os
 import stat
 import sys
@@ -232,6 +233,97 @@ def test_unsafe_workspace_name_rejected(tmp_path):
     queue = DeferredResyncQueue(str(tmp_path), lambda _ws: None)
     with pytest.raises(ValueError):
         queue.has_pending("../escape", "bundle")
+
+
+async def test_identical_post_while_queued_adds_nothing(tmp_path):
+    rag = await _build_rag(tmp_path)
+    queue = _queue(tmp_path, rag)
+    svc = EmailIngestionService(rag, resync_queue=queue)
+    try:
+        await svc.ingest_email(_email("a.txt"), track_id="v1")
+        await _set_busy(rag, True)
+        await svc.ingest_email(_email("b.txt"), track_id="v2")
+        await queue.stop()  # keep v2 queued
+        (queued,) = list(
+            (tmp_path / "rag" / ".email_resync_queue" / rag.workspace).glob("*.json")
+        )
+        before = queued.read_text()
+
+        queue2 = _queue(tmp_path, rag)
+        again = await EmailIngestionService(rag, resync_queue=queue2).ingest_email(
+            _email("b.txt"), track_id="v2-again"
+        )
+
+        assert again["unchanged"] is True and again["deferred"] is False
+        assert queued.read_text() == before  # the queued v2 still applies as is
+        await queue2.stop()
+    finally:
+        await rag.finalize_storages()
+
+
+async def test_queued_version_already_stored_deletes_nothing(tmp_path, monkeypatch):
+    rag = await _build_rag(tmp_path)
+    queue = _queue(tmp_path, rag)
+    svc = EmailIngestionService(rag, resync_queue=queue)
+    try:
+        await svc.ingest_email(_email("a.txt"), track_id="v1")
+        stored = await rag.doc_status.get_docs_by_statuses(list(DocStatus))
+        components = [
+            ((await rag.full_docs.get_by_id(doc_id))["content"], str(st.file_path))
+            for doc_id, st in stored.items()
+        ]
+        deletes = []
+        original = rag.adelete_by_doc_id
+
+        async def counting_delete(doc_id, **kwargs):
+            deletes.append(doc_id)
+            return await original(doc_id, **kwargs)
+
+        monkeypatch.setattr(rag, "adelete_by_doc_id", counting_delete)
+
+        # Queued while busy, then found identical to what is stored by now.
+        await queue.defer(
+            rag.workspace, components[0][1].split("__")[0], "v2", components
+        )
+        await _wait_drained(queue, rag.workspace)
+
+        assert deletes == []
+        assert {t for t, _ in (await _bundle_docs(rag)).values()} == {"v1"}
+        assert queue.pending_count(rag.workspace) == 0
+    finally:
+        await queue.stop()
+        await rag.finalize_storages()
+
+
+async def test_version_1_record_still_applies(tmp_path):
+    rag = await _build_rag(tmp_path)
+    queue = _queue(tmp_path, rag)
+    svc = EmailIngestionService(rag, resync_queue=queue)
+    try:
+        first = await svc.ingest_email(_email("a.txt"), track_id="v1")
+        await _set_busy(rag, True)
+        await svc.ingest_email(_email("b.txt"), track_id="v2")
+        await queue.stop()
+        directory = tmp_path / "rag" / ".email_resync_queue" / rag.workspace
+        (queued,) = list(directory.glob("*.json"))
+        # Rewrite it the way the previous release stored records.
+        record = json.loads(queued.read_text())
+        del record["keep_paths"]
+        record["version"] = 1
+        queued.write_text(json.dumps(record))
+
+        await _set_busy(rag, False)
+        restarted = _queue(tmp_path, rag)
+        await restarted.start()
+        await _wait_drained(restarted, rag.workspace)
+
+        docs = await _bundle_docs(rag)
+        bundle = first["bundle_id"]
+        assert {t for t, _ in docs.values()} == {"v2"}
+        assert any(path.startswith(f"{bundle}__attachment_000_b") for path in docs)
+        await restarted.stop()
+    finally:
+        await rag.finalize_storages()
 
 
 async def test_new_email_refused_during_delete_is_queued(tmp_path):

@@ -1,10 +1,11 @@
 """Durable queue for email re-syncs that arrive while the pipeline is busy.
 
-Re-syncing an email that is already stored first deletes its previous
-documents, which needs the workspace's exclusive (destructive) pipeline slot.
-While documents are being processed that slot is unavailable. The endpoint has
+Re-syncing an email whose stored documents changed first deletes the changed
+ones, which needs the workspace's exclusive (destructive) pipeline slot. While
+documents are being processed that slot is unavailable. The endpoint has
 already answered "accepted", so instead of dropping the update the prepared
-documents are written here and applied as soon as the pipeline is free.
+documents are written here and applied as soon as the pipeline is free. Each
+queued version is compared with what is stored when it is applied.
 
 Layout: ``<working_dir>/.email_resync_queue/<workspace>/<sha256(bundle)>.json``,
 files ``0600`` in ``0700`` directories (the same trust boundary as the
@@ -31,7 +32,9 @@ from lightrag.utils import logger
 _SUBDIR = ".email_resync_queue"
 _DEFAULT_WORKSPACE_DIR = "_default"
 _SAFE_WORKSPACE = re.compile(r"[A-Za-z0-9_.\-]{1,128}")
-_RECORD_VERSION = 1
+_RECORD_VERSION = 2
+# Version 2 added ``keep_paths``; version 1 records still apply after an upgrade.
+_READABLE_VERSIONS = (1, 2)
 
 GetRag = Callable[[str], Awaitable[Any]]
 
@@ -78,12 +81,30 @@ class DeferredResyncQueue:
         directory = self._dir(workspace)
         return len(list(directory.glob("*.json"))) if directory.exists() else 0
 
+    async def pending_matches(
+        self,
+        workspace: str,
+        prefix_base: str,
+        components: list[tuple[str, str]],
+        keep_paths: list[str],
+    ) -> bool:
+        """True when the queued re-sync of this bundle is this exact version."""
+        record = await asyncio.to_thread(
+            _load_record, self._path(workspace, prefix_base)
+        )
+        return (
+            record is not None
+            and record["components"] == [[content, fp] for content, fp in components]
+            and sorted(record["keep_paths"]) == sorted(keep_paths)
+        )
+
     async def defer(
         self,
         workspace: str,
         prefix_base: str,
         track_id: str,
         components: list[tuple[str, str]],
+        keep_paths: Optional[list[str]] = None,
     ) -> None:
         record = {
             "version": _RECORD_VERSION,
@@ -92,6 +113,7 @@ class DeferredResyncQueue:
             "prefix_base": prefix_base,
             "track_id": track_id,
             "components": [[content, fp] for content, fp in components],
+            "keep_paths": list(keep_paths or []),
             "queued_at": time.time(),
         }
         path = self._path(workspace, prefix_base)
@@ -162,9 +184,11 @@ class DeferredResyncQueue:
             backoff = min(backoff * 2, self._max_backoff)
 
     async def _apply_batch(self, rag: Any, workspace: str, paths: list[Path]) -> bool:
-        """Delete the old documents of each queued bundle, then enqueue the new.
+        """Sync each queued bundle: delete what changed, then enqueue the new.
 
-        Returns False when the destructive slot is unavailable (retry later).
+        Each record is planned against what is stored now, so a queued version
+        identical to the stored one deletes and enqueues nothing. Returns False
+        when the destructive slot is unavailable (retry later).
         """
         # Lazy imports: email_routes imports this module.
         from lightrag.api.routers.document_routes import (
@@ -172,9 +196,10 @@ class DeferredResyncQueue:
             _release_destructive_busy,
         )
         from lightrag.api.routers.email_routes import (
-            _bundle_doc_ids,
             _get_bundle_lock,
             _mark_deletion_job,
+            _stored_bundle_state,
+            plan_bundle_sync,
         )
         from lightrag.base import DocStatus
         from lightrag.parser_routing import resolve_chunk_options
@@ -183,24 +208,30 @@ class DeferredResyncQueue:
         if not acquired:
             return False
 
-        loaded: list[tuple[Path, dict]] = []
+        loaded: list[tuple[Path, dict, Any]] = []
         try:
             all_docs = await rag.doc_status.get_docs_by_statuses(list(DocStatus))
             records = [(p, r) for p in paths if (r := _load_record(p)) is not None]
-            stale = {
-                path: _bundle_doc_ids(all_docs, f"{record['prefix_base']}__")
-                for path, record in records
-            }
-            await _mark_deletion_job(
-                rag,
-                f"queue ({len(records)} re-synced emails)",
-                sum(len(ids) for ids in stale.values()),
-            )
+            plans = {}
+            for path, record in records:
+                stored = await _stored_bundle_state(
+                    rag, all_docs, f"{record['prefix_base']}__"
+                )
+                plans[path] = plan_bundle_sync(
+                    stored,
+                    [(content, fp) for content, fp in record["components"]],
+                    record["keep_paths"],
+                )
+            deletes = sum(len(plan.delete_ids) for plan in plans.values())
+            if deletes:
+                await _mark_deletion_job(
+                    rag, f"queue ({len(records)} re-synced emails)", deletes
+                )
             for path, record in records:
                 prefix_base = record["prefix_base"]
                 lock = await _get_bundle_lock(f"{rag.workspace}:{prefix_base}")
                 async with lock:
-                    for did in stale[path]:
+                    for did in plans[path].delete_ids:
                         res = await rag.adelete_by_doc_id(did, delete_llm_cache=False)
                         status = getattr(res, "status", None)
                         if status not in ("success", "not_found"):
@@ -208,29 +239,32 @@ class DeferredResyncQueue:
                                 f"[{prefix_base}] delete {did}: {status} "
                                 f"{getattr(res, 'message', '')}"
                             )
-                loaded.append((path, record))
+                loaded.append((path, record, plans[path]))
         finally:
             await _release_destructive_busy(rag)
 
         chunk_opts = resolve_chunk_options(rag.addon_params)
-        for path, record in loaded:
+        for path, record, plan in loaded:
             prefix_base = record["prefix_base"]
             lock = await _get_bundle_lock(f"{rag.workspace}:{prefix_base}")
             async with lock:
-                components = record["components"]
-                await rag.apipeline_enqueue_documents(
-                    [content for content, _ in components],
-                    file_paths=[fp for _, fp in components],
-                    track_id=record["track_id"],
-                    chunk_options=chunk_opts,
-                )
+                if plan.insert:
+                    await rag.apipeline_enqueue_documents(
+                        [content for content, _ in plan.insert],
+                        file_paths=[fp for _, fp in plan.insert],
+                        track_id=record["track_id"],
+                        chunk_options=chunk_opts,
+                    )
                 # A newer re-sync may have replaced the file meanwhile; keep it.
                 current = _load_record(path)
                 if current is not None and current.get("id") == record["id"]:
                     path.unlink(missing_ok=True)
-            logger.info(f"[{prefix_base}] Queued email re-sync applied")
+            if plan.unchanged:
+                logger.info(f"[{prefix_base}] Queued email re-sync unchanged")
+            else:
+                logger.info(f"[{prefix_base}] Queued email re-sync applied")
 
-        if loaded:
+        if any(plan.insert for _, _, plan in loaded):
             task = asyncio.create_task(rag.apipeline_process_enqueue_documents())
             self._background.add(task)
             task.add_done_callback(self._background.discard)
@@ -273,13 +307,16 @@ def _load_record(path: Path) -> Optional[dict]:
         path.rename(path.with_suffix(".bad"))
         return None
     if (
-        record.get("version") != _RECORD_VERSION
+        record.get("version") not in _READABLE_VERSIONS
         or not isinstance(record.get("components"), list)
+        or not isinstance(record.get("keep_paths", []), list)
         or not record.get("prefix_base")
     ):
         logger.error(f"Malformed queued email re-sync {path.name}; set aside")
         path.rename(path.with_suffix(".bad"))
         return None
+    # Version 1 records predate keep_paths: nothing failed that must be kept.
+    record.setdefault("keep_paths", [])
     return record
 
 
