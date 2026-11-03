@@ -381,3 +381,50 @@ async def test_new_email_refused_during_delete_is_queued(tmp_path):
     finally:
         await queue.stop()
         await rag.finalize_storages()
+
+
+async def test_queued_resync_reports_each_delete_as_progress(tmp_path, monkeypatch):
+    """An email batch run reports every deletion, so a long delete batch is
+    never shown as hung by the Operations console."""
+    from lightrag.api.ops import runs
+    from lightrag.api.ops.store import MemoryOpsStore
+
+    store = MemoryOpsStore()
+    tracker = runs.RunTracker(
+        store, "0123456789abcdef0123456789abcdef", interval_s=3600
+    )
+    runs.install(tracker)
+    calls: list[tuple] = []
+    real = runs.progress
+
+    def spy(run_id, **kwargs):
+        calls.append((run_id, kwargs))
+        return real(run_id, **kwargs)
+
+    monkeypatch.setattr(runs, "progress", spy)
+    rag = await _build_rag(tmp_path)
+    queue = _queue(tmp_path, rag)
+    svc = EmailIngestionService(rag, resync_queue=queue)
+    try:
+        await svc.ingest_email(_email("a.txt", "b.txt"), track_id="v1")
+        await _set_busy(rag, True)
+        queued = await svc.ingest_email(_email(), track_id="v2")
+        assert queued["deferred"] is True
+        await _set_busy(rag, False)
+        await _wait_drained(queue, rag.workspace)
+        await tracker.flush_once()
+        [batch] = [r for r in store.run_rows.values() if r["kind"] == "email_batch"]
+        deletes = [
+            kwargs
+            for run_id, kwargs in calls
+            if run_id == batch["run_id"] and kwargs.get("stage") == "delete"
+        ]
+        done = [d["done"] for d in deletes if "done" in d]
+        # One progress per deleted document (the attachments and the
+        # changed master), against the total announced up front.
+        assert done == [1] * batch["docs_total"] and len(done) >= 2
+        assert batch["status"] == "succeeded"
+    finally:
+        runs.install(None)
+        await queue.stop()
+        await rag.finalize_storages()

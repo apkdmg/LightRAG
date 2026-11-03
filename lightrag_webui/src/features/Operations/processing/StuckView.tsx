@@ -4,19 +4,21 @@ import { opsApi } from '../api'
 import { Pager, Panel } from '../components/Panel'
 import StuckTable from '../components/StuckTable'
 import { useOpsShell } from '../context'
-import { fmtAge, fmtClock } from '../format'
+import { fmtAge, fmtClock, fmtCount } from '../format'
 import { useOpsPoll } from '../poll'
 import { isMultiWorker } from '../severity'
-import { stuckRows } from './stuck'
+import { STUCK_CLASSES, checkedClasses, stuckRows } from './stuck'
 
-/** §3.6: stuck docs are served from a 15 s cache. */
+/** §3.6: stuck docs are served from a 15 s cache; the run classes come from the 60 s reconcile pass. */
 const STUCK_SECONDS = 15
 
 /**
- * What is stuck (§2.4, US-3). In this release the server detects stale
- * documents (in parsing, analyzing or processing longer than the threshold);
- * hung, orphaned and busy-without-run checks arrive with run tracking, and
- * the view says so instead of implying they were checked.
+ * What is stuck (§2.4, US-3): orphaned runs (Gunicorn only, once the OS has
+ * confirmed the owner is gone), runs that are alive but hung, workspaces busy
+ * without a live run, reservations without an owner (Gunicorn only, with
+ * restart guidance) and stale documents. The view says which classes the
+ * server actually checked, so a class that was not checked never reads as
+ * "nothing stuck".
  */
 export default function StuckView() {
   const { t } = useTranslation()
@@ -40,17 +42,31 @@ export default function StuckView() {
       {(data) => {
         const rows = stuckRows(data, multiWorker)
         const docs = data.stale_docs ?? { items: [], total: 0 }
+        const checked = checkedClasses(data, multiWorker)
+        const possible = STUCK_CLASSES.filter((c) => multiWorker || (c !== 'orphaned' && c !== 'reservations'))
+        const unchecked = possible.filter((c) => !checked.includes(c))
+        const list = checked.map((c) => t(`operations.stuck.class.${c}`)).join(', ')
+        const time = fmtClock(data.checked?.at ?? poll.updatedAt)
         return (
           <div className="flex flex-col gap-3">
             {rows.length ? (
               <StuckTable rows={rows} />
             ) : (
-              <p className="text-muted-foreground m-0 text-sm">{t('operations.stuck.none', { time: fmtClock(poll.updatedAt) })}</p>
+              <p className="text-muted-foreground m-0 text-sm">
+                {typeof data.checked?.workspaces === 'number' && typeof data.checked?.runs === 'number'
+                  ? t('operations.stuck.noneCounted', { workspaces: fmtCount(data.checked.workspaces), runs: fmtCount(data.checked.runs), list, time })
+                  : t('operations.stuck.noneClasses', { list, time })}
+              </p>
             )}
             <Pager page={docs.page ?? page} pageSize={docs.page_size ?? Math.max(docs.items.length, 50)} total={docs.total} onPage={setPage} />
-            {!status?.features?.runs || (data.checked_classes && !data.checked_classes.includes('hung')) ? (
-              <p className="text-muted-foreground m-0 text-xs">{t('operations.stuck.runsLater')}</p>
+            {unchecked.length ? (
+              <p className="text-muted-foreground m-0 text-xs">
+                {status?.features?.runs === false
+                  ? t('operations.stuck.trackingOff')
+                  : t('operations.stuck.notChecked', { list: unchecked.map((c) => t(`operations.stuck.class.${c}`)).join(', ') })}
+              </p>
             ) : null}
+            {!multiWorker ? <p className="text-muted-foreground m-0 text-xs">{t('operations.stuck.singleProcess')}</p> : null}
           </div>
         )
       }}

@@ -3,9 +3,8 @@ import { CircleDashedIcon } from 'lucide-react'
 import { DrawerKind } from '../hashState'
 
 /**
- * A drawer link for an entity whose drawer ships later (run, log entry,
- * alert). Old links still open the page; they say so
- * instead of failing.
+ * A drawer link for an entity whose drawer ships later (log entry, alert).
+ * Such links still open the page; they say so instead of failing.
  */
 export default function UnsupportedDrawer({ kind }: { kind: DrawerKind }) {
   const { t } = useTranslation()

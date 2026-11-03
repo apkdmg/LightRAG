@@ -11,12 +11,14 @@ logged and the console reports what is unavailable instead.
 
 It also starts this worker's heartbeat (every process) and the dependency
 probes (a leased singleton on Postgres; local to each process without it),
-and, on Postgres, the leased attention snapshot.
+and, on Postgres, run tracking (this worker's buffered run writer) and the
+leased reconcile + attention cycle.
 
 Switches (all default on): ``OPS_ENABLED`` (the whole backend),
 ``OPS_INDEX_BUILD`` (the background index builder), ``OPS_QUEUE_SCAN``
-(the email re-sync queue scan) and ``OPS_PROBES_ENABLED`` (dependency
-probes).
+(the email re-sync queue scan), ``OPS_PROBES_ENABLED`` (dependency
+probes) and ``OPS_RUN_TRACKING`` (run and failure tracking; off makes
+every pipeline hook a no-op).
 """
 
 from __future__ import annotations
@@ -64,6 +66,7 @@ class OpsRuntime:
     index_outcome: Optional[dict[str, str]] = None
     heartbeat: Optional[Heartbeat] = None
     probes: Any = None
+    run_tracker: Any = None
 
     def leases_held(self) -> list[str]:
         return [
@@ -93,6 +96,17 @@ class OpsRuntime:
             )
 
     async def _forget(self, workspace: str) -> None:
+        tracker = self.run_tracker
+        if tracker is not None:
+            # Rows buffered for the workspace are dropped before its stored
+            # ops data is removed, so no flush writes them back afterwards.
+            try:
+                await tracker.forget_flushed(workspace)
+            except Exception as e:
+                logger.warning(
+                    "Dropping a deleted workspace's buffered ops rows failed (%s)",
+                    type(e).__name__,
+                )
         for attempt, delay in enumerate((0.0, *_FORGET_RETRY_DELAYS_S), start=1):
             if delay:
                 await asyncio.sleep(delay)
@@ -199,6 +213,34 @@ def _start_probes(app: Any, args: Any, runtime: OpsRuntime) -> None:
     )
 
 
+def _start_run_tracking(app: Any, runtime: OpsRuntime) -> None:
+    """Install this worker's run tracker (pipeline hooks write through it)."""
+    from lightrag.api.ops import runs
+    from lightrag.api.ops.pauses import _role_slots
+
+    own = runtime.service.own_providers
+
+    async def byo(workspace: str, slot: str) -> bool:
+        if own is None:
+            return False
+        slots = await own.slots([workspace])
+        return slot in slots.get(workspace, frozenset())
+
+    tracker = runs.RunTracker(
+        runtime.store,
+        runtime.worker_id,
+        byo_resolver=byo,
+        role_slots=_role_slots,
+    )
+    tracker.start()
+    runs.install(tracker)
+    runtime.run_tracker = tracker
+    runtime.service.run_tracking = True
+    if runtime.heartbeat is not None:
+        runtime.heartbeat.run_tracker = tracker
+    logger.info("Operations console: run tracking on")
+
+
 def _start_reconcile(app: Any, runtime: OpsRuntime) -> None:
     from lightrag.api.ops import reconcile
 
@@ -297,6 +339,17 @@ async def _start(app: Any, rag: Any, args: Any) -> OpsRuntime:
             )
     if store is None:
         return runtime
+    if env_flag("OPS_RUN_TRACKING"):
+        try:
+            _start_run_tracking(app, runtime)
+        except Exception:
+            logger.error(
+                "Operations console run tracking could not start", exc_info=True
+            )
+    else:
+        logger.info(
+            "Operations console: run tracking disabled by OPS_RUN_TRACKING=false"
+        )
     try:
         _start_reconcile(app, runtime)
     except Exception:
@@ -341,6 +394,15 @@ async def stop_ops(app: Any) -> None:
     if not isinstance(runtime, OpsRuntime):
         return
     remove_event_sink(runtime.on_event)
+    if runtime.run_tracker is not None:
+        from lightrag.api.ops import runs
+
+        if runs.tracker() is runtime.run_tracker:
+            runs.install(None)
+        try:
+            await runtime.run_tracker.stop()
+        except Exception:
+            logger.debug("Ops run tracker did not stop cleanly", exc_info=True)
     if runtime.heartbeat is not None:
         try:
             await runtime.heartbeat.stop()

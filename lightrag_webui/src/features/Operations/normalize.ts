@@ -1,5 +1,9 @@
 import type {
+  ActiveRun,
+  ActiveRuns,
   AttentionItem,
+  DocFailure,
+  DocFailureState,
   DocRow,
   DocStage,
   DocumentDetail,
@@ -9,12 +13,16 @@ import type {
   Feed,
   OpsEvent,
   OpsOverview,
+  OpsRun,
+  OpsRuns,
   OpsWorker,
   OverviewKpis,
   Page,
   PauseItem,
   ProcessingSummary,
+  RunDetail,
   Stuck,
+  StuckRun,
   WorkspaceDetail,
   WorkspaceLive
 } from './api'
@@ -75,6 +83,7 @@ export function normalizeAttention(raw: unknown): AttentionItem[] {
       since: str(a.since),
       count: num(a.count) ?? num(obj(a.params).count),
       workspace: str(a.workspace) ?? str(obj(a.params).workspace),
+      run_id: str(a.run_id) ?? str(obj(a.params).run_id),
       dep: str(a.dep) ?? str(obj(a.params).dep) ?? str(obj(a.params).dependency),
       worker_id: str(a.worker_id) ?? str(obj(a.params).worker_id),
       target: a.target ? obj(a.target) : targetOfLink(a.link)
@@ -188,16 +197,214 @@ export function normalizeSummary(raw: unknown): ProcessingSummary {
   } as ProcessingSummary
 }
 
+// ---------- runs ----------
+
+/** Outcomes a finished run row can have (§3.5 LIGHTRAG_OPS_RUNS.status). */
+export const RUN_OUTCOMES = ['succeeded', 'failed', 'cancelled', 'paused', 'orphaned'] as const
+
+const STATUS_ALIASES: Record<string, string> = {
+  ok: 'succeeded',
+  success: 'succeeded',
+  completed: 'succeeded',
+  done: 'succeeded',
+  error: 'failed',
+  canceled: 'cancelled'
+}
+
+const canonicalStatus = (raw: unknown): string | null => {
+  const s = str(raw)?.toLowerCase() ?? null
+  return s ? (STATUS_ALIASES[s] ?? s) : null
+}
+
+/**
+ * What a run shows as: a finished run shows its outcome; a running one shows
+ * the server's live classification (running, hung, paused, unresponsive,
+ * orphaned), or "running" when the server sent none.
+ */
+export function runDisplayState(status: unknown, state: unknown): string {
+  const st = canonicalStatus(status)
+  const live = canonicalStatus(state)
+  if (st && st !== 'running') return st
+  return live ?? st ?? 'unknown'
+}
+
+const seconds = (from: unknown, to: unknown): number | null => {
+  const a = str(from) ? Date.parse(from as string) : Number.NaN
+  const b = str(to) ? Date.parse(to as string) : Number.NaN
+  return Number.isFinite(a) && Number.isFinite(b) ? Math.max(0, (b - a) / 1000) : null
+}
+
+/** One run row; null when it has no id (nothing to open). A missing workspace takes `workspace`. */
+export function normalizeRun(raw: unknown, workspace?: string): OpsRun | null {
+  const r = obj(raw)
+  const runId = str(r.run_id) ?? str(r.id)
+  const ws = str(r.workspace) ?? workspace ?? null
+  if (!runId || !ws) return null
+  const status = canonicalStatus(r.status) ?? (r.finished_at ? 'unknown' : 'running')
+  return {
+    ...r,
+    run_id: runId,
+    workspace: ws,
+    kind: str(r.kind),
+    trigger: str(r.trigger),
+    status,
+    state: runDisplayState(status, r.state),
+    was_orphaned: !!r.was_orphaned,
+    worker_id: str(r.worker_id),
+    pid: num(r.pid),
+    worker_alive: typeof r.worker_alive === 'boolean' ? r.worker_alive : null,
+    started_at: str(r.started_at),
+    heartbeat_at: str(r.heartbeat_at),
+    progress_at: str(r.progress_at),
+    finished_at: str(r.finished_at),
+    heartbeat_age_s: num(r.heartbeat_age_s),
+    progress_age_s: num(r.progress_age_s),
+    duration_s: first(num(r.duration_s), num(r.duration_ms) === null ? null : (num(r.duration_ms) as number) / 1000, seconds(r.started_at, r.finished_at)),
+    docs_total: num(r.docs_total),
+    docs_done: num(r.docs_done),
+    docs_failed: num(r.docs_failed),
+    stage: str(r.stage),
+    label: str(r.label),
+    error_kind: str(r.error_kind),
+    error_summary: str(r.error_summary),
+    request_id: str(r.request_id),
+    live: r.live ? (obj(r.live) as OpsRun['live']) : null,
+    pause: r.pause ? (obj(r.pause) as OpsRun['pause']) : null
+  }
+}
+
+/** A keyset cursor as the server sent it: a string (or number), or `{ts|started_at}` from an object. */
+const cursorOf = (v: unknown): string | null => {
+  if (typeof v === 'number' && Number.isFinite(v)) return String(v)
+  if (str(v)) return v as string
+  const o = obj(v)
+  return str(o.ts) ?? str(o.started_at) ?? null
+}
+
+export function normalizeRuns(raw: unknown): OpsRuns {
+  const r = obj(raw)
+  const list = Array.isArray(raw) ? raw : arr(r.items ?? r.runs)
+  return {
+    ...r,
+    items: list.map((i) => normalizeRun(i)).filter((i): i is OpsRun => i !== null),
+    next_before: cursorOf(r.next_before)
+  } as OpsRuns
+}
+
+export function normalizeDocFailure(raw: unknown): DocFailure | null {
+  const f = obj(raw)
+  const ts = str(f.ts) ?? str(f.failed_at) ?? str(f.at)
+  if (!ts) return null
+  return {
+    ...f,
+    ts,
+    workspace: str(f.workspace),
+    doc_id: str(f.doc_id),
+    track_id: str(f.track_id),
+    run_id: str(f.run_id),
+    stage: str(f.stage),
+    error_kind: str(f.error_kind),
+    http_status: num(f.http_status),
+    exc_type: str(f.exc_type),
+    message: str(f.message) ?? str(f.message_redacted) ?? str(f.error),
+    attempt: num(f.attempt),
+    model: str(f.model),
+    file_path_masked: str(f.file_path_masked) ?? str(f.file)
+  }
+}
+
+const docFailures = (v: unknown) => arr(v).map(normalizeDocFailure).filter((f): f is DocFailure => f !== null)
+
+/** `metadata.failure`; null when it carries nothing worth showing. */
+export function normalizeFailureState(raw: unknown): DocFailureState | null {
+  const f = obj(raw)
+  if (!Object.keys(f).length) return null
+  const out: DocFailureState = {
+    stage: str(f.stage),
+    error_kind: str(f.error_kind),
+    http_status: num(f.http_status),
+    attempt: num(f.attempt),
+    first_failed_at: str(f.first_failed_at),
+    last_failed_at: str(f.last_failed_at) ?? str(f.failed_at),
+    last_run_id: str(f.last_run_id) ?? str(f.run_id),
+    model: str(f.model)
+  }
+  return out.error_kind || out.stage || out.attempt !== null ? out : null
+}
+
+export function normalizeRunDetail(raw: unknown): RunDetail {
+  const d = obj(raw)
+  // Some servers return the run's fields at the top level.
+  const run = normalizeRun(d.run ?? d)
+  return {
+    ...d,
+    run,
+    failures: docFailures(d.failures),
+    log_count: num(d.log_count)
+  } as RunDetail
+}
+
+/** /processing/active: durable run rows (or interim rows) with one display state each. */
+export function normalizeActive(raw: unknown): ActiveRuns {
+  const a = obj(raw)
+  const runs = arr(a.runs).map((r): ActiveRun => {
+    const row = obj(r)
+    return {
+      ...row,
+      workspace: String(row.workspace ?? ''),
+      run_id: str(row.run_id),
+      status: canonicalStatus(row.status),
+      state: row.status ? runDisplayState(row.status, row.state) : (canonicalStatus(row.state) ?? 'unknown')
+    } as ActiveRun
+  })
+  return { ...a, runs: runs.filter((r) => r.workspace) } as ActiveRuns
+}
+
+/**
+ * One stuck item as the server sends it. Reservations name their flag by
+ * `kind` (scanning | pending_enqueues) and `count` on older servers; the
+ * reason is a code (`reason_code`, `reason` on older servers) that the view
+ * translates, never text to print.
+ */
+const stuckRuns = (v: unknown): StuckRun[] =>
+  arr(v)
+    .map((r) => obj(r))
+    .filter((r) => str(r.workspace))
+    .map((r) => {
+      const kind = str(r.kind)
+      const state = str(r.state)
+      return {
+        ...r,
+        workspace: r.workspace,
+        run_id: str(r.run_id),
+        pid: first(num(r.pid), num(r.owner_pid)),
+        worker_id: str(r.worker_id) ?? str(r.owner_worker_id),
+        age_s: num(r.age_s),
+        reason_code: str(r.reason_code) ?? str(r.reason),
+        since: str(r.since) ?? str(r.started_at),
+        kind,
+        label: str(r.label),
+        state,
+        owner_unresponsive: r.owner_unresponsive === true || state === 'unresponsive',
+        heartbeat_age_s: num(r.heartbeat_age_s),
+        progress_age_s: num(r.progress_age_s),
+        worker_heartbeat_age_s: num(r.worker_heartbeat_age_s),
+        scanning: typeof r.scanning === 'boolean' ? r.scanning : kind === 'scanning' ? true : kind === 'pending_enqueues' ? false : null,
+        pending_enqueues: first(num(r.pending_enqueues), kind === 'pending_enqueues' ? num(r.count) : null),
+        confirmed_by: str(r.confirmed_by)
+      }
+    })
+
 export function normalizeStuck(raw: unknown): Stuck {
   const s = obj(raw)
   const th = obj(s.thresholds)
   const docs = obj(s.stale_docs)
   return {
     ...s,
-    orphaned: arr(s.orphaned),
-    hung: arr(s.hung),
-    busy_without_run: arr(s.busy_without_run),
-    reservations: arr(s.reservations),
+    orphaned: stuckRuns(s.orphaned),
+    hung: stuckRuns(s.hung),
+    busy_without_run: stuckRuns(s.busy_without_run),
+    reservations: stuckRuns(s.reservations),
     stale_docs: {
       ...docs,
       items: arr(docs.items).map((d) => ({ ...d, updated_at: str(d.updated_at) ?? str(d.since), file_path_masked: str(d.file_path_masked) ?? str(d.file) })),
@@ -209,19 +416,27 @@ export function normalizeStuck(raw: unknown): Stuck {
       orphan_s: first(num(th.orphan_s), num(th.orphan_seconds)),
       hung_min: first(num(th.hung_min), num(th.hung_minutes)),
       doc_min: first(num(th.doc_min), num(th.doc_minutes))
-    }
+    },
+    checked_classes: Array.isArray(s.checked_classes) ? s.checked_classes.filter((c: unknown) => typeof c === 'string') : undefined,
+    checked: s.checked ? obj(s.checked) : null
   } as Stuck
 }
 
+/** Durable groups may name their key after the group (`error_kind`, `stage`, `model`, `workspace`). */
+const groupRows = (v: unknown) =>
+  arr(v)
+    .map((g) => obj(g))
+    .map((g) => ({ ...g, key: String(g.key ?? g.error_kind ?? g.stage ?? g.model ?? g.workspace ?? ''), count: num(g.count) ?? 0 }))
+
 export function normalizeFailures(raw: unknown): Failures {
   const f = obj(raw)
-  return { ...f, groups: arr(f.groups), legacy: arr(f.legacy), excluded: obj(f.excluded) } as Failures
+  return { ...f, groups: groupRows(f.groups), legacy: groupRows(f.legacy), excluded: obj(f.excluded) } as Failures
 }
 
 const docFields = <T extends Loose>(d: T) => ({
   ...d,
   file_path_masked: str(d.file_path_masked) ?? str(d.file),
-  error_redacted: str(d.error_redacted) ?? str(d.error)
+  error_redacted: str(d.error_redacted) ?? str(d.error) ?? str(d.message)
 })
 
 export function normalizePage<T>(raw: unknown, mapItem: (item: Loose) => T = (i) => i as T): Page<T> {
@@ -230,8 +445,27 @@ export function normalizePage<T>(raw: unknown, mapItem: (item: Loose) => T = (i)
   return { ...p, items, page: num(p.page) ?? 1, page_size: num(p.page_size) ?? Math.max(items.length, 1), total: num(p.total) ?? items.length } as Page<T>
 }
 
-export const normalizeFailureDocs = (raw: unknown) => normalizePage<FailureDoc>(raw, (d) => docFields(d) as FailureDoc)
+export const normalizeFailureDocs = (raw: unknown) =>
+  normalizePage<FailureDoc>(raw, (d) => ({ ...docFields(d), updated_at: str(d.updated_at) ?? str(d.ts), http_status: num(d.http_status), attempt: num(d.attempt) }) as FailureDoc)
 export const normalizeDocuments = (raw: unknown) => normalizePage<DocRow>(raw, (d) => docFields(d) as DocRow)
+
+/** One workspace's queue state; the backoff deadline (FR-32) may be spelled after the drainer's sleep. */
+const drains = (raw: unknown) => {
+  if (!raw || typeof raw !== 'object') return null
+  const d = obj(raw)
+  return { ok: num(d.ok) ?? 0, failed: first(num(d.failed), num(d.error)) ?? 0, slot_busy: num(d.slot_busy) ?? 0 }
+}
+
+const queueItem = (raw: unknown) => {
+  const i = obj(raw)
+  return {
+    ...i,
+    backoff_until: str(i.backoff_until) ?? str(i.next_attempt_at) ?? str(i.backoff_deadline),
+    last_attempt_at: str(i.last_attempt_at),
+    drains_1h: drains(i.drains_1h),
+    drainer: i.drainer ? obj(i.drainer) : null
+  }
+}
 
 export function normalizeEmailQueue(raw: unknown): EmailQueue {
   const q = obj(raw)
@@ -239,7 +473,7 @@ export function normalizeEmailQueue(raw: unknown): EmailQueue {
     ...q,
     total: num(q.total) ?? 0,
     workspaces: num(q.workspaces) ?? 0,
-    items: arr(q.items),
+    items: arr(q.items).map(queueItem),
     // The pager counts workspaces with records; the routes call it total_items.
     total_items: first(num(q.total_items), num(q.workspaces)) ?? 0
   } as EmailQueue
@@ -269,6 +503,9 @@ export function normalizeWorkspace(raw: unknown): WorkspaceDetail {
     const rejection = l.provider_rejection ? obj(l.provider_rejection) : null
     live = {
       ...l,
+      run_id: str(l.run_id),
+      owner_worker_id: str(l.owner_worker_id),
+      owner_pid: num(l.owner_pid),
       job_name: str(l.job_name) ?? str(l.job),
       latest_message: str(l.latest_message) ?? str(l.latest_message_redacted),
       paused: typeof l.paused === 'boolean' ? l.paused : !!rejection && rejection.active !== false,
@@ -286,10 +523,15 @@ export function normalizeWorkspace(raw: unknown): WorkspaceDetail {
     live,
     live_status: str(w.live_status) ?? (w.manager === 'unresponsive' ? 'unresponsive' : w.idle ? 'idle' : 'ok'),
     counts,
-    email_queue: w.email_queue ? obj(w.email_queue) : null,
+    email_queue: w.email_queue ? queueItem(w.email_queue) : null,
     pause: Array.isArray(w.pause) ? w.pause : fromLive ? [fromLive] : [],
-    recent_runs: arr(w.recent_runs),
+    recent_runs: arr(w.recent_runs)
+      .map((r) => normalizeRun(r, workspace))
+      .filter((r): r is OpsRun => r !== null),
     failures_by_kind: arr(w.failures_by_kind)
+      .map((f) => obj(f))
+      .map((f) => ({ key: String(f.key ?? f.error_kind ?? 'unknown'), count: num(f.count) ?? 0, http_status: num(f.http_status) }))
+      .filter((f) => f.count > 0)
   } as WorkspaceDetail
 }
 
@@ -317,8 +559,13 @@ export function normalizeDocument(raw: unknown): DocumentDetail {
   const doc = obj(d.doc)
   return {
     ...d,
-    doc: { ...docFields(doc), status: String(doc.status ?? 'unknown'), stages: arr(doc.stages).map(normalizeStage) },
-    failures: arr(d.failures),
+    doc: {
+      ...docFields(doc),
+      status: String(doc.status ?? 'unknown'),
+      stages: arr(doc.stages).map(normalizeStage),
+      failure: normalizeFailureState(doc.failure)
+    },
+    failures: docFailures(d.failures),
     calls: arr(d.calls),
     calls_available: typeof d.calls_available === 'boolean' ? d.calls_available : undefined
   } as DocumentDetail

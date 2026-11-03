@@ -1363,9 +1363,13 @@
         "label": "Running",
         "explain": "The run is making progress."
       },
+      "cancelling": {
+        "label": "Cancelling",
+        "explain": "A user asked to cancel the run. It stops after the documents in progress; it still holds the workspace until then."
+      },
       "paused": {
         "label": "Paused",
-        "explain": "The LLM provider rejected requests (for example budget or rate limit). The run resumes when the pause clears."
+        "explain": "The LLM provider rejected requests (for example budget or rate limit), so the run stopped. It resumes when the pause clears."
       },
       "hung": {
         "label": "Hung",
@@ -1373,7 +1377,7 @@
       },
       "orphaned": {
         "label": "Orphaned",
-        "explain": "The worker that owned this run has exited. Busy stays set until it is released."
+        "explain": "The worker that owned this run has exited (confirmed by the operating system). Busy stays set until it is released or the container restarts."
       },
       "busy_without_run": {
         "label": "Busy without a run",
@@ -1389,7 +1393,19 @@
       },
       "unresponsive": {
         "label": "Unresponsive",
-        "explain": "The worker process exists but has stopped sending heartbeats."
+        "explain": "The worker that owns this run stopped sending heartbeats, but its process is not confirmed gone, so the run is not orphaned. It still holds the workspace."
+      },
+      "succeeded": {
+        "label": "Succeeded",
+        "explain": "The run finished and processed its documents."
+      },
+      "failed": {
+        "label": "Failed",
+        "explain": "The run stopped on an error. Its documents stay failed or pending and are retried by the next run."
+      },
+      "cancelled": {
+        "label": "Cancelled",
+        "explain": "A user cancelled the run. Cancelled documents are retried automatically by the next run."
       },
       "unknown": {
         "label": "Unknown",
@@ -1478,10 +1494,6 @@
         "title": "Activity",
         "body": "Alerts, the audit log of admin actions, system events and incident export will appear here."
       },
-      "runs": {
-        "title": "Run history",
-        "body": "Thirty days of runs (kind, trigger, duration, documents done and failed, outcome) arrive with run tracking in a later release. Until then, Active shows the interim list, labelled \"Approximate (interim)\"."
-      },
       "signin": {
         "title": "Sign-in health",
         "body": "SSO callback errors, rejected tokens and login lockouts per 15 minutes and 24 hours arrive with the Performance release. Counts carry outcomes only, never usernames."
@@ -1491,7 +1503,7 @@
     "maskNote": "File names are masked on the server. Revealing one is an audited action that arrives in a later release.",
     "approximate": {
       "label": "Approximate (interim)",
-      "hint": "Read from workspaces with documents in progress and a read-only snapshot of their pipeline state, before run tracking exists. A run can be missing or shown late."
+      "hint": "Read from workspaces with documents in progress and a read-only snapshot of their pipeline state, because run tracking is off or not answering. A run can be missing or shown late."
     },
     "scope": {
       "host": "host",
@@ -1635,6 +1647,10 @@
         "title": "Run hung",
         "runbook": "Open the workspace, then cancel the run or restart the container."
       },
+      "worker_unresponsive": {
+        "title": "Worker stopped reporting while holding a workspace",
+        "runbook": "Check the worker's CPU in Health › Workers; restart the container if it does not recover."
+      },
       "reservation_without_owner": {
         "title": "Stranded reservation",
         "runbook": "Restart the container to clear it."
@@ -1707,7 +1723,8 @@
       "processed": "Processed",
       "failed": "Failed",
       "noEvents": "No deployments, provider rejections or admin actions in the last {{hours}} hours.",
-      "noBuckets": "Documents processed per hour arrive with run tracking. Token Insights › Work has the daily history."
+      "noBuckets": "Documents processed per hour are recorded while run tracking is on. Token Insights › Work has the daily history.",
+      "noWork": "No documents were processed or failed in the last {{hours}} hours."
     },
     "event": {
       "deployment": "deploy",
@@ -1755,7 +1772,10 @@
       "insert": "insert",
       "reprocess": "reprocess",
       "startup": "startup",
-      "admin": "admin"
+      "admin": "admin",
+      "api": "API",
+      "provider": "provider",
+      "other": "other"
     },
     "active": {
       "title": "Active runs",
@@ -1780,7 +1800,13 @@
         "elapsed": "Elapsed",
         "progress": "Progress",
         "worker": "Worker"
-      }
+      },
+      "durableNote": "Runs in progress from run tracking, with their stage and owner process.",
+      "noneDurable": "Nothing is running. Checked the run table at {{time}}.",
+      "lastHeartbeat": "last heartbeat {{age}} ago",
+      "ownerGone": "owner process gone",
+      "failedDocs_one": "{{count}} failed",
+      "failedDocs_other": "{{count}} failed"
     },
     "stuck": {
       "title": "Stuck",
@@ -1790,12 +1816,26 @@
         "hung": "hung after {{age}} without progress",
         "doc": "stale document after {{age}}"
       },
-      "none": "Nothing stuck. Checked documents in parsing, analyzing and processing at {{time}}.",
-      "runsLater": "Hung runs, orphaned runs and busy-without-run checks arrive with run tracking; this release detects stale documents.",
       "run": "run {{id}}",
       "openWorkspace": "open workspace",
       "why": {
-        "stale_doc": "in {{status}} since {{time}}"
+        "stale_doc": "in {{status}} since {{time}}",
+        "orphaned": "Worker {{pid}} exited ({{how}}); its last heartbeat was {{age}} ago.",
+        "orphanedNoPid": "The owner worker exited ({{how}}); its last heartbeat was {{age}} ago.",
+        "hung": "Worker {{pid}} is alive, but no document has moved for {{age}}.",
+        "hungNoPid": "The worker is alive, but no document has moved for {{age}}.",
+        "busy_without_run": "Busy is set, but no live run owns it (for example after an upgrade or a crash).",
+        "reservationScan": "A scan reservation is held with no live scan owner. It blocks email drains and deletes.",
+        "reservationEnqueue_one": "{{count}} upload reservation is held with no live owner. It blocks email drains and deletes.",
+        "reservationEnqueue_other": "{{count}} upload reservations are held with no live owner. They block email drains and deletes.",
+        "unresponsive": "Worker {{pid}} still exists but stopped sending heartbeats {{age}} ago while holding this workspace.",
+        "unresponsiveNoPid": "The owner worker still exists but stopped sending heartbeats {{age}} ago while holding this workspace.",
+        "busy_no_run": "Busy is set, but no run or live owner holds it (for example after an upgrade or a crash).",
+        "busy_run_unknown": "Busy names a run the run table does not hold, so nothing live owns it.",
+        "busy_run_finished": "Busy names a run that has already finished: the release did not happen.",
+        "reservationScan_owner_dead": "A scan reservation is held by a worker that has exited. It blocks email drains and deletes.",
+        "reservationScan_owner_unknown": "A scan reservation is held by a worker that never reported a heartbeat. It blocks email drains and deletes.",
+        "reservationScan_no_owner": "A scan reservation is held with no recorded owner. It blocks email drains and deletes."
       },
       "col": {
         "class": "Class",
@@ -1803,7 +1843,33 @@
         "what": "What",
         "age": "Age",
         "why": "Why"
-      }
+      },
+      "noneClasses": "Nothing stuck. Checked {{list}} at {{time}}.",
+      "noneCounted": "Nothing stuck. Checked doc status for {{workspaces}} workspaces and {{runs}} running runs ({{list}}) at {{time}}.",
+      "notChecked": "Not checked by this server: {{list}}.",
+      "trackingOff": "Run tracking is turned off on this server (OPS_RUN_TRACKING=false), so only stale documents are checked.",
+      "singleProcess": "One process: orphaned runs and stranded reservations exist only in multi-worker (Gunicorn) mode.",
+      "class": {
+        "orphaned": "orphaned runs",
+        "hung": "hung runs",
+        "stale_docs": "stale documents",
+        "busy_without_run": "busy without a run",
+        "reservations": "reservations without an owner"
+      },
+      "flagScanning": "scanning",
+      "flagEnqueues_one": "{{count}} pending enqueue",
+      "flagEnqueues_other": "{{count}} pending enqueues",
+      "flagBusy": "busy, no run",
+      "confirmedBy": {
+        "pid_gone": "process gone",
+        "pid_reused": "process ID reused by another process",
+        "create_time": "process replaced",
+        "exit_marker": "exit recorded by the Gunicorn master",
+        "exited": "the worker recorded its own exit",
+        "superseded": "replaced by a newer worker on its host",
+        "host_gone": "its host stopped reporting (container recreated)"
+      },
+      "restart": "→ Restart the container to clear it (see the runbook). Documents in progress are retried on start-up."
     },
     "backlog": {
       "title": "Backlog",
@@ -1892,20 +1958,27 @@
         "example": "Example (masked)",
         "docs": "Docs"
       },
-      "cancelledLabel": "cancelled by a user"
+      "cancelledLabel": "cancelled by a user",
+      "notDurable": "This server does not record failure kinds yet, so every failure is listed under Unclassified (legacy).",
+      "trackingOff": "Run tracking is turned off on this server (OPS_RUN_TRACKING=false), so new failures are not classified."
     },
     "errorKind": {
       "provider_budget": "provider budget (402)",
-      "provider_rate_limit": "provider rate limit",
       "provider_auth": "provider rejected the key",
-      "provider_timeout": "provider timeout",
-      "llm_bad_output": "LLM bad output",
-      "parser_timeout": "parser timeout",
-      "parser_error": "parser error",
-      "storage_error": "storage error",
+      "rate_limited": "rate limited (429)",
+      "timeout": "timeout",
+      "connection": "connection failed",
+      "context_length": "input too long for the model",
+      "provider_4xx": "provider rejected the request",
+      "provider_5xx": "provider server error",
+      "llm_output": "unreadable LLM output",
+      "storage": "storage error",
+      "content_missing": "document content missing",
+      "multimodal": "image or table analysis failed",
+      "internal": "internal error",
       "cancelled": "cancelled",
       "duplicate": "duplicate",
-      "unknown": "unknown"
+      "unknown": "unclassified"
     },
     "stage": {
       "enqueued": "enqueued",
@@ -1926,7 +1999,10 @@
         "pending": "not started",
         "unknown": "unknown",
         "interrupted": "interrupted"
-      }
+      },
+      "enqueue": "enqueue",
+      "delete": "delete",
+      "process": "waiting for processing"
     },
     "email": {
       "title": "Email re-sync queue",
@@ -1938,17 +2014,29 @@
         "ok": "ok",
         "slot_busy": "waiting: pipeline busy",
         "failed": "failed",
-        "error": "error"
+        "error": "error",
+        "exception": "error"
       },
       "col": {
         "workspace": "Workspace",
         "pending": "Pending",
         "since": "Waiting",
         "bad": "Unreadable",
+        "drainer": "Drainer",
         "attempts": "Attempts",
         "last": "Last result",
-        "lastOk": "Last success"
-      }
+        "lastOk": "Last success",
+        "drains": "Last hour"
+      },
+      "worker": "worker {{id}}",
+      "backoffLeft": "backoff {{age}}",
+      "drainsNone": "no drains",
+      "drainsOk_one": "{{count}} ok",
+      "drainsOk_other": "{{count}} ok",
+      "drainsFailed_one": "{{count}} failed",
+      "drainsFailed_other": "{{count}} failed",
+      "drainsBusy_one": "{{count}} slot busy",
+      "drainsBusy_other": "{{count}} slot busy"
     },
     "pauses": {
       "title": "Provider pauses",
@@ -1976,6 +2064,70 @@
         "retry": "Next try"
       }
     },
+    "runs": {
+      "title": "Run history",
+      "sub": "The last 30 days, newest first: pipeline runs, email batches, deletes, scans and start-up resumes.",
+      "workspace": "Workspace",
+      "workspacePlaceholder": "Exact workspace ID",
+      "kind": "Kind",
+      "allKinds": "All kinds",
+      "outcome": "Outcome",
+      "allOutcomes": "All",
+      "none": "No runs recorded in the last 30 days.",
+      "noneMatching": "No runs match these filters.",
+      "trackingOff": "Run tracking is turned off on this server (OPS_RUN_TRACKING=false), so no runs are recorded.",
+      "loadOlder": "Load older runs",
+      "loading": "Loading…",
+      "end": "End of the 30-day history.",
+      "col": {
+        "started": "Started",
+        "workspace": "Workspace",
+        "kind": "Kind",
+        "trigger": "Trigger",
+        "outcome": "Outcome",
+        "duration": "Duration",
+        "docs": "Docs",
+        "failed": "Failed",
+        "error": "Error kind"
+      }
+    },
+    "runDrawer": {
+      "workspace": "Workspace",
+      "kindTrigger": "Kind · trigger",
+      "label": "Label (masked)",
+      "started": "Started",
+      "finished": "Finished",
+      "took": "took {{age}}",
+      "elapsed": "Running for",
+      "progress": "Progress",
+      "failedDocs": "Failed docs",
+      "lastProgress": "Last progress",
+      "ago": "{{age}} ago",
+      "process": "Owner process",
+      "pid": "pid {{pid}}",
+      "heartbeat": "heartbeat {{age}} ago",
+      "ownerGone": "gone",
+      "error": "Error",
+      "request": "Request",
+      "runId": "Run ID",
+      "wasOrphaned": "was orphaned",
+      "wasOrphanedHint": "This run was marked orphaned, and its owner process later reported it finished.",
+      "whatToDo": "What to do",
+      "guide": {
+        "hung": "The worker is alive, but this run has made no progress. It holds the workspace, so new work and the email queue wait. Cancel it from Documents › Pipeline status in that workspace, or restart the container if cancel does not take effect.",
+        "unresponsive": "The worker process exists but has stopped sending heartbeats, so it is not treated as dead. Check Health › Workers; restart the container if it does not recover.",
+        "orphaned": "The worker that owned this run has exited, and busy is still set. Restart the container to clear it; documents in progress are retried on start-up.",
+        "paused": "The LLM provider rejected requests. The run resumes on its own once a call succeeds; keys and budgets are managed on the Providers page."
+      },
+      "failures_one": "Failed documents ({{count}})",
+      "failures_other": "Failed documents ({{count}})",
+      "noFailures": "No document failed in this run.",
+      "logCount_one": "{{count}} log line carries this run ID.",
+      "logCount_other": "{{count}} log lines carry this run ID.",
+      "retention": "Runs and their failures are kept for 30 days.",
+      "notFound": "This run is not in the run table. Runs are kept for 30 days.",
+      "unavailable": "Run details need run tracking and PostgreSQL storage, which this server does not have."
+    },
     "pager": {
       "previous": "Previous",
       "next": "Next",
@@ -1998,7 +2150,8 @@
         "alert": "alert"
       },
       "dependencyTitle": "Dependency {{name}}",
-      "workerTitle": "Worker {{id}}"
+      "workerTitle": "Worker {{id}}",
+      "runTitle": "Run {{id}}"
     },
     "workspace": {
       "owner": "Owner {{owner}}",
@@ -2020,7 +2173,6 @@
       "pauses": "Provider pause",
       "failuresByKind": "Failures by kind",
       "recentRuns": "Recent runs",
-      "runsLater": "Run history arrives with run tracking.",
       "feed": "Live feed (redacted, last 200)",
       "follow": "Follow",
       "feedEmpty": "No pipeline messages yet.",
@@ -2034,7 +2186,11 @@
       "copied": "Workspace ID copied",
       "copyFailed": "Could not copy the workspace ID",
       "openInsights": "LLM usage in Insights",
-      "notFound": "No such workspace: it has no documents, no queued emails and no live state."
+      "notFound": "No such workspace: it has no documents, no queued emails and no live state.",
+      "runsOff": "Run tracking is turned off on this server (OPS_RUN_TRACKING=false).",
+      "noRuns": "No runs recorded for this workspace in the last 30 days.",
+      "allFailures": "All failures",
+      "failuresWindow": "Classified failures in the last 7 days."
     },
     "document": {
       "path": "{{workspace}} › {{id}}",
@@ -2049,7 +2205,6 @@
       "error": "Error (redacted)",
       "failures": "Failure history",
       "noFailures": "No failures recorded for this document.",
-      "failuresLater": "Failure history (stage, kind, model, attempt) arrives with run tracking.",
       "attempt": "attempt {{n}}",
       "calls": "LLM calls (up to 50)",
       "explore": "Explore in Insights",
@@ -2071,7 +2226,14 @@
         "truncated": "truncated",
         "abandoned": "abandoned"
       },
-      "notFound": "This document no longer exists in the workspace."
+      "notFound": "This document no longer exists in the workspace.",
+      "failuresOff": "Failure history is recorded only while run tracking is on (OPS_RUN_TRACKING).",
+      "currentFailure": "Current failure",
+      "failureKind": "Kind",
+      "failureStage": "Stage",
+      "failureModel": "Model",
+      "firstFailed": "First failed",
+      "lastRun": "Last run"
     },
     "dep": {
       "postgres": "PostgreSQL",

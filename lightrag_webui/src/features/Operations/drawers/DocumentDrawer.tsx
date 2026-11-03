@@ -11,15 +11,18 @@ import { fmtClock, fmtCount, fmtLatency, shortId, utcTitle } from '../format'
 import { useStale } from '../hooks'
 import { useOpsPoll } from '../poll'
 import { docStatusState } from '../severity'
+import { ErrorKindText } from './RunDrawer'
 import Section from './Section'
 
 const DETAIL_SECONDS = 15
 
 /**
- * The Document drawer (§2.9, US-5), read-only: status, the stage timeline
- * from the doc-status metadata timings, the redacted error, failure history
- * (once run tracking records it) and up to 50 LLM calls for this doc. The
- * file name stays masked; revealing it is an audited action of a later
+ * The Document drawer (§2.9, US-5), read-only: status (with the attempt
+ * number of a failed doc), the stage timeline from the doc-status metadata
+ * timings, the current classified failure (stage, kind, model, the run that
+ * hit it), the redacted error, the failure history across attempts and up
+ * to 50 LLM calls for this doc. Runs open the Run drawer on the breadcrumb.
+ * The file name stays masked; revealing it is an audited action of a later
  * release.
  */
 export default function DocumentDrawer({ workspace, docId }: { workspace: string; docId: string }) {
@@ -32,6 +35,8 @@ export default function DocumentDrawer({ workspace, docId }: { workspace: string
   const doc = data?.doc
   const calls = data?.calls ?? []
   const failures = data?.failures ?? []
+  const failure = doc?.failure ?? null
+  const openRun = (runId: string) => nav.openDrawer({ kind: 'run', id: runId }, { push: true })
   const inStack = nav.stack.some((d) => d.kind === 'workspace' && d.id === workspace)
   return (
     <>
@@ -70,6 +75,9 @@ export default function DocumentDrawer({ workspace, docId }: { workspace: string
               <StatusChip state={doc.cancelled ? 'unknown' : docStatusState(doc.status)}>
                 {doc.cancelled ? t('operations.docStatus.cancelled') : t(`operations.docStatus.${doc.status}`, { defaultValue: doc.status })}
               </StatusChip>
+              {doc.status === 'failed' && typeof failure?.attempt === 'number' ? (
+                <span className="text-muted-foreground ms-2 text-xs">{t('operations.document.attempt', { n: failure.attempt })}</span>
+              ) : null}
             </Kv>
             {doc.track_id ? (
               <Kv k={t('operations.document.track')}>
@@ -84,6 +92,35 @@ export default function DocumentDrawer({ workspace, docId }: { workspace: string
               <span title={utcTitle(doc.updated_at)}>{fmtClock(doc.updated_at ?? null)}</span>
             </Kv>
           </div>
+          {failure && doc.status === 'failed' ? (
+            <Section title={t('operations.document.currentFailure')}>
+              <div className="flex flex-col gap-1">
+                <Kv k={t('operations.document.failureKind')}>
+                  <span className="font-medium">
+                    <ErrorKindText kind={failure.error_kind} status={failure.http_status} />
+                  </span>
+                </Kv>
+                {failure.stage ? <Kv k={t('operations.document.failureStage')}>{t(`operations.stage.${failure.stage}`, { defaultValue: failure.stage })}</Kv> : null}
+                {failure.model ? (
+                  <Kv k={t('operations.document.failureModel')}>
+                    <span className="font-mono text-xs">{failure.model}</span>
+                  </Kv>
+                ) : null}
+                {failure.first_failed_at ? (
+                  <Kv k={t('operations.document.firstFailed')}>
+                    <span title={utcTitle(failure.first_failed_at)}>{fmtClock(failure.first_failed_at)}</span>
+                  </Kv>
+                ) : null}
+                {failure.last_run_id ? (
+                  <Kv k={t('operations.document.lastRun')}>
+                    <button type="button" className="font-mono text-xs underline underline-offset-2" onClick={() => openRun(failure.last_run_id as string)}>
+                      {shortId(failure.last_run_id)}
+                    </button>
+                  </Kv>
+                ) : null}
+              </div>
+            </Section>
+          ) : null}
           <Section title={t('operations.document.timeline')}>
             <StageTimeline stages={doc.stages ?? []} />
           </Section>
@@ -94,22 +131,32 @@ export default function DocumentDrawer({ workspace, docId }: { workspace: string
           ) : null}
           <Section title={t('operations.document.failures')}>
             {failures.length ? (
-              <ul className="m-0 flex list-none flex-col gap-1 p-0 text-[13px]">
+              <ul className="m-0 flex list-none flex-col gap-1.5 p-0 text-[13px]">
                 {failures.map((f, i) => (
-                  <li key={`${f.ts}-${i}`} className="flex flex-wrap items-center gap-2">
-                    <span className="font-mono text-xs" title={utcTitle(f.ts)}>
-                      {fmtClock(f.ts)}
+                  <li key={`${f.ts}-${i}`} className="flex flex-col gap-0.5">
+                    <span className="flex flex-wrap items-center gap-x-2">
+                      <span className="font-mono text-xs" title={utcTitle(f.ts)}>
+                        {fmtClock(f.ts)}
+                      </span>
+                      {f.run_id ? (
+                        <button type="button" className="font-mono text-xs underline underline-offset-2" onClick={() => openRun(f.run_id as string)}>
+                          {t('operations.stuck.run', { id: shortId(f.run_id, 6) })}
+                        </button>
+                      ) : null}
+                      {f.stage ? <span>{t(`operations.stage.${f.stage}`, { defaultValue: f.stage })}</span> : null}
+                      <span className="font-medium">
+                        <ErrorKindText kind={f.error_kind} status={f.http_status} />
+                      </span>
+                      {f.model ? <span className="font-mono text-xs">{f.model}</span> : null}
+                      {typeof f.attempt === 'number' ? <span className="text-muted-foreground text-xs">{t('operations.document.attempt', { n: f.attempt })}</span> : null}
                     </span>
-                    {f.stage ? <span>{t(`operations.stage.${f.stage}`, { defaultValue: f.stage })}</span> : null}
-                    <span className="font-medium">{f.error_kind ? t(`operations.errorKind.${f.error_kind}`, { defaultValue: f.error_kind }) : '–'}</span>
-                    {f.model ? <span className="font-mono text-xs">{f.model}</span> : null}
-                    {typeof f.attempt === 'number' ? <span className="text-muted-foreground text-xs">{t('operations.document.attempt', { n: f.attempt })}</span> : null}
+                    {f.message ? <span className="text-muted-foreground font-mono text-xs break-words">{f.message}</span> : null}
                   </li>
                 ))}
               </ul>
             ) : (
               <p className="text-muted-foreground m-0 text-xs">
-                {status?.features?.runs ? t('operations.document.noFailures') : t('operations.document.failuresLater')}
+                {status?.features?.runs === false ? t('operations.document.failuresOff') : t('operations.document.noFailures')}
               </p>
             )}
           </Section>

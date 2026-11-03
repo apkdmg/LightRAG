@@ -71,7 +71,22 @@ async def _lift_provider_pause(workspace: str) -> bool:
     except PipelineNotInitializedError:
         return False
     async with get_namespace_lock("pipeline_status", workspace=workspace):
-        return bool(pipeline_status.pop(PROVIDER_PAUSE_KEY, None))
+        pause = pipeline_status.pop(PROVIDER_PAUSE_KEY, None)
+    if pause:
+        # Operations console: the persisted pause ends here (buffered, no I/O).
+        from lightrag.api.ops import runs as ops_runs
+
+        # Filed under the storage's workspace name ("default" for the
+        # unnamed workspace on Postgres), as the pipeline recorded it.
+        ops_workspace = (
+            pause.get("ops_workspace") if isinstance(pause, dict) else None
+        ) or workspace
+        ops_runs.pause_cleared(
+            ops_workspace,
+            role=pause.get("role") if isinstance(pause, dict) else None,
+            reason="key_updated",
+        )
+    return bool(pause)
 
 
 async def _resume_paused_ingestion(workspace_manager, workspace: str) -> None:

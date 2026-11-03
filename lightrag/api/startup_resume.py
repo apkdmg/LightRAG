@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 from typing import Any, Awaitable, Callable, Optional
 
+from lightrag.api.ops import runs as ops_runs
 from lightrag.base import DocStatus
 from lightrag.pipeline import _INFLIGHT_DOC_STATUSES
 from lightrag.utils import logger
@@ -98,7 +99,9 @@ async def resume_pending_documents(
                     f"Startup resume: processing {waiting} waiting document(s) "
                     f"in workspace '{workspace}'"
                 )
-                await rag.apipeline_process_enqueue_documents()
+                # Runs started here are recorded as startup resumes.
+                with ops_runs.run_origin(kind="startup_resume", trigger="startup"):
+                    await rag.apipeline_process_enqueue_documents()
             except Exception as e:
                 logger.error(f"Startup resume failed for '{workspace}': {e}")
 

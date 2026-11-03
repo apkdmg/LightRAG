@@ -363,3 +363,116 @@ def seed_health(app: FastAPI, store: MemoryOpsStore) -> None:
             "loop_lag_ms": 3,
             "pool_wait_ms": 1,
         }
+
+
+RUN_ID = "a1b2c3d4e5f60718293a4b5c6d7e8f90"
+ORPHAN_RUN_ID = "0f1e2d3c4b5a69788796a5b4c3d2e1f0"
+DONE_RUN_ID = "11112222333344445555666677778888"
+
+
+def seed_runs(store: MemoryOpsStore, worker_id: str = WORKER_ID) -> None:
+    """Run tracking rows: a running run in fsktm (owned by ``worker_id``), a
+    finished one, an orphaned one in space1, and classified failures."""
+    import asyncio
+
+    now = time.time()
+    base = {
+        "trigger": "upload",
+        "worker_id": worker_id,
+        "pid": 4242,
+        "finished_at": None,
+        "docs_total": 4,
+        "docs_done": 1,
+        "docs_failed": 1,
+        "stage": "extract",
+        "label": "Senate minutes [2 files]",
+        "error_kind": None,
+        "error_summary": None,
+        "request_id": None,
+    }
+    rows = [
+        {
+            **base,
+            "run_id": RUN_ID,
+            "workspace": "fsktm",
+            "kind": "process",
+            "status": "running",
+            "started_at": now - 600,
+            "heartbeat_at": now - 5,
+            "progress_at": now - 30,
+        },
+        {
+            **base,
+            "run_id": DONE_RUN_ID,
+            "workspace": "fsktm",
+            "kind": "delete",
+            "status": "succeeded",
+            "started_at": now - 7200,
+            "heartbeat_at": now - 7100,
+            "progress_at": now - 7100,
+            "finished_at": now - 7100,
+        },
+        {
+            **base,
+            "run_id": ORPHAN_RUN_ID,
+            "workspace": "space1",
+            "kind": "email_batch",
+            "trigger": "resync",
+            "worker_id": OTHER_WORKER_ID,
+            "status": "running",
+            "started_at": now - 1800,
+            "heartbeat_at": now - 900,
+            "progress_at": now - 900,
+        },
+    ]
+    failures = [
+        {
+            "ts": now - 120,
+            "workspace": "fsktm",
+            "doc_id": "doc-aaaa0004",
+            "track_id": "upload_20261103_101010_aaaa0004",
+            "run_id": RUN_ID,
+            "stage": "extract",
+            "error_kind": "rate_limited",
+            "http_status": 429,
+            "exc_type": "openai.RateLimitError",
+            "message": "RateLimitError: Error code: 429 <redacted>",
+            "attempt": 2,
+            "model": "gpt-4o-mini",
+        },
+        {
+            "ts": now - 60,
+            "workspace": "fsktm",
+            "doc_id": "doc-aaaa0005",
+            "track_id": None,
+            "run_id": RUN_ID,
+            "stage": "extract",
+            "error_kind": "cancelled",
+            "http_status": None,
+            "exc_type": "PipelineCancelledException",
+            "message": "User cancelled",
+            "attempt": 1,
+            "model": "gpt-4o-mini",
+        },
+        {
+            "ts": now - 30,
+            "workspace": "space1",
+            "doc_id": "doc-bbbb0002",
+            "track_id": None,
+            "run_id": ORPHAN_RUN_ID,
+            "stage": "parse",
+            "error_kind": "timeout",
+            "http_status": None,
+            "exc_type": "httpx.ReadTimeout",
+            "message": "ReadTimeout docling:5001",
+            "attempt": 1,
+            "model": None,
+        },
+    ]
+
+    async def write() -> None:
+        await store.runs_write(rows)
+        await store.doc_failures_write(failures)
+        await store.runs_orphan([ORPHAN_RUN_ID])
+
+    asyncio.run(write())

@@ -44,6 +44,7 @@ from lightrag.utils import (
     generate_track_id,
     move_file_to_parsed_dir,
 )
+from lightrag.api.ops import runs as ops_runs
 from lightrag.api.ops.context import bind_log_workspace
 from lightrag.api.ops.redact import mask_path
 from lightrag.api.utils_api import get_combined_auth_dependency
@@ -1068,7 +1069,9 @@ async def _reserve_enqueue_slot(rag: LightRAG) -> bool:
     return True
 
 
-async def _acquire_destructive_busy(rag: LightRAG) -> tuple[bool, str | None]:
+async def _acquire_destructive_busy(
+    rag: LightRAG, *, run_kind: Optional[str] = "delete", trigger: str = "api"
+) -> tuple[bool, str | None]:
     """Atomically reserve the destructive busy slot for ``/documents/clear``
     or ``/documents/delete_document``.
 
@@ -1088,6 +1091,11 @@ async def _acquire_destructive_busy(rag: LightRAG) -> tuple[bool, str | None]:
     enqueue/scan reservation cannot squeeze past us.
 
     Caller is responsible for clearing both flags in its finally block.
+
+    With run tracking on, the reservation is also a run (``run_kind``,
+    ``trigger``; ``run_kind=None`` records none): its owner keys are written
+    in the same update as the flags and ``_release_destructive_busy``
+    finishes it.
 
     Returns:
         (acquired, reason).  ``acquired=True`` and ``reason=None`` on
@@ -1110,6 +1118,7 @@ async def _acquire_destructive_busy(rag: LightRAG) -> tuple[bool, str | None]:
     pipeline_status_lock = get_namespace_lock(
         "pipeline_status", workspace=rag.workspace
     )
+    run_id = ops_runs.new_run_id() if run_kind else None
     async with pipeline_status_lock:
         if pipeline_status.get("busy"):
             return False, "Pipeline is busy with another operation."
@@ -1124,18 +1133,32 @@ async def _acquire_destructive_busy(rag: LightRAG) -> tuple[bool, str | None]:
                 "Wait for in-flight work to complete before clearing or "
                 "deleting."
             )
-        pipeline_status["busy"] = True
-        pipeline_status["destructive_busy"] = True
+        pipeline_status.update(
+            {
+                "busy": True,
+                "destructive_busy": True,
+                # A slot taken without a run still names its owner.
+                **ops_runs.owner_fields(run_id, owner_only=True),
+            }
+        )
+    ops_runs.start(
+        run_id, workspace=ops_runs.workspace_of(rag), kind=run_kind, trigger=trigger
+    )
     return True, None
 
 
-async def _release_destructive_busy(rag: LightRAG) -> None:
+async def _release_destructive_busy(
+    rag: LightRAG, *, outcome: str = "succeeded", finish: bool = True
+) -> Optional[str]:
     """Release the destructive busy slot acquired by
     ``_acquire_destructive_busy``.  Never raises.
 
     Distinct from ``_release_enqueue_slot``: that helper clears
     ``pending_enqueues`` (the upload/insert reservation), this one
     clears ``busy + destructive_busy`` (the clear/delete reservation).
+
+    The run that owned the slot is finished with ``outcome`` unless
+    ``finish`` is False (the caller finishes it later). Returns its ID.
     """
     from lightrag.exceptions import PipelineNotInitializedError
     from lightrag.kg.shared_storage import get_namespace_data, get_namespace_lock
@@ -1150,8 +1173,13 @@ async def _release_destructive_busy(rag: LightRAG) -> None:
         "pipeline_status", workspace=rag.workspace
     )
     async with pipeline_status_lock:
-        pipeline_status["busy"] = False
-        pipeline_status["destructive_busy"] = False
+        run_id = pipeline_status.get("run_id")
+        pipeline_status.update(
+            {"busy": False, "destructive_busy": False, **ops_runs.clear_fields()}
+        )
+    if finish:
+        ops_runs.finish(run_id, outcome)
+    return run_id
 
 
 async def _release_enqueue_slot(rag: LightRAG) -> None:
@@ -2161,7 +2189,11 @@ async def pipeline_index_texts(
 
 
 async def run_scanning_process(
-    rag: LightRAG, doc_manager: DocumentManager, track_id: str = None
+    rag: LightRAG,
+    doc_manager: DocumentManager,
+    track_id: str = None,
+    *,
+    scan_run_id: Optional[str] = None,
 ):
     """Background task to scan and index documents
 
@@ -2169,7 +2201,20 @@ async def run_scanning_process(
         rag: LightRAG instance
         doc_manager: DocumentManager instance
         track_id: Optional tracking ID to pass to all scanned files
+        scan_run_id: The scan run started by the endpoint (run tracking)
     """
+    # Processing runs this scan starts are labelled with the scan trigger.
+    with ops_runs.run_origin(trigger="scan"):
+        await _run_scanning_process(rag, doc_manager, track_id, scan_run_id)
+
+
+async def _run_scanning_process(
+    rag: LightRAG,
+    doc_manager: DocumentManager,
+    track_id: Optional[str],
+    scan_run_id: Optional[str],
+):
+    """Body of :func:`run_scanning_process`."""
     # The scan endpoint set ``scanning=True`` AND
     # ``scanning_exclusive=True`` synchronously before scheduling this
     # task.  ``scanning`` covers the whole lifecycle (refuses
@@ -2196,6 +2241,7 @@ async def run_scanning_process(
     except PipelineNotInitializedError:
         pass
 
+    scan_outcome = "succeeded"
     try:
         new_files = doc_manager.scan_directory_for_new_files()
         total_files = len(new_files)
@@ -2342,6 +2388,13 @@ async def run_scanning_process(
             if pipeline_status is not None and pipeline_status_lock is not None:
                 async with pipeline_status_lock:
                     pipeline_status["scanning_exclusive"] = False
+            # From here the scan waits for processing, which reports its own
+            # progress as a process run (the console never calls the scan hung).
+            ops_runs.progress(
+                scan_run_id,
+                docs_total=len(new_files) + len(resume_files),
+                stage="process",
+            )
 
             # New files take the standard enqueue + process path.  When at
             # least one new file is successfully enqueued, pipeline_index_files
@@ -2386,12 +2439,14 @@ async def run_scanning_process(
             if pipeline_status is not None and pipeline_status_lock is not None:
                 async with pipeline_status_lock:
                     pipeline_status["scanning_exclusive"] = False
+            ops_runs.progress(scan_run_id, stage="process")
             logger.info(
                 "No upload file found, check if there are any documents in the queue..."
             )
             await rag.apipeline_process_enqueue_documents()
 
     except Exception as e:
+        scan_outcome = "failed"
         logger.error(f"Error during scanning process: {str(e)}")
         logger.error(traceback.format_exc())
     finally:
@@ -2400,8 +2455,14 @@ async def run_scanning_process(
         # was never initialised for this workspace (test rigs).
         if pipeline_status is not None and pipeline_status_lock is not None:
             async with pipeline_status_lock:
-                pipeline_status["scanning"] = False
-                pipeline_status["scanning_exclusive"] = False
+                pipeline_status.update(
+                    {
+                        "scanning": False,
+                        "scanning_exclusive": False,
+                        **ops_runs.scan_clear_fields(),
+                    }
+                )
+        ops_runs.finish(scan_run_id, scan_outcome)
 
 
 async def background_delete_documents(
@@ -2436,6 +2497,8 @@ async def background_delete_documents(
     # job-info fields; the busy reservation was acquired by the
     # endpoint and is released in the finally block below.
     async with pipeline_status_lock:
+        # The run the endpoint's reservation started (None: tracking off).
+        run_id = pipeline_status.get("run_id")
         pipeline_status.update(
             {
                 # Job name can not be changed, it's verified in adelete_by_doc_id()
@@ -2453,6 +2516,10 @@ async def background_delete_documents(
             pipeline_status["history_messages"].append(
                 "LLM cache cleanup requested for this deletion job"
             )
+    ops_runs.progress(
+        run_id, docs_total=total_docs, label=f"Deleting {total_docs} documents"
+    )
+    run_outcome = "succeeded"
 
     try:
         # Loop through each document ID and delete them one by one
@@ -2468,6 +2535,7 @@ async def background_delete_documents(
                     failed_deletions.extend(
                         doc_ids[i - 1 :]
                     )  # i-1 because enumerate starts at 1
+                    run_outcome = "cancelled"
                     break  # Exit the loop, remaining documents unchanged
 
                 start_msg = f"Deleting document {i}/{total_docs}: {doc_id}"
@@ -2475,6 +2543,10 @@ async def background_delete_documents(
                 pipeline_status["cur_batch"] = i
                 pipeline_status["latest_message"] = start_msg
                 pipeline_status["history_messages"].append(start_msg)
+                # Owner heartbeat, at most every 5 s (no I/O).
+                heartbeat = ops_runs.progress(run_id, stage="delete", heartbeat=True)
+                if heartbeat:
+                    pipeline_status.update(heartbeat)
 
             file_path = "#"
             try:
@@ -2486,6 +2558,7 @@ async def background_delete_documents(
                 )
                 if result.status == "success":
                     successful_deletions.append(doc_id)
+                    ops_runs.progress(run_id, done=1, stage="delete")
                     success_msg = (
                         f"Document deleted {i}/{total_docs}: {doc_id}[{file_path}]"
                     )
@@ -2557,6 +2630,7 @@ async def background_delete_documents(
                             pipeline_status["history_messages"].append(no_file_msg)
                 else:
                     failed_deletions.append(doc_id)
+                    ops_runs.progress(run_id, failed=1, stage="delete")
                     error_msg = f"Failed to delete {i}/{total_docs}: {doc_id}[{file_path}] - {result.message}"
                     logger.error(error_msg)
                     async with pipeline_status_lock:
@@ -2565,6 +2639,7 @@ async def background_delete_documents(
 
             except Exception as e:
                 failed_deletions.append(doc_id)
+                ops_runs.progress(run_id, failed=1, stage="delete")
                 error_msg = f"Error deleting document {i}/{total_docs}: {doc_id}[{file_path}] - {str(e)}"
                 logger.error(error_msg)
                 logger.error(traceback.format_exc())
@@ -2573,6 +2648,7 @@ async def background_delete_documents(
                     pipeline_status["history_messages"].append(error_msg)
 
     except Exception as e:
+        run_outcome = "failed"
         error_msg = f"Critical error during batch deletion: {str(e)}"
         logger.error(error_msg)
         logger.error(traceback.format_exc())
@@ -2581,8 +2657,9 @@ async def background_delete_documents(
     finally:
         # Final summary and check for pending requests
         async with pipeline_status_lock:
-            pipeline_status["busy"] = False
-            pipeline_status["destructive_busy"] = False
+            pipeline_status.update(
+                {"busy": False, "destructive_busy": False, **ops_runs.clear_fields()}
+            )
             pipeline_status["pending_requests"] = False  # Reset pending requests flag
             pipeline_status["cancellation_requested"] = (
                 False  # Always reset cancellation flag
@@ -2593,6 +2670,7 @@ async def background_delete_documents(
 
             # Check if there are pending document indexing requests
             has_pending_request = pipeline_status.get("request_pending", False)
+        ops_runs.finish(run_id, run_outcome)
 
         # If there are pending requests, start document processing pipeline
         if has_pending_request:
@@ -2770,12 +2848,28 @@ def create_document_routes(
             # classification phase: run_scanning_process clears it once
             # classification is done so concurrent uploads can land
             # while the scan-driven processing finishes.
-            pipeline_status["scanning"] = True
-            pipeline_status["scanning_exclusive"] = True
+            scan_run_id = ops_runs.new_run_id()
+            # The scan's owner keys (reservation-without-owner detection)
+            # ride in the same update; empty with run tracking off.
+            pipeline_status.update(
+                {
+                    "scanning": True,
+                    "scanning_exclusive": True,
+                    **ops_runs.scan_owner_fields(),
+                }
+            )
+        ops_runs.start(
+            scan_run_id,
+            workspace=ops_runs.workspace_of(rag),
+            kind="scan",
+            trigger="scan",
+        )
 
         # Start the scanning process in the background with track_id.  The
         # task is responsible for clearing both flags in its finally block.
-        background_tasks.add_task(run_scanning_process, rag, doc_manager, track_id)
+        background_tasks.add_task(
+            run_scanning_process, rag, doc_manager, track_id, scan_run_id=scan_run_id
+        )
         return ScanResponse(
             status="scanning_started",
             message="Scanning process has been initiated in the background",
@@ -3299,10 +3393,12 @@ def create_document_routes(
         # remove every input file, so a concurrent upload accepted in
         # this window would write to storages mid-drop and silently
         # lose the document.
-        acquired, reason = await _acquire_destructive_busy(rag)
+        acquired, reason = await _acquire_destructive_busy(rag, run_kind="clear")
         if not acquired:
             return ClearDocumentsResponse(status="busy", message=reason)
+        clear_outcome = "failed"
         async with pipeline_status_lock:
+            clear_run_id = pipeline_status.get("run_id")
             pipeline_status.update(
                 {
                     "job_name": "Clearing Documents",
@@ -3435,6 +3531,7 @@ def create_document_routes(
             if "history_messages" in pipeline_status:
                 pipeline_status["history_messages"].append(final_message)
 
+            clear_outcome = "succeeded" if status == "success" else "failed"
             # Return response based on results
             return ClearDocumentsResponse(status=status, message=final_message)
         except Exception as e:
@@ -3448,12 +3545,18 @@ def create_document_routes(
             # Reset busy + destructive_busy after completion so the next
             # reservation / scan sees an idle pipeline.
             async with pipeline_status_lock:
-                pipeline_status["busy"] = False
-                pipeline_status["destructive_busy"] = False
+                pipeline_status.update(
+                    {
+                        "busy": False,
+                        "destructive_busy": False,
+                        **ops_runs.clear_fields(),
+                    }
+                )
                 completion_msg = "Document clearing process completed"
                 pipeline_status["latest_message"] = completion_msg
                 if "history_messages" in pipeline_status:
                     pipeline_status["history_messages"].append(completion_msg)
+            ops_runs.finish(clear_run_id, clear_outcome)
 
     @router.get(
         "/pipeline_status",

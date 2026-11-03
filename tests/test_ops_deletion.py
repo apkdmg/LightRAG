@@ -11,7 +11,12 @@ import pytest
 from lightrag.api.ops.runtime import OpsRuntime
 from lightrag.api.ops.service import OpsService
 from lightrag.api.ops.snapshot import NamespaceReader
-from lightrag.api.ops.store import MemoryOpsStore, PostgresOpsStore, workspace_hash
+from lightrag.api.ops.store import (
+    MemoryOpsStore,
+    PostgresOpsStore,
+    deleted_key,
+    workspace_hash,
+)
 from lightrag.usage import add_event_sink, emit_event, remove_event_sink
 
 pytestmark = pytest.mark.offline
@@ -40,7 +45,13 @@ def _seeded() -> MemoryOpsStore:
 async def test_memory_forget_semantics():
     store = _seeded()
     await store.forget_workspace(WS)
-    assert set(store.kv) == {f"resync:{WS}x", "email_queue_summary"}
+    # A tombstone (hashed name) keeps buffered rows from being written back.
+    assert set(store.kv) == {
+        f"resync:{WS}x",
+        "email_queue_summary",
+        deleted_key(WS),
+    }
+    assert WS not in deleted_key(WS)
     assert store.kv["email_queue_summary"]["items"] == [
         {"workspace": "other", "pending": 1}
     ]

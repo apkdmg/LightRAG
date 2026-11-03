@@ -16,6 +16,7 @@ import { OverallStateChip } from './components/StatusChip'
 import { DrawerMove, OpsNav, OpsNavContext, OpsOverviewContext, OpsShellContext, useOpsNav } from './context'
 import DependencyDrawer from './drawers/DependencyDrawer'
 import DocumentDrawer from './drawers/DocumentDrawer'
+import RunDrawer from './drawers/RunDrawer'
 import UnsupportedDrawer from './drawers/UnsupportedDrawer'
 import WorkerDrawer from './drawers/WorkerDrawer'
 import WorkspaceDrawer from './drawers/WorkspaceDrawer'
@@ -325,6 +326,7 @@ function OperationsPage() {
 function renderDrawer(drawer: Drawer) {
   if (drawer.kind === 'workspace') return <WorkspaceDrawer workspace={drawer.id} />
   if (drawer.kind === 'document') return <DocumentDrawer workspace={drawer.workspace} docId={drawer.id} />
+  if (drawer.kind === 'run') return <RunDrawer runId={drawer.id} />
   if (drawer.kind === 'dependency') return <DependencyDrawer dep={drawer.id} />
   if (drawer.kind === 'worker') return <WorkerDrawer workerId={drawer.id} />
   return <UnsupportedDrawer kind={drawer.kind} />

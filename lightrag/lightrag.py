@@ -133,6 +133,7 @@ from lightrag.types import KnowledgeGraph
 from dotenv import load_dotenv
 from lightrag.pipeline import _PipelineMixin
 from lightrag.usage import emit_event, run_in_usage_scope
+from lightrag.api.ops import runs as ops_runs
 from lightrag.kg.factory import get_storage_class
 from lightrag.addon_params import (
     ObservableAddonParams,
@@ -2788,6 +2789,9 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
 
         # Track whether WE acquired the pipeline
         we_acquired_pipeline = False
+        # Operations console run for a deletion that takes the pipeline
+        # itself (None with run tracking off; no I/O).
+        run_id = ops_runs.new_run_id()
 
         # Check and acquire pipeline if needed
         async with pipeline_status_lock:
@@ -2805,6 +2809,7 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
                         "request_pending": False,
                         "cancellation_requested": False,
                         "latest_message": f"Starting deletion for document: {doc_id}",
+                        **ops_runs.owner_fields(run_id),
                     }
                 )
                 # Initialize history messages
@@ -2824,6 +2829,15 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
                     )
                 # Pipeline is busy with deletion - proceed without acquiring
 
+        if we_acquired_pipeline:
+            ops_runs.start(
+                run_id,
+                workspace=ops_runs.workspace_of(self),
+                kind="delete",
+                trigger="api",
+                label="Single document deletion",
+                docs_total=1,
+            )
         deletion_operations_started = False
         deletion_fully_completed = False
         in_final_delete_stage = False
@@ -3605,52 +3619,63 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
             )
 
         finally:
-            # ALWAYS ensure persistence if any deletion operations were started
-            if deletion_operations_started:
-                try:
-                    await self._insert_done()
-                except Exception as persistence_error:
-                    persistence_error_msg = f"Failed to persist data after deletion attempt for {doc_id}: {persistence_error}"
-                    logger.error(persistence_error_msg)
-                    logger.error(traceback.format_exc())
+            try:
+                # ALWAYS ensure persistence if any deletion operations were started
+                if deletion_operations_started:
+                    try:
+                        await self._insert_done()
+                    except Exception as persistence_error:
+                        persistence_error_msg = f"Failed to persist data after deletion attempt for {doc_id}: {persistence_error}"
+                        logger.error(persistence_error_msg)
+                        logger.error(traceback.format_exc())
 
-                    if deletion_fully_completed:
-                        # All deletion stages succeeded; the flush error is a post-cleanup
-                        # concern. Do not override the success result already returned.
-                        logger.error(
-                            "Post-deletion persistence flush failed for %s, "
-                            "but deletion completed successfully: %s",
-                            doc_id,
-                            persistence_error,
-                        )
-                    elif original_exception is None:
-                        # Deletion stages were in-flight but the try-block return was never
-                        # reached; treat the persistence failure as the primary error.
-                        return DeletionResult(
-                            status="fail",
-                            doc_id=doc_id,
-                            message=f"Deletion completed but failed to persist changes: {persistence_error}",
-                            status_code=500,
-                            file_path=file_path,
-                        )
-                    # If there was an original exception, log the persistence error but
-                    # don't override it — the original error result was already returned.
-            else:
-                logger.debug(
-                    f"No deletion operations were started for document {doc_id}, skipping persistence"
-                )
-
-            # Release pipeline only if WE acquired it
-            if we_acquired_pipeline:
-                async with pipeline_status_lock:
-                    pipeline_status["busy"] = False
-                    pipeline_status["cancellation_requested"] = False
-                    completion_msg = (
-                        f"Deletion process completed for document: {doc_id}"
+                        if deletion_fully_completed:
+                            # All deletion stages succeeded; the flush error is a post-cleanup
+                            # concern. Do not override the success result already returned.
+                            logger.error(
+                                "Post-deletion persistence flush failed for %s, "
+                                "but deletion completed successfully: %s",
+                                doc_id,
+                                persistence_error,
+                            )
+                        elif original_exception is None:
+                            # Every normal path returns or raises an Exception, so this
+                            # is a BaseException (e.g. cancellation) in flight. Let it
+                            # propagate: returning here would swallow it.
+                            logger.error(
+                                "Deletion of %s was interrupted and the persistence "
+                                "flush also failed: %s",
+                                doc_id,
+                                persistence_error,
+                            )
+                        # If there was an original exception, log the persistence error but
+                        # don't override it — the original error result was already returned.
+                else:
+                    logger.debug(
+                        f"No deletion operations were started for document {doc_id}, skipping persistence"
                     )
-                    pipeline_status["latest_message"] = completion_msg
-                    pipeline_status["history_messages"].append(completion_msg)
-                    logger.info(completion_msg)
+            finally:
+                # Release pipeline only if WE acquired it
+                if we_acquired_pipeline:
+                    async with pipeline_status_lock:
+                        pipeline_status.update(
+                            {
+                                "busy": False,
+                                "cancellation_requested": False,
+                                **ops_runs.clear_fields(),
+                            }
+                        )
+                        completion_msg = (
+                            f"Deletion process completed for document: {doc_id}"
+                        )
+                        pipeline_status["latest_message"] = completion_msg
+                        pipeline_status["history_messages"].append(completion_msg)
+                        logger.info(completion_msg)
+                    ops_runs.finish(
+                        run_id,
+                        "succeeded" if deletion_fully_completed else "failed",
+                        docs_done=1 if deletion_fully_completed else None,
+                    )
 
     async def adelete_by_entity(self, entity_name: str) -> DeletionResult:
         """Asynchronously delete an entity and all its relationships.

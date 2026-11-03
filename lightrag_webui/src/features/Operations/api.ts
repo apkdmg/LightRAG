@@ -1,5 +1,6 @@
 import { axiosInstance } from '@/api/lightrag'
 import {
+  normalizeActive,
   normalizeDocument,
   normalizeDocuments,
   normalizeEmailQueue,
@@ -9,6 +10,8 @@ import {
   normalizeFeed,
   normalizeOverview,
   normalizePage,
+  normalizeRunDetail,
+  normalizeRuns,
   normalizeStuck,
   normalizeSummary,
   normalizeWorkspace
@@ -22,8 +25,9 @@ import { normalizeConfig, normalizeDepDetail, normalizeHealth, normalizeProbeRes
  * axios instance so auth headers, token renewal and the error mapping apply.
  *
  * The response types below follow the §3.7 catalogue. Fields that arrive in
- * later releases (run tracking, heartbeats, probes, logs) are optional, and
- * every view renders a missing field as "–" or an honest note rather than
+ * later releases (logs, alerts, actions) are optional, and fields a server
+ * may leave out (run tracking turned off with OPS_RUN_TRACKING=false, a
+ * server one release behind) render as "–" or an honest note rather than
  * failing.
  */
 
@@ -116,6 +120,8 @@ export type AttentionItem = {
   since?: string | null
   count?: Num
   workspace?: string | null
+  /** The run the item is about (hung and orphaned runs). */
+  run_id?: string | null
   /** The dependency or worker the item is about (rules on probes and heartbeats). */
   dep?: string | null
   worker_id?: string | null
@@ -165,7 +171,7 @@ export type LiveFlags = {
 }
 
 export type ActiveRun = {
-  /** null for interim (approximate) rows, before run tracking. */
+  /** null for interim (approximate) rows: run tracking off, or a server one release behind. */
   run_id?: string | null
   workspace: string
   kind?: string | null
@@ -174,19 +180,113 @@ export type ActiveRun = {
   label?: string | null
   worker_id?: string | null
   pid?: Num
+  /** false once the OS confirmed the owner process is gone; null when not known. */
   worker_alive?: boolean | null
   started_at?: string | null
   heartbeat_age_s?: Num
+  /** Age of the owner worker's last heartbeat (what "unresponsive" is about). */
+  worker_heartbeat_age_s?: Num
   progress_age_s?: Num
   docs_done?: Num
   docs_total?: Num
+  docs_failed?: Num
+  /** The pipeline stage the run is in (parsing, analyzing, extract, merge, …). */
   stage?: string | null
-  /** running | paused | hung | orphaned | … (severity.ts RUN_STATES) */
+  /** running | cancelling | paused | hung | unresponsive | orphaned | … (severity.ts RUN_STATES) */
   state: string
+  /** The durable row's status (running, paused, orphaned, …); `state` is what to show. */
+  status?: string | null
   live?: LiveFlags | null
   pause?: { status_code?: Num; slot?: string | null; role?: string | null; kind?: string | null; active?: boolean } | null
   /** Redacted last pipeline message (interim rows). */
   latest_message?: string | null
+}
+
+/**
+ * One row of LIGHTRAG_OPS_RUNS (FR-17): a pipeline run, email batch, delete,
+ * clear, scan, startup resume or admin action, with its outcome. `state` is
+ * what the console shows: the outcome once finished, else the live
+ * classification (running, paused, hung, unresponsive, orphaned).
+ */
+export type OpsRun = {
+  run_id: string
+  workspace: string
+  kind?: string | null
+  trigger?: string | null
+  /** running | succeeded | failed | cancelled | paused | orphaned */
+  status: string
+  state: string
+  /** The run was marked orphaned and its owner later finished it (FR-17). */
+  was_orphaned?: boolean
+  worker_id?: string | null
+  pid?: Num
+  worker_alive?: boolean | null
+  started_at?: string | null
+  heartbeat_at?: string | null
+  progress_at?: string | null
+  finished_at?: string | null
+  heartbeat_age_s?: Num
+  progress_age_s?: Num
+  /** Seconds from start to finish (or to now while running). */
+  duration_s?: Num
+  docs_total?: Num
+  docs_done?: Num
+  docs_failed?: Num
+  stage?: string | null
+  /** Redacted, path-masked job name. */
+  label?: string | null
+  error_kind?: string | null
+  /** Redacted. */
+  error_summary?: string | null
+  request_id?: string | null
+  /** Live pipeline flags for a running run, when the server read them. */
+  live?: LiveFlags | null
+  pause?: ActiveRun['pause']
+}
+
+/** Run history, newest first, keyset-paged by `next_before` (null on the last page). */
+export type OpsRuns = Generated & { items: OpsRun[]; next_before: string | null; enabled?: boolean }
+
+/**
+ * One classified document failure (LIGHTRAG_OPS_DOC_FAILURES, §3.5): which
+ * stage failed, why (`error_kind`), on which model and attempt. The message
+ * is redacted and path-masked on the server.
+ */
+export type DocFailure = {
+  ts: string
+  workspace?: string | null
+  doc_id?: string | null
+  track_id?: string | null
+  run_id?: string | null
+  stage?: string | null
+  error_kind?: string | null
+  http_status?: Num
+  exc_type?: string | null
+  message?: string | null
+  attempt?: Num
+  model?: string | null
+  file_path_masked?: string | null
+}
+
+/** The doc's current failure (doc-status `metadata.failure`), carried over until it is processed. */
+export type DocFailureState = {
+  stage?: string | null
+  error_kind?: string | null
+  http_status?: Num
+  attempt?: Num
+  first_failed_at?: string | null
+  last_failed_at?: string | null
+  last_run_id?: string | null
+  model?: string | null
+}
+
+export type RunDetail = Generated & {
+  /** null only when the server answered without a run (treated as not found). */
+  run: OpsRun | null
+  /** Documents that failed in this run (at most 200), newest first. */
+  failures: DocFailure[]
+  /** Log lines carrying this run_id; null until the log viewer ships. */
+  log_count: Num
 }
 
 export type BacklogCounts = {
@@ -225,12 +325,35 @@ export type StuckRun = {
   workspace: string
   run_id?: string | null
   pid?: Num
+  worker_id?: string | null
   age_s?: Num
-  reason?: string | null
+  /**
+   * Why the row is stuck, as a code the view translates (operations.stuck.why.*):
+   * busy without a run: no_run | run_unknown | run_finished; reservations:
+   * owner_dead | owner_unknown | no_owner | held. Never shown as-is.
+   */
+  reason_code?: string | null
   since?: string | null
+  kind?: string | null
+  label?: string | null
+  /** A run's live classification; `unresponsive` for a hung-class run whose owner stopped beating. */
+  state?: string | null
+  /** The run's owner worker stopped sending heartbeats (its process still exists). */
+  owner_unresponsive?: boolean | null
+  heartbeat_age_s?: Num
+  progress_age_s?: Num
+  worker_heartbeat_age_s?: Num
+  /** Reservations: which flag is held without an owner. */
+  scanning?: boolean | null
+  pending_enqueues?: Num
+  /** Orphaned: how the owner's death was confirmed (pid_gone, create_time, exit_marker, exited, superseded, host_gone). */
+  confirmed_by?: string | null
 }
 
 export type StuckThresholds = { orphan_s?: Num; hung_min?: Num; doc_min?: Num }
+
+/** What the stuck check covered, for the "Nothing stuck. Checked …" sentence. */
+export type StuckChecked = { workspaces?: Num; runs?: Num; candidates?: Num; at?: string | null }
 
 export type Stuck = Generated & {
   orphaned: StuckRun[]
@@ -239,8 +362,11 @@ export type Stuck = Generated & {
   reservations: StuckRun[]
   stale_docs: { items: StaleDoc[]; total: number; page?: number; page_size?: number }
   thresholds: StuckThresholds
-  /** Which classes the server actually checked (only stale docs before run tracking). */
+  /** Which classes the server actually checked (only stale docs while run tracking is off). */
   checked_classes?: string[]
+  checked?: StuckChecked | null
+  /** When the reconcile pass behind the run classes last ran. */
+  reconciled_at?: string | null
 }
 
 export type WorkspaceRow = {
@@ -271,6 +397,8 @@ export type FailureGroup = {
   example?: string | null
   /** Legacy rows: what `key` is (signature, workspace or cancelled); the docs query uses it as the group. */
   kind?: string | null
+  /** Durable error_kind groups: the provider HTTP status most rows carried (402, 429, …). */
+  http_status?: Num
 }
 
 export type Failures = Generated & {
@@ -280,7 +408,7 @@ export type Failures = Generated & {
   legacy: FailureGroup[]
   /** How legacy rows are grouped for the chosen group (signature or workspace). */
   legacy_group?: string | null
-  /** False until failure kinds are recorded at the source. */
+  /** False when failure kinds are not recorded (run tracking off, or a server one release behind). */
   durable?: boolean
 }
 
@@ -291,6 +419,14 @@ export type FailureDoc = {
   file_path_masked?: string | null
   updated_at?: string | null
   error_redacted?: string | null
+  /** Durable groups: the classified failure. */
+  ts?: string | null
+  run_id?: string | null
+  stage?: string | null
+  error_kind?: string | null
+  http_status?: Num
+  attempt?: Num
+  model?: string | null
 }
 
 export type EmailQueueItem = {
@@ -302,7 +438,13 @@ export type EmailQueueItem = {
   last_result_class?: string | null
   reason?: string | null
   last_ok_at?: string | null
-  drainer?: { worker_id?: string | null; state?: string | null; backoff_until?: string | null } | null
+  /** When the drainer last tried (KV resync:<ws>), and the backoff deadline before its next try (FR-32). */
+  last_attempt_at?: string | null
+  backoff_until?: string | null
+  /** Drain outcomes of the last hour (FR-15); null when the server does not know. */
+  drains_1h?: { ok: number; failed: number; slot_busy: number } | null
+  /** The live drainer for this workspace, from worker heartbeats. */
+  drainer?: { worker_id?: string | null; pid?: Num; state?: string | null; backoff_until?: string | null } | null
 }
 
 export type EmailQueue = Generated & {
@@ -343,6 +485,11 @@ export type Pauses = Generated & {
 // ---------- drawers ----------
 
 export type WorkspaceLive = LiveFlags & {
+  /** Owner keys written by run tracking: which run and process hold `busy`. */
+  run_id?: string | null
+  owner_worker_id?: string | null
+  owner_pid?: Num
+  heartbeat_at?: string | null
   job_name?: string | null
   job_start?: string | null
   docs?: Num
@@ -364,8 +511,10 @@ export type WorkspaceDetail = Generated & {
   counts?: BacklogCounts & { processed?: Num }
   email_queue?: Omit<EmailQueueItem, 'workspace'> | null
   pause?: PauseItem[] | null
-  recent_runs?: { run_id?: string | null; kind?: string | null; state?: string | null; started_at?: string | null; docs_done?: Num; docs_total?: Num }[]
-  failures_by_kind?: { key: string; count: number }[]
+  /** The latest five runs, newest first. */
+  recent_runs?: OpsRun[]
+  /** Classified failures in the last 7 days, most frequent first. */
+  failures_by_kind?: { key: string; count: number; http_status?: Num }[]
   errors_1h?: Num
 }
 
@@ -423,9 +572,11 @@ export type DocumentDetail = Generated & {
     created_at?: string | null
     updated_at?: string | null
     error_redacted?: string | null
-    failure?: Record<string, unknown> | null
+    /** The current classified failure; null when the doc is not failed or failed before run tracking. */
+    failure?: DocFailureState | null
   }
-  failures: { ts: string; run_id?: string | null; stage?: string | null; error_kind?: string | null; attempt?: Num; model?: string | null }[]
+  /** Failure history for this doc (attempts), newest first. */
+  failures: DocFailure[]
   calls: LlmCall[]
   /** False when Token Insights is not recording, so calls cannot be listed. */
   calls_available?: boolean
@@ -599,10 +750,7 @@ export const opsApi = {
   status: (signal?: AbortSignal) => get<OpsStatus>('/status', undefined, signal),
   overview: async (signal?: AbortSignal) => normalizeOverview(await get('/overview', undefined, signal)),
   summary: async (signal?: AbortSignal) => normalizeSummary(await get('/processing/summary', undefined, signal)),
-  active: async (signal?: AbortSignal): Promise<ActiveRuns> => {
-    const data = (await get<Partial<ActiveRuns>>('/processing/active', undefined, signal)) ?? {}
-    return { ...data, runs: Array.isArray(data.runs) ? data.runs : [] }
-  },
+  active: async (signal?: AbortSignal): Promise<ActiveRuns> => normalizeActive(await get('/processing/active', undefined, signal)),
   stuck: async (params: Params, signal?: AbortSignal) => normalizeStuck(await get('/processing/stuck', params, signal)),
   workspaces: async (params: Params, signal?: AbortSignal) => normalizePage<WorkspaceRow>(await get('/processing/workspaces', params, signal)),
   failures: async (params: Params, signal?: AbortSignal) => normalizeFailures(await get('/processing/failures', params, signal)),
@@ -619,6 +767,9 @@ export const opsApi = {
   document: async (ws: string, docId: string, signal?: AbortSignal) =>
     normalizeDocument(await get(`/workspaces/${enc(ws)}/documents/${enc(docId)}`, undefined, signal)),
   events: async (params: Params, signal?: AbortSignal) => normalizeEvents(await get('/events', params, signal)),
+  /** Run history (FR-17), newest first; pass the previous answer's `next_before` for the next page. */
+  runs: async (params: Params, signal?: AbortSignal) => normalizeRuns(await get('/runs', params, signal)),
+  run: async (runId: string, signal?: AbortSignal) => normalizeRunDetail(await get(`/runs/${enc(runId)}`, undefined, signal)),
   health: async (signal?: AbortSignal) => normalizeHealth(await get('/health', undefined, signal)),
   dependency: async (dep: string, hours: number, signal?: AbortSignal) =>
     normalizeDepDetail(dep, await get(`/health/${enc(dep)}`, { hours }, signal)),

@@ -6,7 +6,8 @@ import { FailureGroup, opsApi } from '../api'
 import ErrorPanel from '../components/ErrorPanel'
 import { Pager, Panel } from '../components/Panel'
 import Skeleton from '../components/Skeleton'
-import { useOpsNav } from '../context'
+import { useOpsNav, useOpsShell } from '../context'
+import { ErrorKindText } from '../drawers/RunDrawer'
 import { fmtClock, fmtCount, shortId, utcTitle } from '../format'
 import { useOpsPoll } from '../poll'
 
@@ -19,7 +20,8 @@ const LEGACY_GROUP = 'signature'
 
 type Period = (typeof WINDOWS)[number]
 type Group = (typeof GROUPS)[number]
-type Picked = { key: string; group: string; label: string }
+/** A group's documents to list; `source` says which side a name used by both (workspace) comes from. */
+type Picked = { key: string; group: string; label: string; source: 'legacy' | 'durable' }
 
 /** What a legacy row's key is: a message signature, a workspace, or the cancellations bucket. */
 const legacyKind = (row: FailureGroup, fallback: string | null | undefined) => row.kind || fallback || LEGACY_GROUP
@@ -32,7 +34,7 @@ function GroupLabel({ group, row, legacy, legacyGroup }: { group: string; row: F
     if (kind === 'workspace') return <span className="break-all">{row.key || '–'}</span>
     return <>{t('operations.failures.legacyLabel')}</>
   }
-  if (group === 'error_kind') return <>{t(`operations.errorKind.${row.key}`, { defaultValue: row.key })}</>
+  if (group === 'error_kind') return <ErrorKindText kind={row.key} status={row.http_status} />
   if (group === 'stage') return <>{t(`operations.stage.${row.key}`, { defaultValue: row.key })}</>
   return <span className="break-all">{row.key || '–'}</span>
 }
@@ -43,8 +45,8 @@ function GroupDocs({ picked, period, onClose }: { picked: Picked; period: Period
   const nav = useOpsNav()
   const [page, setPage] = useState(1)
   const poll = useOpsPoll(
-    (signal) => opsApi.failureDocs({ key: picked.key, group: picked.group, window: period, page }, signal),
-    [picked.key, picked.group, period, page],
+    (signal) => opsApi.failureDocs({ key: picked.key, group: picked.group, window: period, page, source: picked.source }, signal),
+    [picked.key, picked.group, picked.source, period, page],
     FAILURES_SECONDS
   )
   const data = poll.data
@@ -72,6 +74,16 @@ function GroupDocs({ picked, period, onClose }: { picked: Picked; period: Period
                   <span className="text-muted-foreground font-mono text-xs" title={utcTitle(d.updated_at)}>
                     {fmtClock(d.updated_at ?? null)}
                   </span>
+                  {d.error_kind || d.stage ? (
+                    <span className="col-span-2 text-xs">
+                      {d.stage ? `${t(`operations.stage.${d.stage}`, { defaultValue: d.stage })} · ` : ''}
+                      <span className="font-medium">
+                        <ErrorKindText kind={d.error_kind} status={d.http_status} />
+                      </span>
+                      {d.model ? <span className="text-muted-foreground font-mono"> · {d.model}</span> : null}
+                      {typeof d.attempt === 'number' ? <span className="text-muted-foreground"> · {t('operations.document.attempt', { n: d.attempt })}</span> : null}
+                    </span>
+                  ) : null}
                   <span className="text-muted-foreground col-span-2 truncate text-xs">
                     {d.workspace}
                     {d.error_redacted ? ` · ${d.error_redacted}` : ''}
@@ -123,7 +135,17 @@ function GroupTable({
         <tbody>
           {rows.map((r) => {
             const kind = legacy ? legacyKind(r, legacyGroup) : group
-            const label = !legacy || kind === 'workspace' ? r.key : kind === 'cancelled' ? t('operations.failures.cancelledLabel') : t('operations.failures.legacyLabel')
+            const label = legacy
+              ? kind === 'workspace'
+                ? r.key
+                : kind === 'cancelled'
+                  ? t('operations.failures.cancelledLabel')
+                  : t('operations.failures.legacyLabel')
+              : group === 'error_kind'
+                ? t(`operations.errorKind.${r.key}`, { defaultValue: r.key })
+                : group === 'stage'
+                  ? t(`operations.stage.${r.key}`, { defaultValue: r.key })
+                  : r.key
             return (
               <tr key={`${legacy ? 'legacy' : group}:${r.key}`} className="border-b align-top last:border-0">
                 <td className="p-2 font-medium" data-label={legacy ? col('signature') : t(`operations.failures.group.${group}`)}>
@@ -148,7 +170,7 @@ function GroupTable({
                   <button
                     type="button"
                     className="hover:bg-muted min-h-7 rounded-lg border px-2.5 text-xs whitespace-nowrap"
-                    onClick={() => onPick({ key: r.key, group: kind, label })}
+                    onClick={() => onPick({ key: r.key, group: kind, label, source: legacy ? 'legacy' : 'durable' })}
                   >
                     {col('docs')}
                   </button>
@@ -163,13 +185,17 @@ function GroupTable({
 }
 
 /**
- * Failure analysis (§2.4, FR-14). Real failures only: duplicates are
- * excluded and cancellations are counted separately (or included on
- * request). Until run tracking records failure kinds, older failures are
- * grouped by a normalised message signature ("unclassified (legacy)").
+ * Failure analysis (§2.4, FR-14): classified failures from the failure
+ * history, grouped by kind, stage, workspace or model, with first and last
+ * seen, a masked example and a drill to the documents. Real failures only:
+ * duplicates are excluded and cancellations are counted separately (or
+ * included on request). Failures recorded before classification existed
+ * (or while run tracking is off) are grouped by a normalised message
+ * signature under "Unclassified (legacy)".
  */
 export default function FailuresView() {
   const { t } = useTranslation()
+  const { status } = useOpsShell()
   const [period, setPeriod] = useState<Period>('24h')
   const [group, setGroup] = useState<Group>('error_kind')
   const [includeCancelled, setIncludeCancelled] = useState(false)
@@ -210,6 +236,11 @@ export default function FailuresView() {
             </label>
           </div>
           {data.groups.length ? <GroupTable rows={data.groups} group={group} legacy={false} onPick={setPicked} /> : null}
+          {data.durable === false ? (
+            <p className="text-muted-foreground m-0 text-xs">
+              {status?.features?.runs === false ? t('operations.failures.trackingOff') : t('operations.failures.notDurable')}
+            </p>
+          ) : null}
           {data.legacy?.length ? (
             <div className="flex flex-col gap-1.5">
               <h3 className="m-0 text-[13px] font-semibold">{t('operations.failures.legacyTitle')}</h3>
@@ -220,7 +251,7 @@ export default function FailuresView() {
           {!data.groups.length && !data.legacy?.length ? (
             <p className="text-muted-foreground m-0 text-sm">{t('operations.failures.none', { window: t(`operations.failures.windows.${period}`) })}</p>
           ) : null}
-          {picked ? <GroupDocs key={`${picked.group}:${picked.key}:${period}`} picked={picked} period={period} onClose={() => setPicked(null)} /> : null}
+          {picked ? <GroupDocs key={`${picked.source}:${picked.group}:${picked.key}:${period}`} picked={picked} period={period} onClose={() => setPicked(null)} /> : null}
           <p className="text-muted-foreground m-0 text-xs">{t('operations.maskNote')}</p>
         </div>
       )}

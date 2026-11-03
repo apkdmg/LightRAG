@@ -187,7 +187,8 @@ async def purge_workspace(
 
     rag = await workspace_manager.begin_deletion(workspace_id)
     try:
-        acquired, reason = await _acquire_destructive_busy(rag)
+        # No run is recorded: the workspace's ops rows are removed with it.
+        acquired, reason = await _acquire_destructive_busy(rag, run_kind=None)
         if not acquired:
             raise WorkspaceBusyError(reason)
         try:

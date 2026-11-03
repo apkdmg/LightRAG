@@ -3,7 +3,7 @@ import { Bar, BarChart, CartesianGrid, ReferenceLine, ResponsiveContainer, Toolt
 import { OpsEvent, TimelineBucket, opsApi } from '../api'
 import { fmtClock, fmtCount, utcTitle } from '../format'
 import { OPS_CHART } from '../motion'
-import { useOpsOverview } from '../context'
+import { useOpsOverview, useOpsShell } from '../context'
 import { OVERVIEW_REFRESH_SECONDS, TIMELINE_HOURS, TIMELINE_REFRESH_SECONDS, markerOffset } from '../overview'
 import { OpsPoll, useOpsPoll } from '../poll'
 import { Panel } from './Panel'
@@ -103,6 +103,7 @@ function MarkerStrip({ events, from, to }: { events: OpsEvent[]; from: number; t
  */
 export default function TimelinePanel({ buckets, events }: { buckets: TimelineBucket[] | null | undefined; events?: OpsEvent[] | null }) {
   const { t } = useTranslation()
+  const { status } = useOpsShell()
   // The overview already carries the last 6 hours of markers; only an older server needs /events.
   const fromOverview = Array.isArray(events)
   const poll = useOpsPoll(
@@ -144,7 +145,11 @@ export default function TimelinePanel({ buckets, events }: { buckets: TimelineBu
             ) : (
               <p className="text-muted-foreground m-0 text-xs">{t('operations.timeline.noEvents', { hours: TIMELINE_HOURS })}</p>
             )}
-            {!buckets?.length ? <p className="text-muted-foreground m-0 text-xs">{t('operations.timeline.noBuckets')}</p> : null}
+            {!buckets?.length ? (
+              <p className="text-muted-foreground m-0 text-xs">
+                {status?.features?.runs ? t('operations.timeline.noWork', { hours: TIMELINE_HOURS }) : t('operations.timeline.noBuckets')}
+              </p>
+            ) : null}
           </div>
         )
       }}
