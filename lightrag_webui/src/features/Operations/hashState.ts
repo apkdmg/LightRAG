@@ -114,3 +114,34 @@ export function writeOpsHash(state: OpsHash): string {
   if (state.logQuery) q.set('olq', state.logQuery)
   return `#/?${q.toString()}`
 }
+
+/** A drill-down target from the server (attention items, KPI tiles). */
+export type HashTarget = {
+  tab?: string | null
+  sub?: string | null
+  workspace?: string | null
+  doc_id?: string | null
+  run_id?: string | null
+}
+
+/**
+ * The view a target opens, starting from the current one: a valid tab and
+ * sub-view switch the page, a workspace (and doc) opens its drawer. Run
+ * drawers arrive with run tracking, so a run target falls back to its
+ * workspace. Anything malformed is ignored, never trusted.
+ */
+export function viewForTarget(base: OpsHash, target: HashTarget | null | undefined): OpsHash {
+  if (!target) return base
+  const tab: OpsTab = target.tab && (OPS_TABS as readonly string[]).includes(target.tab) ? (target.tab as OpsTab) : base.tab
+  const sub = target.sub && OPS_SUBS[tab].includes(target.sub) ? target.sub : tab === base.tab ? base.sub : null
+  const workspace = cleanId(target.workspace ?? null)
+  const docId = cleanId(target.doc_id ?? null)
+  let drawer: Drawer | null = tab === base.tab ? base.drawer : null
+  if (workspace && docId) drawer = { kind: 'document', workspace, id: docId }
+  else if (workspace) drawer = { kind: 'workspace', id: workspace }
+  return { tab, sub, drawer, logQuery: null }
+}
+
+/** Two drawers are the same entity (the URL can name only one). */
+export const sameDrawer = (a: Drawer | null, b: Drawer | null) =>
+  a === b || (!!a && !!b && a.kind === b.kind && a.id === b.id && (a.kind !== 'document' || (b.kind === 'document' && a.workspace === b.workspace)))

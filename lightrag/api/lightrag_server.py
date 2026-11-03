@@ -70,6 +70,8 @@ from lightrag.api.ops.redact import text_ref
 from lightrag.api.routers.ops_routes import configure_ops
 from lightrag.api.routers.ops_routes import router as ops_router
 from lightrag.api.insights.runtime import start_insights as _start_insights
+from lightrag.api.ops.runtime import start_ops as _start_ops
+from lightrag.api.ops.runtime import stop_ops as _stop_ops
 from lightrag.api.insights.runtime import stop_insights as _stop_insights
 from lightrag.api.routers.insights_routes import router as insights_router
 from lightrag.api.routers.email_routes import create_email_routes
@@ -539,6 +541,9 @@ def create_app(args):
                 await registry.initialize()
 
             await _start_insights(app, rag, args)
+            # Operations console: store, background index build, leased loops.
+            # Never blocks or fails startup.
+            await _start_ops(app, rag, args)
 
             resync_queue = getattr(app.state, "email_resync_queue", None)
             if resync_queue is not None:
@@ -591,6 +596,7 @@ def create_app(args):
             if resync_queue is not None:
                 await resync_queue.stop()
 
+            await _stop_ops(app)
             await _stop_insights(app)
 
             registry = getattr(app.state, "workspace_registry", None)

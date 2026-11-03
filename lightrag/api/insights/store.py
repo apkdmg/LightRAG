@@ -44,6 +44,8 @@ SUM_METRICS = (
     "priced_completion_tokens",
 )
 BACKFILL_SOURCE = "backfill"
+# Largest page of individual calls one read returns; older pages use before_ts.
+CALLS_LIMIT_MAX = 200
 CALL_RETENTION_DAYS = 90
 HOURLY_RETENTION_DAYS = 730
 UNKNOWN_MODEL = "unknown"
@@ -99,6 +101,41 @@ def record_metrics(record: UsageRecord) -> dict[str, float]:
         "priced_prompt_tokens": 0 if reported else record.prompt_tokens,
         "priced_completion_tokens": 0 if reported else record.completion_tokens,
     }
+
+
+def llm_rates(row: dict[str, Any]) -> dict[str, float]:
+    """Error, truncation and abandon rates over attempted (non-cache) calls.
+
+    The one definition shared by Token Insights and the Operations console, so
+    both pages show the same number for the same window.
+    """
+    attempts = row.get("calls") or 0
+    if not attempts:
+        return {"error_rate": 0.0, "truncated_rate": 0.0, "abandoned_rate": 0.0}
+    return {
+        "error_rate": (row.get("errors") or 0) / attempts,
+        "truncated_rate": (row.get("truncated") or 0) / attempts,
+        "abandoned_rate": (row.get("abandoned") or 0) / attempts,
+    }
+
+
+def _clamp_limit(limit: int) -> int:
+    return max(1, min(int(limit), CALLS_LIMIT_MAX))
+
+
+def _epoch(value: Any) -> float:
+    return value.timestamp() if isinstance(value, datetime) else float(value)
+
+
+def _percentile(sorted_values: list[float], fraction: float) -> Optional[float]:
+    """Linear interpolation, like Postgres ``percentile_cont``."""
+    if not sorted_values:
+        return None
+    position = (len(sorted_values) - 1) * fraction
+    low = int(position)
+    high = min(low + 1, len(sorted_values) - 1)
+    weight = position - low
+    return float(sorted_values[low] * (1 - weight) + sorted_values[high] * weight)
 
 
 def rollup_increments(
@@ -174,7 +211,21 @@ class UsageStore(ABC):
         doc_id: Optional[str] = None,
         client: Optional[str] = None,
         limit: int = 100,
-    ) -> list[dict[str, Any]]: ...
+        before_ts: Optional[Any] = None,
+    ) -> list[dict[str, Any]]:
+        """Newest first, at most ``CALLS_LIMIT_MAX``; ``before_ts`` (epoch
+        seconds or datetime) pages further back."""
+
+    @abstractmethod
+    async def llm_health(
+        self,
+        start: datetime,
+        end: datetime,
+        *,
+        filters: Optional[dict[str, str]] = None,
+    ) -> dict[str, Any]:
+        """Attempts, failures and latency percentiles (cache hits excluded),
+        plus :func:`llm_rates`. Shared by Insights and the Operations console."""
 
     @abstractmethod
     async def latency_p95(
@@ -349,16 +400,48 @@ class MemoryUsageStore(UsageStore):
         return rows[:limit]
 
     async def calls(
-        self, start, end, *, filters=None, doc_id=None, client=None, limit=100
+        self,
+        start,
+        end,
+        *,
+        filters=None,
+        doc_id=None,
+        client=None,
+        limit=100,
+        before_ts=None,
     ):
+        before = _epoch(before_ts) if before_ts is not None else None
         rows = [
             asdict(r)
             for r in self._matching_calls(start, end, filters)
             if (doc_id is None or r.doc_id == doc_id)
             and (client is None or r.client == client)
+            and (before is None or r.ts < before)
         ]
         rows.sort(key=lambda x: -x["ts"])
-        return rows[:limit]
+        return rows[: _clamp_limit(limit)]
+
+    async def llm_health(self, start, end, *, filters=None):
+        row = dict.fromkeys(
+            ("calls", "cache_hits", "errors", "truncated", "abandoned"), 0
+        )
+        latencies: list[float] = []
+        for r in self._matching_calls(start, end, filters):
+            if r.cache_hit:
+                row["cache_hits"] += 1
+                continue
+            row["calls"] += 1
+            latencies.append(r.latency_ms)
+            if r.status in ("error", "truncated", "abandoned"):
+                row["errors" if r.status == "error" else r.status] += 1
+        latencies.sort()
+        return {
+            **row,
+            "p50_ms": _percentile(latencies, 0.5),
+            "p95_ms": _percentile(latencies, 0.95),
+            "p99_ms": _percentile(latencies, 0.99),
+            **llm_rates(row),
+        }
 
     async def latency_p95(self, start, end, *, filters=None):
         values: dict[str, list[int]] = defaultdict(list)
@@ -720,7 +803,15 @@ class PostgresUsageStore(UsageStore):
         )
 
     async def calls(
-        self, start, end, *, filters=None, doc_id=None, client=None, limit=100
+        self,
+        start,
+        end,
+        *,
+        filters=None,
+        doc_id=None,
+        client=None,
+        limit=100,
+        before_ts=None,
     ):
         params: list[Any] = [start, end]
         conditions = ["ts >= $1", "ts < $2"]
@@ -731,7 +822,10 @@ class PostgresUsageStore(UsageStore):
         if client is not None:
             params.append(client)
             conditions.append(f"client = ${len(params)}")
-        params.append(limit)
+        if before_ts is not None:
+            params.append(datetime.fromtimestamp(_epoch(before_ts), timezone.utc))
+            conditions.append(f"ts < ${len(params)}")
+        params.append(_clamp_limit(limit))
         rows = await self._rows(
             f"""SELECT EXTRACT(EPOCH FROM ts)::float8 AS ts, workspace, purpose, operation,
                 source, model, billing, prompt_tokens, completion_tokens,
@@ -742,6 +836,36 @@ class PostgresUsageStore(UsageStore):
             params,
         )
         return rows
+
+    async def llm_health(self, start, end, *, filters=None):
+        params: list[Any] = [start, end]
+        conditions = ["ts >= $1", "ts < $2"]
+        self._where(filters, params, conditions)
+        rows = await self._rows(
+            f"""SELECT
+                COUNT(*) FILTER (WHERE NOT cache_hit)::bigint AS calls,
+                COUNT(*) FILTER (WHERE cache_hit)::bigint AS cache_hits,
+                COUNT(*) FILTER (WHERE NOT cache_hit AND status = 'error')::bigint AS errors,
+                COUNT(*) FILTER (WHERE NOT cache_hit AND status = 'truncated')::bigint AS truncated,
+                COUNT(*) FILTER (WHERE NOT cache_hit AND status = 'abandoned')::bigint AS abandoned,
+                percentile_cont(ARRAY[0.5, 0.95, 0.99]) WITHIN GROUP (ORDER BY latency_ms)
+                    FILTER (WHERE NOT cache_hit) AS pct
+            FROM {_TABLE_CALLS} WHERE {" AND ".join(conditions)}""",
+            params,
+        )
+        row = dict(rows[0]) if rows else {}
+        pct = row.pop("pct", None) or [None, None, None]
+        out = {
+            k: int(row.get(k) or 0)
+            for k in ("calls", "cache_hits", "errors", "truncated", "abandoned")
+        }
+        return {
+            **out,
+            "p50_ms": float(pct[0]) if pct[0] is not None else None,
+            "p95_ms": float(pct[1]) if pct[1] is not None else None,
+            "p99_ms": float(pct[2]) if pct[2] is not None else None,
+            **llm_rates(out),
+        }
 
     async def latency_p95(self, start, end, *, filters=None):
         params: list[Any] = [start, end]

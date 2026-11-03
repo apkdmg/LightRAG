@@ -40,6 +40,13 @@ _READABLE_VERSIONS = (1, 2)
 GetRag = Callable[[str], Awaitable[Any]]
 
 
+def workspace_for_dir(name: str) -> Optional[str]:
+    """The workspace a queue directory belongs to; None for anything else."""
+    if not _SAFE_WORKSPACE.fullmatch(name) or name in (".", ".."):
+        return None
+    return "" if name == _DEFAULT_WORKSPACE_DIR else name
+
+
 class DeferredResyncQueue:
     def __init__(
         self,
@@ -60,6 +67,11 @@ class DeferredResyncQueue:
         self._closed = False
 
     # -- paths -----------------------------------------------------------
+    @property
+    def base_dir(self) -> Path:
+        """Root of the per-workspace queue directories (read by the ops scan)."""
+        return self._base
+
     def _dir(self, workspace: str) -> Path:
         name = workspace or _DEFAULT_WORKSPACE_DIR
         if not _SAFE_WORKSPACE.fullmatch(name) or name in (".", ".."):

@@ -27,7 +27,7 @@ from lightrag.utils import logger
 
 from . import analytics as an
 from .recorder import LOST_ROWS_KEY
-from .store import DIMENSIONS, SUM_METRICS, UsageStore
+from .store import DIMENSIONS, SUM_METRICS, UsageStore, llm_rates
 
 SETTINGS_KEY = "settings"
 ANOMALY_STATE_KEY = "anomaly_state"
@@ -795,7 +795,7 @@ class InsightsService:
         )
         today_rows = await self._rows(today, today, [], filters=filters)
         today_row = today_rows[0] if today_rows else {}
-        attempts = today_row.get("calls", 0)
+        today_rates = llm_rates(today_row)
         queues = await self.live()
         keys = self.workspace_keys(workspace)
         byo_share = total.get("byo_tokens", 0) / tokens if tokens else 0
@@ -877,12 +877,8 @@ class InsightsService:
             "health": {
                 "queue": queues["purposes"].get(purpose),
                 "p95_ms": p95.get(purpose),
-                "error_rate": _round(today_row.get("errors", 0) / attempts, 4)
-                if attempts
-                else 0,
-                "truncated_rate": _round(today_row.get("truncated", 0) / attempts, 4)
-                if attempts
-                else 0,
+                "error_rate": _round(today_rates["error_rate"], 4),
+                "truncated_rate": _round(today_rates["truncated_rate"], 4),
                 "tokens_today": today_row.get("tokens", 0),
                 "not_measured": total.get("not_measured", 0),
             },

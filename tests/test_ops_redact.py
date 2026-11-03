@@ -9,6 +9,7 @@ import time
 import pytest
 
 from lightrag.api.ops.redact import (
+    redact_pipeline,
     EXC_MAX_CHARS,
     MSG_MAX_CHARS,
     RedactFilter,
@@ -462,3 +463,79 @@ def test_file_and_console_handler_output_is_redacted(tmp_path, capsys):
         for handler in list(target.handlers):
             handler.close()
             target.removeHandler(handler)
+
+
+# -- legacy pipeline text shown by the Operations console (D9) -----------------------
+
+_PIPELINE_CORPUS = [
+    (
+        "Failed to extract document 1/3: Minit Mesyuarat Jabatan Keselamatan.pdf",
+        "Failed to extract document 1/3: Min•••an.pdf",
+    ),
+    (
+        "Merging stage failed in document 2/3: inputs/a/Surat Tawaran Ali bin Abu.pdf",
+        "Merging stage failed in document 2/3: Sur•••bu.pdf",
+    ),
+    (
+        "User cancelled during merge 1/4: inputs/user1/Minit Mesyuarat Jabatan.docx",
+        "User cancelled during merge 1/4: Min•••an.docx",
+    ),
+    (
+        "Completed processing file 3/10: senarai_pelajar_ahmad_bin_ali.json",
+        "Completed processing file 3/10: sen•••li.json",
+    ),
+    ("Merging stage 4/9: config dump.xml", "Merging stage 4/9: con•••mp.xml"),
+    (
+        "Duplicate content skipped after parsing: Laporan Kewangan Ali bin Abu "
+        "2024.docx; archived to /srv/archive/Laporan Kewangan Ali bin Abu 2024.docx",
+        "Duplicate content skipped after parsing: Lap•••.docx; archived to Lap•••.docx",
+    ),
+    (
+        "Deleting doc-0a1b2c3d Surat Tawaran Ali bin Abu.pdf(previous status: FAILED)",
+        "Deleting doc-0a1b2c3d Sur•••bu.pdf(previous status: FAILED)",
+    ),
+    (
+        "Error deleting document 2/5: doc-0a1b[Big Report (final).xml] - not found",
+        "Error deleting document 2/5: doc-0a1b[Big•••l).xml] - not found",
+    ),
+    (
+        "Skipping already processed file: data export 2024.json",
+        "Skipping already processed file: dat•••.json",
+    ),
+    (
+        "Failed to delete file Big Report.pdf: Permission denied",
+        "Failed to delete file Big•••rt.pdf: Permission denied",
+    ),
+    (
+        "Successfully deleted source files: a b c.pdf, d e.json",
+        "Successfully deleted source files: a•••.pdf, d•••.json",
+    ),
+    # Lines that are not about a file stay as they were.
+    (
+        "Processed entity batch 1/3: 500 records (total: 10/20)",
+        "Processed entity batch 1/3: 500 records (total: 10/20)",
+    ),
+    ("Deleting document 1/3: doc-0a1b", "Deleting document 1/3: doc-0a1b"),
+]
+
+
+@pytest.mark.parametrize("raw,expected", _PIPELINE_CORPUS)
+def test_pipeline_lines_mask_the_whole_file_name(raw, expected):
+    assert redact_pipeline(raw) == expected
+    assert redact_pipeline(expected) == expected
+
+
+def test_pipeline_text_masks_a_known_path_anywhere():
+    path = "inputs/u/Minit Mesyuarat Jabatan.json"
+    text = "ValueError: could not parse Minit Mesyuarat Jabatan.json (row 3)"
+    assert (
+        redact_pipeline(text, paths=(path, None))
+        == "ValueError: could not parse Min•••an.json (row 3)"
+    )
+    # Multi-line text: each line on its own, other rules still apply.
+    two = "Extracting stage 1/2: My Notes.txt\nsent to someone@unimas.my"
+    out = redact_pipeline(two)
+    assert out.startswith("Extracting stage 1/2: My •••es.txt\n")
+    assert "someone@unimas.my" not in out
+    assert redact_pipeline(None) == ""
+    assert len(redact_pipeline("Merging stage 1/2: " + "x" * 5000, 100)) <= 100

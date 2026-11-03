@@ -51,24 +51,22 @@ describe('ProcessChip', () => {
   })
 })
 
-describe('OverviewTab', () => {
-  test('shows what /status reports and an honest later-release note', () => {
+describe('OverviewTab outside the shell', () => {
+  test('without the overview poll it still shows what /status reports', () => {
     const html = withShell(<OverviewTab />, status())
     expect(html).toContain('operations.system.title')
     expect(html).toContain('operations.system.storageOk')
     expect(html).toContain('operations.system.workersPending')
     expect(html).toContain('operations.feature.multiWorkerOnly')
-    expect(html).toContain('operations.later.overview.title')
+    expect(html).toContain('operations.system.singleProcessNote')
   })
 
   test('without PostgreSQL the storage row says so instead of failing', () => {
     expect(withShell(<OverviewTab />, status({ available: false }))).toContain('operations.system.storageMissing')
   })
 
-  test('renders the later-release note before the first status answer', () => {
-    const html = withShell(<OverviewTab />, null)
-    expect(html).not.toContain('operations.system.title')
-    expect(html).toContain('operations.later.overview.title')
+  test('renders nothing before the first status answer', () => {
+    expect(withShell(<OverviewTab />, null)).not.toContain('operations.system.title')
   })
 })
 

@@ -102,6 +102,8 @@ export type OpsPoll<T> = {
   slow: boolean
   /** When the shown data was last confirmed by the server (epoch ms). */
   updatedAt: number | null
+  /** When the poll before that one succeeded: "since" for change deltas. */
+  previousAt: number | null
   /** The shown data came from a baseline poll: render it without change animations. */
   baseline: boolean
   reload: () => void
@@ -126,6 +128,8 @@ export function useOpsPoll<T>(
   const [error, setError] = useState<OpsError | null>(null)
   const [loadedKey, setLoadedKey] = useState<string | null>(null)
   const [updatedAt, setUpdatedAt] = useState<number | null>(null)
+  const [previousAt, setPreviousAt] = useState<number | null>(null)
+  const lastAtRef = useRef<number | null>(null)
   const [baseline, setBaseline] = useState(true)
   const [slow, setSlow] = useState(false)
 
@@ -169,7 +173,10 @@ export function useOpsPoll<T>(
       setData((previous) => keepIfSame(previous, result))
       setError(null)
       setBaseline(isBaseline)
-      setUpdatedAt(Date.now())
+      const now = Date.now()
+      setPreviousAt(lastAtRef.current)
+      lastAtRef.current = now
+      setUpdatedAt(now)
       setLoadedKey(key)
     } catch (e) {
       if (id !== requestRef.current || isAbort(e)) return
@@ -239,5 +246,5 @@ export function useOpsPoll<T>(
   }, [load])
 
   const reload = useCallback(() => void load(), [load])
-  return { data, error, loading: loadedKey !== depsKey, slow, updatedAt, baseline, reload }
+  return { data, error, loading: loadedKey !== depsKey, slow, updatedAt, previousAt, baseline, reload }
 }

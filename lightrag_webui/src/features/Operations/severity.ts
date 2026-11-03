@@ -130,3 +130,44 @@ export const workersState = (expected: number | null | undefined, live: number |
   if (live <= 0) return 'critical'
   return live < expected ? 'warning' : 'ok'
 }
+
+/** A document's doc-status value as a state: processed OK, failed Critical, in flight Running, pending Unknown. */
+export const docStatusState = (status: string | null | undefined): OpsState => {
+  switch ((status ?? '').toLowerCase()) {
+    case 'processed':
+      return 'ok'
+    case 'failed':
+      return 'critical'
+    case 'parsing':
+    case 'analyzing':
+    case 'processing':
+      return 'running'
+    default:
+      return 'unknown'
+  }
+}
+
+/**
+ * A backlog row's state column. Failed docs and stale docs are a warning on a
+ * workspace row (hundreds of rows in red would hide what is urgent); hung is
+ * serious and orphaned critical, as for runs.
+ */
+export const workspaceRowState = (raw: string | null | undefined): OpsState => {
+  switch ((raw ?? '').toLowerCase()) {
+    case 'running':
+      return 'running'
+    case 'paused':
+      return 'paused'
+    case 'idle':
+      return 'ok'
+    case 'stale_doc':
+    case 'failed':
+      return 'warning'
+    case 'hung':
+      return 'serious'
+    case 'orphaned':
+      return 'critical'
+    default:
+      return 'unknown'
+  }
+}

@@ -1444,7 +1444,8 @@
       "operator": "Admin and operator",
       "adminOnly": "Admin (operator actions restricted)",
       "version": "Version",
-      "features": "Features"
+      "features": "Features",
+      "singleProcessNote": "One Uvicorn process. Orphan detection and Release busy exist only in multi-worker (Gunicorn) mode."
     },
     "feature": {
       "durable": "Durable operations storage",
@@ -1462,14 +1463,6 @@
     },
     "later": {
       "note": "This section arrives in a later release.",
-      "overview": {
-        "title": "System overview",
-        "body": "The overall state, key numbers, a needs-attention list, the last 6 hours of processing and a dependency summary will appear here."
-      },
-      "processing": {
-        "title": "Processing across workspaces",
-        "body": "Active runs, stuck runs and documents, the backlog by workspace, failure analysis, the email re-sync queue and provider pauses will appear here. Until then, the Documents tab shows the pipeline of your own workspace."
-      },
       "logs": {
         "title": "Logs",
         "body": "A searchable view of WARNING and ERROR log lines, redacted when they are written, will appear here. Error messages already show a Ref: request ID that matches the server log line."
@@ -1485,7 +1478,606 @@
       "activity": {
         "title": "Activity",
         "body": "Alerts, the audit log of admin actions, system events and incident export will appear here."
+      },
+      "runs": {
+        "title": "Run history",
+        "body": "Thirty days of runs (kind, trigger, duration, documents done and failed, outcome) arrive with run tracking in a later release. Until then, Active shows the interim list, labelled \"Approximate (interim)\"."
       }
+    },
+    "unavailableShort": "Not available: this view needs PostgreSQL KV storage (LIGHTRAG_KV_STORAGE=PGKVStorage).",
+    "maskNote": "File names are masked on the server. Revealing one is an audited action that arrives in a later release.",
+    "approximate": {
+      "label": "Approximate (interim)",
+      "hint": "Read from workspaces with documents in progress and a read-only snapshot of their pipeline state, before run tracking exists. A run can be missing or shown late."
+    },
+    "scope": {
+      "host": "host",
+      "worker": "worker {{pid}}",
+      "hint": "host: from PostgreSQL, the same whichever process answers. worker: this process only."
+    },
+    "overall": {
+      "healthy": "Healthy",
+      "degraded": "Degraded",
+      "down": "Down",
+      "unknown": "Unknown",
+      "maintenance": "Maintenance",
+      "stale": "Stale",
+      "count": {
+        "critical_one": "{{count}} critical",
+        "critical_other": "{{count}} critical",
+        "serious_one": "{{count}} serious",
+        "serious_other": "{{count}} serious",
+        "warning_one": "{{count}} warning",
+        "warning_other": "{{count}} warnings"
+      }
+    },
+    "kpi": {
+      "delta": "{{change}} since {{time}}",
+      "deltaNoTime": "{{change}} since the last refresh",
+      "active": {
+        "label": "Active runs",
+        "longest": "longest {{age}}",
+        "none": "nothing running"
+      },
+      "backlog": {
+        "label": "Backlog",
+        "sub": "in-flight docs",
+        "delta": "{{sign}}{{count}} in the last hour",
+        "oldest": "oldest {{age}}"
+      },
+      "failed": {
+        "label": "Failed 24h",
+        "sub": "real failures",
+        "cancelled": "+{{count}} cancelled",
+        "dup": "{{count}} dup excluded"
+      },
+      "stuck": {
+        "label": "Stuck",
+        "none": "nothing stuck",
+        "unknown": "not known right now",
+        "runs_one": "{{count}} run",
+        "runs_other": "{{count}} runs",
+        "docs_one": "{{count}} doc",
+        "docs_other": "{{count}} docs",
+        "reservations_one": "{{count}} reservation",
+        "reservations_other": "{{count}} reservations"
+      },
+      "email": {
+        "label": "Email queue",
+        "sub": "records waiting",
+        "longest": "oldest waiting {{age}}",
+        "bad_one": "{{count}} unreadable file",
+        "bad_other": "{{count}} unreadable files"
+      },
+      "llm": {
+        "label": "LLM 15m",
+        "errorRate": "{{rate}} err",
+        "sub": "p95 {{p95}} · {{calls}} calls",
+        "unavailable": "needs Token Insights recording"
+      },
+      "deps": {
+        "label": "Dependencies",
+        "sub": "probes passing",
+        "later": "probes arrive with Health"
+      },
+      "workers": {
+        "label": "Server",
+        "single": "1 process",
+        "sub": "workers reporting"
+      }
+    },
+    "attention": {
+      "title": "Needs attention",
+      "checked": "checked {{time}}",
+      "none": "No issues. Checked doc status for {{workspaces}} workspaces, {{active}} active runs and the email queue at {{time}}.",
+      "noneSimple": "No issues found in the checks that ran at {{time}}.",
+      "next": "Next: {{step}}",
+      "resolved": "resolved"
+    },
+    "rule": {
+      "workers_below_expected": {
+        "title": "Fewer workers than expected",
+        "runbook": "Open Health › Workers and check the container."
+      },
+      "manager_rtt": {
+        "title": "Shared state is slow to answer",
+        "runbook": "Check the workers' CPU; restart the container if it stays unresponsive."
+      },
+      "pg_probe": {
+        "title": "PostgreSQL is slow or down",
+        "runbook": "Check the Postgres container and its connections."
+      },
+      "pg_pool_wait": {
+        "title": "Waiting for database connections",
+        "runbook": "Look for long queries and the pool size."
+      },
+      "pg_connections": {
+        "title": "PostgreSQL connections nearly used up",
+        "runbook": "Find the clients holding connections."
+      },
+      "pg_blocked": {
+        "title": "Blocked database queries",
+        "runbook": "Open the Postgres dependency for the blocking query."
+      },
+      "dependency_down": {
+        "title": "A dependency is down",
+        "runbook": "Open the dependency and check its container."
+      },
+      "vllm_waiting": {
+        "title": "vLLM queue is long",
+        "runbook": "Compare with LightRAG's own call rate before blaming LightRAG load."
+      },
+      "llm_error_rate_15m": {
+        "title": "LLM error rate is high",
+        "runbook": "Check the provider's status and the key's spend limit. Cost is in Token Insights."
+      },
+      "llm_p95_15m": {
+        "title": "LLM calls are slow",
+        "runbook": "Compare with the provider's status page."
+      },
+      "provider_paused": {
+        "title_one": "{{countText}} workspace paused by the LLM provider",
+        "title_other": "{{countText}} workspaces paused by the LLM provider",
+        "runbook": "They resume on their own once a call succeeds. Keys are managed on the Providers page."
+      },
+      "embed_rerank_error_rate_15m": {
+        "title": "Embedding or rerank errors",
+        "runbook": "Check the vLLM containers."
+      },
+      "run_orphaned": {
+        "title": "Run orphaned",
+        "runbook": "Release busy, then run the pipeline again."
+      },
+      "run_hung": {
+        "title": "Run hung",
+        "runbook": "Open the workspace, then cancel the run or restart the container."
+      },
+      "reservation_without_owner": {
+        "title": "Stranded reservation",
+        "runbook": "Restart the container to clear it."
+      },
+      "stale_docs": {
+        "title_one": "{{countText}} document in progress too long",
+        "title_other": "{{countText}} documents in progress too long",
+        "runbook": "Open Stuck to see which workspaces they belong to."
+      },
+      "oldest_pending": {
+        "title": "Documents waiting a long time",
+        "runbook": "Open Backlog sorted by oldest."
+      },
+      "failure_spike": {
+        "title": "More failures than usual",
+        "runbook": "Open Failures and group by kind."
+      },
+      "email_queue_stalled": {
+        "title": "Email queue is not draining",
+        "runbook": "Open the email queue and check the last result."
+      },
+      "email_queue_bad": {
+        "title_one": "{{countText}} unreadable email queue file",
+        "title_other": "{{countText}} unreadable email queue files",
+        "runbook": "The drainer skips .bad files; check the server logs for the cause."
+      },
+      "email_ingest_silence": {
+        "title": "No emails received for a while",
+        "runbook": "Check the email connector, not LightRAG."
+      },
+      "http_5xx_rate_5m": {
+        "title": "Server errors on requests",
+        "runbook": "Open Logs filtered to errors."
+      },
+      "unauth_warning_lines_5m": {
+        "title": "Warnings from unauthenticated requests",
+        "runbook": "Look for a scanner or a misconfigured client."
+      },
+      "signin_failures_15m": {
+        "title": "Sign-in failures",
+        "runbook": "Check the identity provider."
+      },
+      "tls_cert_expiry": {
+        "title": "TLS certificate expires soon",
+        "runbook": "Renew the certificate."
+      },
+      "disk_free": {
+        "title": "Disk nearly full",
+        "runbook": "Free space on the host."
+      },
+      "log_sink_or_recorder_drops_5m": {
+        "title": "Records are being dropped",
+        "runbook": "Check database health and write volume."
+      },
+      "smtp_probe": {
+        "title": "Alert email is not being delivered",
+        "runbook": "Check the SMTP server."
+      }
+    },
+    "overview": {
+      "processingNow": "Processing now",
+      "allActive": "All active",
+      "deps": "Dependencies",
+      "depsLater": "Dependency checks (PostgreSQL, Milvus, Neo4j, vLLM, Docling, SMTP and sign-in) arrive with the Health tab."
+    },
+    "timeline": {
+      "title": "Last {{hours}} hours",
+      "chartLabel": "Documents processed and failed per hour over the last {{hours}} hours, with event markers",
+      "processed": "Processed",
+      "failed": "Failed",
+      "noEvents": "No deployments, provider rejections or admin actions in the last {{hours}} hours.",
+      "noBuckets": "Documents processed per hour arrive with run tracking. Token Insights › Work has the daily history."
+    },
+    "event": {
+      "deployment": "deploy",
+      "model_change": "model change",
+      "provider_rejection": "provider rejected",
+      "ingestion_resumed": "ingestion resumed",
+      "workspace_delete": "workspace deleted",
+      "run_orphaned": "run orphaned",
+      "ops_action": "admin action"
+    },
+    "sub": {
+      "label": "Processing view",
+      "active": "Active",
+      "stuck": "Stuck",
+      "backlog": "Backlog",
+      "failures": "Failures",
+      "email": "Email queue",
+      "pauses": "Pauses",
+      "runs": "Runs"
+    },
+    "docStatus": {
+      "pending": "Pending",
+      "parsing": "Parsing",
+      "analyzing": "Analyzing",
+      "processing": "Processing",
+      "processed": "Processed",
+      "failed": "Failed",
+      "cancelled": "Cancelled"
+    },
+    "kind": {
+      "process": "process",
+      "email_batch": "email batch",
+      "delete": "delete",
+      "clear": "clear",
+      "email_delete": "email delete",
+      "scan": "scan",
+      "startup_resume": "startup resume",
+      "admin": "admin"
+    },
+    "trigger": {
+      "upload": "upload",
+      "email": "email",
+      "resync": "re-sync",
+      "scan": "scan",
+      "insert": "insert",
+      "reprocess": "reprocess",
+      "startup": "startup",
+      "admin": "admin"
+    },
+    "active": {
+      "title": "Active runs",
+      "interimNote": "Workspaces with documents in progress, most recent first (at most 50), with their live pipeline flags.",
+      "none": "Nothing is processing right now.",
+      "noneChecked": "Nothing is processing. Checked doc status and live pipeline flags at {{time}}.",
+      "truncated": "Showing the {{count}} most recent workspaces with documents in progress.",
+      "progressLabel": "Documents done",
+      "pausedCode": "Provider answered {{code}} for {{slot}}; resumes when the pause clears.",
+      "pausedNoCode": "Paused by the LLM provider; resumes when the pause clears.",
+      "lastProgress": "last progress {{age}} ago",
+      "cancelling": "cancellation requested",
+      "destructive": "a delete or clear is running",
+      "workerGone": "gone",
+      "col": {
+        "state": "State",
+        "workspace": "Workspace",
+        "kind": "Kind",
+        "label": "Label (masked)",
+        "trigger": "Trigger",
+        "started": "Started",
+        "elapsed": "Elapsed",
+        "progress": "Progress",
+        "worker": "Worker"
+      }
+    },
+    "stuck": {
+      "title": "Stuck",
+      "thresholds": "Thresholds: {{list}}",
+      "th": {
+        "orphan": "orphaned after {{age}} without heartbeat",
+        "hung": "hung after {{age}} without progress",
+        "doc": "stale document after {{age}}"
+      },
+      "none": "Nothing stuck. Checked documents in parsing, analyzing and processing at {{time}}.",
+      "runsLater": "Hung runs, orphaned runs and busy-without-run checks arrive with run tracking; this release detects stale documents.",
+      "run": "run {{id}}",
+      "openWorkspace": "open workspace",
+      "why": {
+        "stale_doc": "in {{status}} since {{time}}"
+      },
+      "col": {
+        "class": "Class",
+        "workspace": "Workspace",
+        "what": "What",
+        "age": "Age",
+        "why": "Why"
+      }
+    },
+    "backlog": {
+      "title": "Backlog",
+      "excluded": "(+{{cancelled}} cancelled · {{dup}} dup excluded)",
+      "mixLabel": "Backlog by status; choose a segment to filter the table",
+      "segment": "{{status}}: {{count}} documents",
+      "cancelled": "Cancelled",
+      "dup": "Duplicates",
+      "byWorkspace": "Backlog by workspace",
+      "matching_one": "{{total}} workspace with work in progress or failures",
+      "matching_other": "{{total}} workspaces with work in progress or failures",
+      "find": "Find",
+      "placeholder": "Workspace, owner or email…",
+      "filters": "Show only",
+      "has": {
+        "failed": "Has failed",
+        "stuck": "Has stuck",
+        "email": "Email pending",
+        "paused": "Paused"
+      },
+      "sortBy": "Sort by",
+      "sort": {
+        "oldest": "Oldest",
+        "inflight": "In flight",
+        "failed": "Failed",
+        "name": "Name"
+      },
+      "dirAsc": "Ascending (select to reverse)",
+      "dirDesc": "Descending (select to reverse)",
+      "none": "No workspace has documents in progress or failed.",
+      "noneMatching": "No workspace matches this search and these filters.",
+      "pausedState": "Paused",
+      "state": {
+        "running": "Running",
+        "paused": "Paused",
+        "stale_doc": "Stale",
+        "pending": "Pending",
+        "failed": "Has failed",
+        "idle": "Idle",
+        "hung": "Hung",
+        "orphaned": "Orphaned"
+      },
+      "col": {
+        "workspace": "Workspace",
+        "pending": "Pending",
+        "parsing": "Parse",
+        "analyzing": "Analyze",
+        "processing": "Process",
+        "failed": "Failed",
+        "cancelled": "Cancelled",
+        "oldest": "Oldest",
+        "queue": "Queue",
+        "state": "State"
+      }
+    },
+    "failures": {
+      "title": "Failures",
+      "excluded": "{{dup}} duplicate rows excluded · {{cancelled}} cancellations counted separately",
+      "window": "Window",
+      "windows": {
+        "1h": "1 h",
+        "24h": "24 h",
+        "7d": "7 d"
+      },
+      "groupBy": "Group by",
+      "group": {
+        "error_kind": "Kind",
+        "stage": "Stage",
+        "workspace": "Workspace",
+        "model": "Model"
+      },
+      "includeCancelled": "Include cancelled",
+      "legacyTitle": "Unclassified (legacy)",
+      "legacyLabel": "unclassified (legacy)",
+      "legacyNote": "Failures recorded before failure kinds existed, grouped by their normalised error message.",
+      "none": "No real failures in the last {{window}}.",
+      "docsFor": "Documents: {{label}}",
+      "closeDocs": "Close",
+      "noDocs": "No documents in this group any more.",
+      "col": {
+        "signature": "Message signature",
+        "count": "Count",
+        "workspaces": "Workspaces",
+        "first": "First",
+        "last": "Last",
+        "example": "Example (masked)",
+        "docs": "Docs"
+      },
+      "cancelledLabel": "cancelled by a user"
+    },
+    "errorKind": {
+      "provider_budget": "provider budget (402)",
+      "provider_rate_limit": "provider rate limit",
+      "provider_auth": "provider rejected the key",
+      "provider_timeout": "provider timeout",
+      "llm_bad_output": "LLM bad output",
+      "parser_timeout": "parser timeout",
+      "parser_error": "parser error",
+      "storage_error": "storage error",
+      "cancelled": "cancelled",
+      "duplicate": "duplicate",
+      "unknown": "unknown"
+    },
+    "stage": {
+      "enqueued": "enqueued",
+      "pending": "pending",
+      "parsing": "parsing",
+      "analyzing": "analyzing",
+      "processing": "processing",
+      "extract": "extract",
+      "merge": "merge",
+      "processed": "processed",
+      "failed": "failed",
+      "failedState": "(failed)",
+      "runningState": "(in progress)",
+      "parse": "parse",
+      "analyze": "analyze",
+      "state": {
+        "skipped": "skipped",
+        "pending": "not started",
+        "unknown": "unknown",
+        "interrupted": "interrupted"
+      }
+    },
+    "email": {
+      "title": "Email re-sync queue",
+      "summary": "{{records}} records · {{workspaces}} workspaces · longest waiting {{longest}} · {{bad}} unreadable · scanned {{scanned}} ago",
+      "notScanned": "The queue has not been scanned yet. The scan runs once a minute on one process.",
+      "empty": "The queue is empty (scanned {{time}}).",
+      "privacy": "Contents are never shown: the scan counts files without opening them.",
+      "result": {
+        "ok": "ok",
+        "slot_busy": "waiting: pipeline busy",
+        "failed": "failed",
+        "error": "error"
+      },
+      "col": {
+        "workspace": "Workspace",
+        "pending": "Pending",
+        "since": "Waiting",
+        "bad": "Unreadable",
+        "attempts": "Attempts",
+        "last": "Last result",
+        "lastOk": "Last success"
+      }
+    },
+    "pauses": {
+      "title": "Provider pauses",
+      "openProviders": "Providers",
+      "group_one": "{{slot}} · {{kind}}: {{countText}} workspace",
+      "group_other": "{{slot}} · {{kind}}: {{countText}} workspaces",
+      "none": "No workspace is paused by its LLM provider.",
+      "note": "Paused workspaces resume on their own once a call to the provider succeeds.",
+      "byo": "own key (BYO)",
+      "systemKey": "system key",
+      "slotKind": "{{slot}} · {{kind}}",
+      "since": "since {{time}}",
+      "kind": {
+        "invalid_key": "key rejected",
+        "budget_exhausted": "budget exhausted",
+        "unknown": "unknown"
+      },
+      "col": {
+        "workspace": "Workspace",
+        "slot": "Slot",
+        "kind": "Kind",
+        "status": "Status",
+        "key": "Key",
+        "since": "Since",
+        "retry": "Next try"
+      }
+    },
+    "pager": {
+      "previous": "Previous",
+      "next": "Next",
+      "range": "{{first}}–{{last}} of {{total}}"
+    },
+    "drawer": {
+      "close": "Close",
+      "back": "Back",
+      "breadcrumb": "Drill-down path",
+      "workspaceTitle": "Workspace {{id}}",
+      "documentTitle": "Document {{id}}",
+      "later": "The {{kind}} view arrives in a later release.",
+      "kind": {
+        "workspace": "workspace",
+        "document": "document",
+        "run": "run",
+        "log": "log entry",
+        "dependency": "dependency",
+        "worker": "worker",
+        "alert": "alert"
+      }
+    },
+    "workspace": {
+      "owner": "Owner {{owner}}",
+      "idle": "Idle",
+      "idleNotLoaded": "Idle (not loaded in memory)",
+      "managerUnresponsive": "The live state did not answer in time. Counts below come from the database.",
+      "scanning": "An input scan is running.",
+      "enqueues_one": "{{count}} upload is being queued.",
+      "enqueues_other": "{{count}} uploads are being queued.",
+      "batch": "batch {{current}} of {{total}}",
+      "docs_one": "{{count}} document",
+      "docs_other": "{{count}} documents",
+      "runningFor": "running for {{age}}",
+      "actionInProgress": "Action in progress by {{actor}}: {{action}} ({{time}})",
+      "counts": "Counts",
+      "loadedIn": "Loaded in",
+      "emailQueue": "Email queue",
+      "emailEmpty": "Nothing waiting in the email queue.",
+      "pauses": "Provider pause",
+      "failuresByKind": "Failures by kind",
+      "recentRuns": "Recent runs",
+      "runsLater": "Run history arrives with run tracking.",
+      "feed": "Live feed (redacted, last 200)",
+      "follow": "Follow",
+      "feedEmpty": "No pipeline messages yet.",
+      "feedReset": "The feed was reset since the last refresh.",
+      "feedNote": "The feed resets when a run starts, an email bundle is replaced, an email batch deletes documents, or a document is deleted.",
+      "documents": "Documents",
+      "documentsFilter": "Document status",
+      "allDocs": "All",
+      "noDocs": "No documents with this status.",
+      "copyId": "Copy workspace ID",
+      "copied": "Workspace ID copied",
+      "copyFailed": "Could not copy the workspace ID",
+      "openInsights": "LLM usage in Insights",
+      "notFound": "No such workspace: it has no documents, no queued emails and no live state."
+    },
+    "document": {
+      "path": "{{workspace}} › {{id}}",
+      "openWorkspace": "open workspace",
+      "status": "Status",
+      "track": "Track",
+      "chunks": "Chunks",
+      "created": "Created",
+      "updated": "Updated",
+      "timeline": "Timeline",
+      "noStages": "No stage timings were recorded for this document.",
+      "error": "Error (redacted)",
+      "failures": "Failure history",
+      "noFailures": "No failures recorded for this document.",
+      "failuresLater": "Failure history (stage, kind, model, attempt) arrives with run tracking.",
+      "attempt": "attempt {{n}}",
+      "calls": "LLM calls (up to 50)",
+      "explore": "Explore in Insights",
+      "noCalls": "No LLM calls recorded for this document.",
+      "callsOff": "Token Insights recording is off, so LLM calls are not recorded.",
+      "callsNote": "Latency includes queue wait and retries.",
+      "cacheHit": "cache hit",
+      "call": {
+        "time": "Time",
+        "purpose": "Purpose",
+        "model": "Model",
+        "tokens": "Tokens in → out",
+        "latency": "Latency",
+        "status": "Status"
+      },
+      "callStatus": {
+        "ok": "ok",
+        "error": "error",
+        "truncated": "truncated",
+        "abandoned": "abandoned"
+      },
+      "notFound": "This document no longer exists in the workspace."
+    },
+    "dep": {
+      "postgres": "PostgreSQL",
+      "milvus": "Milvus",
+      "graph": "Graph",
+      "neo4j": "Neo4j",
+      "vllm_embed": "vLLM embed",
+      "vllm_rerank": "vLLM rerank",
+      "llm": "LLM provider",
+      "docling": "Docling",
+      "smtp": "SMTP",
+      "idp": "Sign-in provider"
     }
   }
 }

@@ -110,3 +110,11 @@ export const shortId = (id: string | null | undefined, keep = 8) => {
   if (!id) return DASH
   return id.length > keep + 1 ? `${id.slice(0, keep)}…` : id
 }
+
+/** The UTC form of a timestamp for a tooltip (NFR-11): "2026-11-03 04:04:31 UTC"; undefined when missing. */
+export const utcTitle = (at: string | number | null | undefined): string | undefined => {
+  if (at === null || at === undefined || at === '') return undefined
+  const d = new Date(at)
+  if (Number.isNaN(d.getTime())) return undefined
+  return `${d.toISOString().slice(0, 19).replace('T', ' ')} UTC`
+}

@@ -1,0 +1,596 @@
+"""Operations console SQL against a real Postgres, at release scale.
+
+Seeds 3000 workspaces x a few hundred doc-status rows (0.5 % in flight, 2 %
+failed, 10 % ``dup-*``) with ``copy_records_to_table``, runs the background
+index builder, then checks that:
+
+- the backlog (Q1), stale-doc (Q3) and live-candidate (Q6) queries never
+  sequentially scan ``LIGHTRAG_DOC_STATUS``, also under
+  ``plan_cache_mode = force_generic_plan``;
+- the latency budgets hold loosely (Q1 < 50 ms, Q2 page < 150 ms,
+  Q3/Q6 < 50 ms; asserted at 3x to absorb a noisy laptop, measured values
+  printed);
+- the store agrees with ``MemoryOpsStore`` on a small dataset;
+- leases, KV helpers, the index builder's invalid-index handling and the
+  workspace-deletion hook behave as specified.
+
+Runs only with ``LIGHTRAG_RUN_INTEGRATION=true``, ``--run-integration`` and
+``POSTGRES_HOST`` / ``POSTGRES_PORT`` / ``POSTGRES_USER`` /
+``POSTGRES_PASSWORD`` / ``POSTGRES_DATABASE`` pointing at a throwaway
+database (it truncates ``LIGHTRAG_DOC_STATUS``). ``OPS_IT_WORKSPACES`` and
+``OPS_IT_DOCS_PER_WS`` change the seed size.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import random
+import statistics
+import sys
+import time
+from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
+
+import pytest
+
+pytestmark = [
+    pytest.mark.integration,
+    pytest.mark.requires_db,
+    pytest.mark.asyncio(loop_scope="module"),
+]
+
+if os.getenv("LIGHTRAG_RUN_INTEGRATION", "false").lower() != "true" or not os.getenv(
+    "POSTGRES_HOST"
+):
+    pytest.skip(
+        "needs LIGHTRAG_RUN_INTEGRATION=true and POSTGRES_* settings",
+        allow_module_level=True,
+    )
+
+import pytest_asyncio  # noqa: E402
+
+from lightrag.api.ops import indexes  # noqa: E402
+from lightrag.api.ops.service import OpsService  # noqa: E402
+from lightrag.api.ops.snapshot import NamespaceReader  # noqa: E402
+from lightrag.api.ops.store import (  # noqa: E402
+    MemoryOpsStore,
+    Page,
+    PostgresOpsStore,
+    workspace_hash,
+)
+
+WORKSPACES = int(os.getenv("OPS_IT_WORKSPACES", "3000"))
+DOCS_PER_WS = int(os.getenv("OPS_IT_DOCS_PER_WS", "300"))
+BUDGET_SLACK = 3.0
+COLUMNS = [
+    "workspace",
+    "id",
+    "status",
+    "file_path",
+    "track_id",
+    "metadata",
+    "error_msg",
+    "chunks_count",
+    "created_at",
+    "updated_at",
+]
+ERRORS = [
+    "RateLimitError: Error code: 429 - request 7f3a9c21 exceeded quota",
+    "APITimeoutError: Request timed out after 120 seconds",
+    "JSONDecodeError: Expecting value: line 1 column 3712 (char 3711)",
+    "ReadTimeout docling:5001 after 300s",
+]
+CANCELLED = [
+    "User cancelled",
+    "User cancelled during entity extraction",
+    "User cancelled during merge phase",
+]
+
+
+def _now() -> datetime:
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+def _row(
+    ws: str, doc_id: str, status: str, updated: datetime, error=None, metadata=None
+):
+    return (
+        ws,
+        doc_id,
+        status,
+        f"report-{doc_id[-6:]}.pdf",
+        f"upload_20261103_101010_{doc_id[-8:]}",
+        json.dumps(metadata or {}),
+        error,
+        3,
+        updated - timedelta(minutes=5),
+        updated,
+    )
+
+
+def _seed_rows(workspaces: int, per_ws: int, rng: random.Random):
+    now = _now()
+    statuses_inflight = ["pending", "parsing", "analyzing", "processing"]
+    for w in range(workspaces):
+        ws = f"user{w:04d}_unimas_my"
+        for d in range(per_ws):
+            roll = rng.random()
+            updated = now - timedelta(minutes=rng.randint(1, 60 * 24 * 30))
+            doc_id = f"doc-{w:04d}{d:05d}{rng.getrandbits(32):08x}"
+            if roll < 0.005:
+                status = statuses_inflight[d % 4]
+                updated = now - timedelta(minutes=rng.choice([5, 30, 90, 400]))
+                yield _row(ws, doc_id, status, updated)
+            elif roll < 0.025:
+                if rng.random() < 0.2:
+                    error = rng.choice(CANCELLED)
+                else:
+                    error = rng.choice(ERRORS)
+                yield _row(ws, doc_id, "failed", updated, error=error)
+            elif roll < 0.125:
+                yield _row(
+                    ws, f"dup-{doc_id[4:]}", "failed", updated, error="duplicate"
+                )
+            else:
+                yield _row(ws, doc_id, "processed", updated)
+
+
+async def _copy(conn, rows):
+    batch = []
+    for row in rows:
+        batch.append(row)
+        if len(batch) >= 50_000:
+            await conn.copy_records_to_table(
+                "lightrag_doc_status", records=batch, columns=COLUMNS
+            )
+            batch = []
+    if batch:
+        await conn.copy_records_to_table(
+            "lightrag_doc_status", records=batch, columns=COLUMNS
+        )
+
+
+@pytest_asyncio.fixture(loop_scope="module", scope="module")
+async def pg():
+    from lightrag.api.insights.store import PostgresUsageStore
+    from lightrag.api.workspace_registry import PostgresWorkspaceRegistry
+
+    store = PostgresOpsStore()
+    await store.initialize()
+    usage = PostgresUsageStore()
+    await usage.initialize()
+    registry = PostgresWorkspaceRegistry()
+    await registry.initialize()
+    await store._refresh_tables(force=True)
+    yield store
+    await registry.finalize()
+    await usage.finalize()
+    await store.finalize()
+
+
+async def _reset(store: PostgresOpsStore) -> None:
+    async with store.dedicated_connection() as conn:
+        await conn.execute("TRUNCATE lightrag_doc_status")
+        await conn.execute("TRUNCATE lightrag_workspace_owners")
+        await conn.execute("TRUNCATE lightrag_usage_events")
+        await conn.execute("TRUNCATE lightrag_ops_kv")
+        await conn.execute("TRUNCATE lightrag_ops_audit")
+
+
+# -- small dataset: Postgres and the memory store must agree ---------------------
+
+
+def _small_dataset(now: datetime):
+    """(workspace, id, status, updated_at, error, metadata) rows."""
+    rows = []
+    for w in range(6):
+        ws = f"ws{w}"
+        for d in range(12):
+            status = [
+                "pending",
+                "parsing",
+                "analyzing",
+                "processing",
+                "failed",
+                "processed",
+            ][d % 6]
+            updated = now - timedelta(minutes=15 * (d + 1) + w, seconds=30)
+            error = None
+            metadata = {}
+            if status == "failed":
+                error = ERRORS[(w + d) % len(ERRORS)] if d % 4 else CANCELLED[w % 3]
+                if w == 5:
+                    metadata = {"failure": {"error_kind": "provider_budget"}}
+            rows.append((ws, f"doc-{w}-{d:02d}", status, updated, error, metadata))
+        rows.append((ws, f"dup-{w}-x", "failed", now, "duplicate", {}))
+    return rows
+
+
+async def test_postgres_matches_memory_store(pg):
+    await _reset(pg)
+    now = _now()
+    memory = MemoryOpsStore(clock=lambda: now.replace(tzinfo=timezone.utc).timestamp())
+    records = []
+    for ws, doc_id, status, updated, error, metadata in _small_dataset(now):
+        records.append(_row(ws, doc_id, status, updated, error, metadata))
+        memory.add_doc(
+            ws,
+            doc_id,
+            status,
+            updated_at=updated,
+            created_at=updated - timedelta(minutes=5),
+            error_msg=error,
+            metadata=metadata,
+            file_path=f"report-{doc_id[-6:]}.pdf",
+            track_id=f"upload_20261103_101010_{doc_id[-8:]}",
+            chunks_count=3,
+        )
+    async with pg.dedicated_connection() as conn:
+        await conn.copy_records_to_table(
+            "lightrag_doc_status", records=records, columns=COLUMNS
+        )
+        await conn.execute(
+            "INSERT INTO lightrag_workspace_owners VALUES ('ws1', 'sso:1', 'a.bin@unimas.my', 0, 0)"
+        )
+    memory.owner_rows["ws1"] = "a.bin@unimas.my"
+    await pg._refresh_tables(force=True)
+
+    def norm(value):
+        if isinstance(value, list):
+            return [norm(v) for v in value]
+        if isinstance(value, dict):
+            return {k: norm(v) for k, v in value.items()}
+        if isinstance(value, datetime):
+            return value.replace(tzinfo=None, microsecond=0)
+        return value
+
+    assert norm(await pg.backlog_totals()) == norm(await memory.backlog_totals())
+    assert await pg.dup_count() == await memory.dup_count() == 6
+    assert await pg.cancelled_count() == await memory.cancelled_count() > 0
+    for sort in ("oldest", "failed", "inflight", "name", "activity"):
+        for desc in (False, True):
+            for has in (frozenset(), frozenset({"failed"}), frozenset({"stuck"})):
+                kwargs = dict(
+                    q=None,
+                    has=has,
+                    sort=sort,
+                    descending=desc,
+                    page=Page(limit=4, offset=0),
+                    stale_minutes=60,
+                    email_workspaces=["ws2"],
+                    paused_workspaces=[],
+                )
+                got = await pg.backlog_page(**kwargs)
+                want = await memory.backlog_page(**kwargs)
+                assert norm(got) == norm(want), (sort, desc, has)
+    search = dict(
+        has=frozenset(),
+        sort="name",
+        descending=False,
+        page=Page(limit=10, offset=0),
+        stale_minutes=60,
+        email_workspaces=["ws2"],
+        paused_workspaces=["ws3"],
+    )
+    rows, total = await pg.backlog_page(q="A.BIN", **search)
+    assert (
+        total == 1
+        and rows[0]["workspace"] == "ws1"
+        and rows[0]["owner"] == "a.bin@unimas.my"
+    )
+    rows, total = await pg.backlog_page(
+        q="ws_", **search
+    )  # "_" is literal, not a wildcard
+    assert total == 0
+    rows, total = await pg.backlog_page(
+        q=None, **{**search, "has": frozenset({"email"})}
+    )
+    assert [r["workspace"] for r in rows] == ["ws2"]
+    rows, total = await pg.backlog_page(
+        q=None, **{**search, "page": Page(limit=10, offset=50)}
+    )
+    assert rows == [] and total == 6
+    assert norm(await pg.stale_docs(60, Page(10, 0))) == norm(
+        await memory.stale_docs(60, Page(10, 0))
+    )
+    assert norm(await pg.live_candidates(50)) == norm(await memory.live_candidates(50))
+    assert await pg.pending_candidates(50) == await memory.pending_candidates(50)
+    for group in ("signature", "workspace"):
+        for include in (False, True):
+            got = await pg.legacy_failures(24, group, include)
+            want = await memory.legacy_failures(24, group, include)
+            assert norm(got["groups"]) == norm(want["groups"]), group
+            assert got["cancelled"]["count"] == want["cancelled"]["count"]
+        key = (await pg.legacy_failures(24, group, False))["groups"][0]["key"]
+        got = await pg.failure_docs(24, group, key, Page(5, 0))
+        assert norm(got) == norm(await memory.failure_docs(24, group, key, Page(5, 0)))
+    got = await pg.failure_docs(24, "cancelled", "cancelled", Page(50, 0))
+    assert norm(got) == norm(
+        await memory.failure_docs(24, "cancelled", "cancelled", Page(50, 0))
+    )
+    assert norm(await pg.workspace_counts("ws1")) == norm(
+        await memory.workspace_counts("ws1")
+    )
+    assert norm(await pg.workspace_documents("ws1", "failed", Page(5, 0))) == norm(
+        await memory.workspace_documents("ws1", "failed", Page(5, 0))
+    )
+    doc = await pg.document("ws5", "doc-5-04")
+    assert doc["metadata"] == {"failure": {"error_kind": "provider_budget"}}
+    assert await pg.owners(["ws1", "ws2"]) == {"ws1": "a.bin@unimas.my"}
+
+
+async def test_kv_and_leases(pg):
+    await _reset(pg)
+    await pg.kv_put("thresholds", {"stale_doc_minutes": 30})
+    assert await pg.kv_get("thresholds") == {"stale_doc_minutes": 30}
+    await pg.kv_merge_many({"resync:ws1": {"first_pending_at": 1.0}})
+    await pg.kv_merge_many({"resync:ws1": {"attempts": 2}})
+    assert await pg.kv_get("resync:ws1") == {"first_pending_at": 1.0, "attempts": 2}
+    assert await pg.kv_cas("action:ws1", None, {"actor": "a"})
+    assert not await pg.kv_cas("action:ws1", None, {"actor": "b"})
+    assert await pg.kv_cas("action:ws1", {"actor": "a"}, {"actor": "b"})
+    assert await pg.kv_get_many(["action:ws1", "missing"]) == {
+        "action:ws1": {"actor": "b"}
+    }
+
+    # Holder stored, renewal by the holder, takeover only after expiry.
+    assert await pg.try_lease("ops:test", "worker-a", 1.0)
+    lease = await pg.kv_get("lease:ops:test")
+    assert lease["holder"] == "worker-a"
+    assert await pg.try_lease("ops:test", "worker-a", 1.0)
+    assert not await pg.try_lease("ops:test", "worker-b", 1.0)
+    await asyncio.sleep(1.2)
+    assert await pg.try_lease("ops:test", "worker-b", 30.0)
+    assert not await pg.try_lease("ops:test", "worker-a", 30.0)
+    await pg.release_lease("ops:test", "worker-a")  # not the holder: no effect
+    assert (await pg.kv_get("lease:ops:test"))["holder"] == "worker-b"
+    await pg.release_lease("ops:test", "worker-b")
+    assert await pg.kv_get("lease:ops:test") is None
+
+
+async def test_forget_workspace(pg):
+    await _reset(pg)
+    ws = "a_bin_unimas_my"
+    for key in (f"resync:{ws}", f"kick:{ws}", f"action:{ws}", f"pause:{ws}:extraction"):
+        await pg.kv_put(key, {"x": 1})
+    await pg.kv_put(f"pause:{ws}x:extraction", {"keep": True})  # another workspace
+    await pg.kv_put(
+        "email_queue_summary",
+        {
+            "items": [
+                {"workspace": ws, "pending": 1},
+                {"workspace": "other", "pending": 2},
+            ]
+        },
+    )
+    async with pg.dedicated_connection() as conn:
+        await conn.execute(
+            """INSERT INTO lightrag_ops_audit (actor, action, workspace, target, phase)
+               VALUES ('admin', 'cancel', $1, $1, 'result')""",
+            ws,
+        )
+    await pg.forget_workspace(ws)
+    remaining = await pg.kv_get_many(
+        [
+            f"resync:{ws}",
+            f"kick:{ws}",
+            f"action:{ws}",
+            f"pause:{ws}:extraction",
+            f"pause:{ws}x:extraction",
+        ]
+    )
+    assert remaining == {f"pause:{ws}x:extraction": {"keep": True}}
+    assert (await pg.kv_get("email_queue_summary"))["items"] == [
+        {"workspace": "other", "pending": 2}
+    ]
+    async with pg.dedicated_connection() as conn:
+        row = await conn.fetchrow(
+            "SELECT workspace, target, actor FROM lightrag_ops_audit"
+        )
+    assert dict(row) == {
+        "workspace": workspace_hash(ws),
+        "target": workspace_hash(ws),
+        "actor": "admin",
+    }
+
+
+# -- release scale ------------------------------------------------------------------
+
+
+def _seq_scans(plan) -> list[str]:
+    found = []
+
+    def walk(node):
+        if isinstance(node, dict):
+            if node.get("Node Type") == "Seq Scan":
+                found.append(str(node.get("Relation Name")))
+            for value in node.values():
+                walk(value)
+        elif isinstance(node, list):
+            for value in node:
+                walk(value)
+
+    walk(plan)
+    return found
+
+
+class _Capture(PostgresOpsStore):
+    """Records the SQL and arguments of each read."""
+
+    def __init__(self, inner: PostgresOpsStore):
+        super().__init__()
+        self._db = inner._db
+        self._tables = inner._tables
+        self._tables_at = inner._tables_at
+        self.ready = self.doc_status_ready = True
+        self.statements: list[tuple[str, tuple]] = []
+
+    async def _read(self, sql, *args):
+        self.statements.append((sql, args))
+        return await super()._read(sql, *args)
+
+
+def _literal(value) -> str:
+    if isinstance(value, int):
+        return str(value)
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+_STATEMENTS = iter(range(1_000_000))
+
+
+async def _explain(conn, sql: str, args: tuple, generic: bool) -> list[str]:
+    name = f"ops_q{next(_STATEMENTS)}"
+    await conn.execute(
+        f"SET plan_cache_mode = {'force_generic_plan' if generic else 'auto'}"
+    )
+    await conn.execute(f"PREPARE {name} AS {sql}")
+    params = f"({', '.join(_literal(a) for a in args)})" if args else ""
+    raw = await conn.fetchval(f"EXPLAIN (FORMAT JSON) EXECUTE {name}{params}")
+    await conn.execute(f"DEALLOCATE {name}")
+    return _seq_scans(json.loads(raw) if isinstance(raw, str) else raw)
+
+
+async def _median_ms(call, runs: int = 7) -> float:
+    samples = []
+    for _ in range(runs):
+        started = time.perf_counter()
+        await call()
+        samples.append((time.perf_counter() - started) * 1000)
+    return statistics.median(samples)
+
+
+async def test_release_scale_plans_and_budgets(pg):
+    await _reset(pg)
+    rng = random.Random(42)
+    started = time.perf_counter()
+    async with pg.dedicated_connection() as conn:
+        # Build over the seeded rows, not over an empty table.
+        for spec in indexes.OPS_INDEXES:
+            await conn.execute(f"DROP INDEX IF EXISTS {spec.name}")
+        await _copy(conn, _seed_rows(WORKSPACES, DOCS_PER_WS, rng))
+        total = await conn.fetchval("SELECT count(*) FROM lightrag_doc_status")
+    seed_s = time.perf_counter() - started
+
+    # The builder runs on its own connection and is idempotent.
+    started = time.perf_counter()
+    async with pg.dedicated_connection() as conn:
+        outcome = await indexes.build_indexes(conn)
+    build_s = time.perf_counter() - started
+    assert outcome["idx_lightrag_doc_status_inflight"] == "created"
+    assert outcome["idx_lightrag_doc_status_dup"] == "created"
+    assert outcome["idx_lightrag_doc_status_id"] == "created"
+    assert outcome["idx_usage_events_kind_ts"] == "created"
+    async with pg.dedicated_connection() as conn:
+        again = await indexes.build_indexes(conn)
+        assert set(again.values()) <= {"valid", "skipped"}
+        # A concurrent build that died leaves an INVALID index: it is rebuilt.
+        await conn.execute(
+            "UPDATE pg_index SET indisvalid = false WHERE indexrelid = "
+            "'idx_lightrag_doc_status_id'::regclass"
+        )
+        assert [s.name for s in await indexes.missing_indexes(conn)] == [
+            "idx_lightrag_doc_status_id"
+        ]
+        assert (await indexes.build_indexes(conn))[
+            "idx_lightrag_doc_status_id"
+        ] == "rebuilt"
+        # Another session holding the builder lock makes this one skip.
+        async with pg.dedicated_connection() as other:
+            await other.fetchval(
+                "SELECT pg_advisory_lock($1)", indexes.ADVISORY_LOCK_KEY
+            )
+            assert set((await indexes.build_indexes(conn)).values()) == {"locked"}
+            await other.fetchval(
+                "SELECT pg_advisory_unlock($1)", indexes.ADVISORY_LOCK_KEY
+            )
+        # Steady state: autovacuum keeps the visibility map current in production.
+        await conn.execute("VACUUM ANALYZE lightrag_doc_status")
+
+    capture = _Capture(pg)
+    await capture.backlog_totals()
+    await capture.stale_docs(60, Page(50, 0))
+    await capture.live_candidates(50)
+    await capture.pending_candidates(50)
+    await capture.dup_count()
+    await capture.cancelled_count()
+    async with pg.dedicated_connection() as conn:
+        for sql, args in capture.statements:
+            for generic in (False, True):
+                scans = await _explain(conn, sql, args, generic)
+                assert "lightrag_doc_status" not in [s.lower() for s in scans], (
+                    sql.split()[1:4],
+                    generic,
+                    scans,
+                )
+
+    page_args = dict(
+        q=None,
+        has=frozenset(),
+        sort="oldest",
+        descending=False,
+        page=Page(50, 0),
+        stale_minutes=60,
+        email_workspaces=[],
+        paused_workspaces=[],
+    )
+    measured = {
+        "Q1 backlog totals": await _median_ms(pg.backlog_totals),
+        "Q1 dup count": await _median_ms(pg.dup_count),
+        "Q1 cancelled count": await _median_ms(pg.cancelled_count),
+        "Q2 backlog page": await _median_ms(lambda: pg.backlog_page(**page_args)),
+        "Q2 backlog search": await _median_ms(
+            lambda: pg.backlog_page(**{**page_args, "q": "user12"})
+        ),
+        "Q3 stale docs": await _median_ms(lambda: pg.stale_docs(60, Page(50, 0))),
+        "Q6 live candidates": await _median_ms(lambda: pg.live_candidates(50)),
+        "Q4 legacy failures 24h": await _median_ms(
+            lambda: pg.legacy_failures(24, "signature", False)
+        ),
+        "workspace counts": await _median_ms(
+            lambda: pg.workspace_counts("user0042_unimas_my")
+        ),
+    }
+    app_state = SimpleNamespace(
+        default_rag=None, ops_server=SimpleNamespace(rag=None), insights=None
+    )
+    service = OpsService(store=pg, reader=NamespaceReader(), app_state=app_state)
+    workers = {"mode": "uvicorn", "expected": 1, "live": 1}
+    await service.overview(workers)
+    service.cache._entries.pop(("overview", "uvicorn", 1, 1), None)
+    measured["/overview warm"] = await _median_ms(
+        lambda: _overview_uncached(service, workers)
+    )
+    measured["/overview cold"] = await _median_ms(
+        lambda: _overview_cold(service, workers)
+    )
+    report = ", ".join(f"{k}={v:.1f}ms" for k, v in measured.items())
+    print(
+        f"\n[ops-it] rows={total} workspaces={WORKSPACES} seed={seed_s:.1f}s "
+        f"index_build={build_s:.1f}s {report}",
+        file=sys.stderr,
+    )
+    budgets = {
+        "Q1 backlog totals": 50,
+        "Q2 backlog page": 150,
+        "Q3 stale docs": 50,
+        "Q6 live candidates": 50,
+        "/overview warm": 300,
+        "/overview cold": 300,
+    }
+    for name, budget in budgets.items():
+        assert measured[name] < budget * BUDGET_SLACK, (name, measured[name])
+
+
+async def _overview_uncached(service: OpsService, workers: dict) -> None:
+    # Warm sub-caches, but recompute the composite each time.
+    service.cache._entries.pop(("overview", "uvicorn", 1, 1), None)
+    await service.overview(workers)
+
+
+async def _overview_cold(service: OpsService, workers: dict) -> None:
+    # Every query runs: what the first viewer after a cache expiry waits for.
+    service.cache.clear()
+    await service.overview(workers)

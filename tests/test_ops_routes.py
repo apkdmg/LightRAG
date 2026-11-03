@@ -114,6 +114,7 @@ def test_status_payload_shape(monkeypatch):
     assert "unavailable_reason" not in body
     assert body["features"] == {
         "durable": False,
+        "processing": False,
         "runs": False,
         "logs": False,
         "probes": False,
@@ -126,6 +127,7 @@ def test_status_payload_shape(monkeypatch):
         "mode": "uvicorn",
         "expected_workers": 1,
         "workers_live": 1,
+        "manager": "local",
     }
     assert body["operator"] is True
     assert body["version"] == "0295"
@@ -171,6 +173,7 @@ def test_gunicorn_mode_reports_workers(monkeypatch):
         "mode": "gunicorn",
         "expected_workers": 4,
         "workers_live": 3,
+        "manager": "local",
     }
 
 
