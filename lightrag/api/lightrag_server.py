@@ -720,7 +720,13 @@ def create_app(args):
         allow_methods=["*"],
         allow_headers=["*"],
         # Token renewal and request correlation headers for cross-origin use
-        expose_headers=["X-New-Token", "X-Request-ID"],
+        expose_headers=[
+            "X-New-Token",
+            "X-Request-ID",
+            "Content-Disposition",
+            "X-Ops-Export-Rows",
+            "X-Ops-Audit-Id",
+        ],
     )
     # Baseline security headers on every response (nosniff, framing, referrer).
     app.add_middleware(SecurityHeadersMiddleware)

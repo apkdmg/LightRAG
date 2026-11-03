@@ -3,6 +3,7 @@ import { useTranslation } from 'react-i18next'
 import { Kv } from '@/features/TokenInsights/ui'
 import { DocFailure, OpsRun, opsApi } from '../api'
 import ErrorPanel from '../components/ErrorPanel'
+import LogSection from '../components/LogSection'
 import { StaleChip } from '../components/Panel'
 import ProgressBar from '../components/ProgressBar'
 import { RunStateLabel } from '../components/RunState'
@@ -227,9 +228,10 @@ export default function RunDrawer({ runId }: { runId: string }) {
         <div className={stale ? 'ops-stale flex flex-col gap-4' : 'flex flex-col gap-4'}>
           <RunSummary run={run} now={poll.updatedAt} stale={stale} multiWorker={isMultiWorker(status?.process.mode)} />
           <RunFailures failures={poll.data?.failures ?? []} workspace={run.workspace} />
-          {typeof poll.data?.log_count === 'number' ? (
-            <p className="text-muted-foreground m-0 text-xs">{t('operations.runDrawer.logCount', { count: poll.data.log_count })}</p>
-          ) : null}
+          <LogSection
+            title={typeof poll.data?.log_count === 'number' ? t('operations.runDrawer.logs', { count: poll.data.log_count }) : t('operations.runDrawer.logsTitle')}
+            filter={{ run_id: run.run_id, window: '7d' }}
+          />
           <p className="text-muted-foreground m-0 text-xs">{t('operations.runDrawer.retention')}</p>
         </div>
       ) : null}

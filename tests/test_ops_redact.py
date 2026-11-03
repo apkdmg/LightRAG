@@ -134,6 +134,30 @@ CORPUS: list[tuple[str, list[str]]] = [
     ),
 ]
 
+# File names with spaces however they are logged, IC and phone numbers next
+# to "_", and URL passwords holding "/" or "@" (FR-72).
+CORPUS += [
+    (
+        "File processing error: - ID: doc-0123 Surat Tawaran Ali Bin Abu.docx",
+        ["Surat", "Tawaran", "Ali Bin"],
+    ),
+    ("Upload failed for Laporan Prestasi Siti Aminah.pdf", ["Prestasi", "Siti"]),
+    ("read /app/inputs/Ali Bin Abu/Laporan Prestasi.pdf", ["Ali Bin", "Prestasi"]),
+    ("open C:\\Users\\Ali Bin Abu\\Laporan Kewangan 2024.docx", ["Ali", "Kewangan"]),
+    ("Docling: /app/inputs/ws/Gaji Ali (1).pdf", ["Gaji Ali", "(1)"]),
+    ("Docling: /app/inputs/ws/Gaji Ali bin Abu [final].docx", ["Gaji Ali", "bin Abu"]),
+    ('OSError: "/x/inputs/ws/Ali\'s Gaji Oktober.pdf"', ["Ali's", "Gaji", "Oktober"]),
+    (
+        "/app/inputs/ws/Minit Mesyuarat Jabatan Kewangan Bil 3 Tahun 2024.pdf",
+        ["Mesyuarat", "Kewangan", "Tahun"],
+    ),
+    ("/app/inputs/ws/Gaji, Ali bin Abu.docx", ["Gaji,", "Ali bin"]),
+    ("nric_900101-13-5678 bad, kp 900101-13-5678_baru", ["900101-13-5678"]),
+    ("[Borang_900101-13-5678] phone_0123456789", ["900101-13-5678", "0123456789"]),
+    ("connect postgresql://lightrag:pa/ss0rd@db:5432/x failed", ["pa/ss0rd", "ss0rd"]),
+    ("neo4j://neo4j:p@ss0rd@neo4j:7687 unreachable", ["ss0rd", "neo4j:p"]),
+]
+
 # Identifiers that must come through unchanged.
 MUST_SURVIVE = [
     "doc-33e75ff09dd601bbe69f351039152189",
@@ -523,6 +547,34 @@ _PIPELINE_CORPUS = [
 def test_pipeline_lines_mask_the_whole_file_name(raw, expected):
     assert redact_pipeline(raw) == expected
     assert redact_pipeline(expected) == expected
+
+
+def test_message_words_and_ids_end_a_file_name():
+    """The name is masked whole, the message around it is kept."""
+    assert (
+        redact("File processing error: - ID: doc-0123 Surat Tawaran Ali.docx")
+        == "File processing error: - ID: doc-0123 Sur•••li.docx"
+    )
+    assert redact("Upload failed for Laporan Prestasi.pdf") == (
+        "Upload failed for Lap•••si.pdf"
+    )
+    assert redact("Laporan Prestasi.pdf could not be parsed") == (
+        "Lap•••si.pdf could not be parsed"
+    )
+    assert redact("Processing .eml file: x") == "Processing .eml file: x"
+    assert redact("can't open 'Report.pdf'") == "can't open 'Rep•••rt.pdf'"
+
+
+def test_redact_filter_masks_deletion_lines_of_any_extension():
+    """Stored file_path values in known shapes are masked whole on every
+    handler, also when the type is not a document type (.json)."""
+    for raw, gone in (
+        ("File deletion skipped, missing or unsafe file: Gaji Ali.json", "Gaji"),
+        ("Error deleting document 1/2: doc-1[senarai_ahmad_bin_ali.json] - x", "ahmad"),
+    ):
+        rec = _record(raw)
+        RedactFilter().filter(rec)
+        assert gone not in rec.getMessage(), rec.getMessage()
 
 
 def test_pipeline_text_masks_a_known_path_anywhere():

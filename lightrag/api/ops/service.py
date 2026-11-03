@@ -32,6 +32,7 @@ from urllib.parse import urlencode
 from uuid import UUID
 
 from lightrag.api.insights.analytics import document_label
+from lightrag.api.ops.audit import SearchAudit
 from lightrag.api.ops.health import (
     DEPLOY_SUPPRESS_S,
     build_strips,
@@ -83,7 +84,7 @@ ATTENTION_KEY = "attention"
 # The leased snapshot is used while it is younger than three reconcile cycles.
 ATTENTION_FRESH_S = 180.0
 # Health cards read from heartbeats rather than probes.
-DERIVED_DEPS = ("manager", "recorder")
+DERIVED_DEPS = ("manager", "recorder", "log_sink")
 
 TTL = {
     "totals": 10.0,
@@ -205,8 +206,9 @@ RUNBOOK = {
     "disk_free": "Free space on the volume holding the working directory or the logs.",
     "workers_below_expected": "Open Health > Workers and check the container; a "
     "worker that stopped reporting may have crashed.",
-    "log_sink_or_recorder_drops_5m": "Usage records are being lost; check "
-    "Postgres health and write volume.",
+    "log_sink_or_recorder_drops_5m": "Usage records or log lines are being "
+    "lost; check Postgres health and write volume (Health > Workers shows "
+    "each worker's buffers and drops).",
     "run_orphaned": "The worker that owned this run died and its workspace is "
     "still marked busy; restart the container to clear it (the documents stay "
     "and are processed again).",
@@ -488,6 +490,8 @@ class OpsService:
         self.probes: Any = None
         self.heartbeat: Any = None
         self.worker_id: Optional[str] = None
+        # Log searches are audited once per actor and filters every 5 min.
+        self.search_audit = SearchAudit()
 
     # -- availability --------------------------------------------------------
     @property
@@ -1868,9 +1872,17 @@ class OpsService:
             "failures_by_kind": failures_by_kind,
             "failures_hours": WORKSPACE_FAILURE_HOURS,
             "runs_available": self.durable_runs,
-            "errors_1h": None,
+            "errors_1h": await self._errors_1h(workspace),
             "available": self.docs_available,
         }
+
+    async def _errors_1h(self, workspace: str) -> Optional[int]:
+        """ERROR+ log lines of the workspace in the last hour (capped)."""
+        from lightrag.api.ops.logs import drawer_count
+
+        return await drawer_count(
+            self, hours=1, workspace=workspace, level=logging.ERROR
+        )
 
     async def feed(
         self, workspace: str, offset: Optional[int], limit: int
@@ -1964,6 +1976,8 @@ class OpsService:
         )
 
     async def _document(self, workspace: str, doc_id: str) -> dict[str, Any]:
+        from lightrag.api.ops.logs import drawer_logs
+
         row = await self._q(lambda: self.store.document(workspace, doc_id))
         if row is None:
             raise OpsNotFound(doc_id)
@@ -2002,7 +2016,7 @@ class OpsService:
             "failures_available": self.durable_runs,
             "calls": calls,
             "calls_available": calls_available,
-            "logs": {"available": False, "count": None, "first": []},
+            "logs": await drawer_logs(self, workspace=workspace, doc_id=doc_id),
         }
 
     async def _document_calls(
@@ -2219,6 +2233,8 @@ class OpsService:
         )
 
     async def _run_detail(self, run_id: str) -> dict[str, Any]:
+        from lightrag.api.ops.logs import drawer_count
+
         row = await self._q(lambda: self.store.run_get(run_id))
         if row is None:
             raise OpsNotFound(run_id)
@@ -2257,8 +2273,7 @@ class OpsService:
                 for f in failures
             ],
             "failures_capped": len(failures) >= RUN_FAILURES_LIMIT,
-            # Log lines per run arrive with the log store.
-            "log_count": None,
+            "log_count": await drawer_count(self, run_id=run_id, level=logging.WARNING),
         }
 
     # -- health and workers ------------------------------------------------------------------

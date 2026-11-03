@@ -16,6 +16,7 @@ Conventions for every route here:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import sys
@@ -25,14 +26,23 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Optional
 
-from fastapi import APIRouter, Depends, Query, Request
+from fastapi import APIRouter, Body, Depends, Path, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response
 from fastapi.routing import APIRoute
+from pydantic import BaseModel, Field
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from lightrag.api.dependencies import UserInfo, require_admin
-from lightrag.api.ops.auth import require_live_admin, require_ops_client
+from lightrag.api.ops import log_sink as ops_log_sink
+from lightrag.api.ops import logs as ops_logs
+from lightrag.api.ops.audit import SearchAudit, filters_digest, write_audit
+from lightrag.api.ops.auth import (
+    is_operator,
+    require_live_admin,
+    require_operator,
+    require_ops_client,
+)
 from lightrag.api.ops.health import dep_card
 from lightrag.api.ops.context import (
     REQUEST_ID_HEADER,
@@ -49,9 +59,10 @@ from lightrag.api.ops.service import (
     OpsNotFound,
     OpsService,
     SEARCH_MAX_LENGTH,
+    validate_workspace,
 )
 from lightrag.api.ops.probes import SMTP_TEST_INTERVAL_S, recheck_limit
-from lightrag.api.ops.redact import sanitize_config
+from lightrag.api.ops.redact import redact, sanitize_config
 from lightrag.api.ops.snapshot import NamespaceReader
 from lightrag.api.ops.store import BACKLOG_STATUSES, Page
 from lightrag.kg import shared_storage
@@ -175,6 +186,10 @@ router = APIRouter(
 )
 
 
+# Every POST: a live admin (not only the token's role) and the CSRF checks.
+_POST_GUARDS = [Depends(require_live_admin), Depends(require_ops_client)]
+
+
 def _generated_at() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -256,26 +271,6 @@ def _count_gunicorn_workers() -> Optional[int]:
         _workers_live_cache["at"] = now
         _workers_live_cache["value"] = value
     return value
-
-
-def operator_accounts() -> set[str]:
-    """``OPS_OPERATOR_ACCOUNTS`` (comma-separated, case-insensitive)."""
-    raw = os.getenv("OPS_OPERATOR_ACCOUNTS", "")
-    return {a.strip().lower() for a in raw.split(",") if a.strip()}
-
-
-def is_operator(user: UserInfo) -> bool:
-    """When no operator list is set, every admin is an operator (D8)."""
-    accounts = operator_accounts()
-    if not accounts:
-        return True
-    candidates = {user.username}
-    metadata = user.metadata or {}
-    for key in ("email", "preferred_username"):
-        value = metadata.get(key)
-        if isinstance(value, str):
-            candidates.add(value)
-    return any(c and c.strip().lower() in accounts for c in candidates)
 
 
 def _service(request: Request) -> OpsService:
@@ -390,7 +385,8 @@ async def status(
             "durable": service.available,
             "processing": service.docs_available,
             "runs": service.durable_runs,
-            "logs": False,
+            "logs": service.available,
+            "log_sink": _log_sink(request) is not None,
             "probes": service.probes is not None,
             "heartbeats": service.heartbeat is not None,
             "alerts": False,
@@ -717,6 +713,316 @@ async def run_detail(request: Request, run_id: str) -> dict[str, Any]:
     )
 
 
+# -- Logs and correlate -------------------------------------------------------------
+
+_EXPORTS_PER_MINUTE = 5
+_export_times: dict[str, list[float]] = {}
+_export_lock = threading.Lock()
+
+
+def _log_sink(request: Request) -> Any:
+    return getattr(getattr(request.app.state, "ops", None), "log_sink", None)
+
+
+async def _sink_meta(request: Request, service: OpsService) -> dict[str, Any]:
+    """Whether this worker stores log lines, and the last redaction audit."""
+    sink = _log_sink(request)
+    audit = None
+    if service.available:
+        try:
+            audit = await service.cache.get(
+                ("log_redaction_audit",),
+                60.0,
+                lambda: service.store.kv_get(ops_log_sink.AUDIT_KEY, None),
+            )
+        except Exception:
+            audit = None
+    return {
+        "enabled": sink is not None,
+        "sink": {
+            "enabled": sink is not None,
+            "level": logging.getLevelName(sink.handler.level) if sink else None,
+            "retention_days": ops_log_sink.retention_days(),
+            "redaction_audit": audit if isinstance(audit, dict) else None,
+        },
+    }
+
+
+def _search_audit(service: OpsService) -> SearchAudit:
+    audit = getattr(service, "search_audit", None)
+    if audit is None:
+        audit = service.search_audit = SearchAudit()
+    return audit
+
+
+def _query_filters(**values: Optional[str]) -> dict[str, Any]:
+    return {k: v for k, v in values.items() if v not in (None, "")}
+
+
+@router.get("/logs")
+async def logs(
+    request: Request,
+    user: UserInfo = Depends(require_admin),
+    level: Optional[str] = Query(None, max_length=16),
+    from_: Optional[str] = Query(None, alias="from", max_length=40),
+    to: Optional[str] = Query(None, max_length=40),
+    workspace: Optional[str] = Query(None, max_length=255),
+    logger_name: Optional[str] = Query(None, alias="logger", max_length=128),
+    module: Optional[str] = Query(None, max_length=128),
+    request_id: Optional[str] = Query(None, max_length=64),
+    run_id: Optional[str] = Query(None, max_length=36),
+    track_id: Optional[str] = Query(None, max_length=255),
+    doc_id: Optional[str] = Query(None, max_length=255),
+    fingerprint: Optional[str] = Query(None, max_length=16),
+    worker_id: Optional[str] = Query(None, max_length=36),
+    q: Optional[str] = Query(None, max_length=ops_logs.Q_MAX),
+    before: Optional[str] = Query(None, max_length=80),
+    after_ts: Optional[str] = Query(None, max_length=40),
+    limit: int = Query(ops_logs.PAGE_DEFAULT, ge=1, le=ops_logs.PAGE_MAX),
+) -> dict[str, Any]:
+    """WARNING+ log lines, newest first, on the ``(ts, id)`` keyset.
+
+    ``before`` (``"<ts>,<id>"`` from ``next_before``) pages older rows;
+    ``after_ts`` (follow mode) returns the newest rows at or after a time.
+    At most 7 days per query, 24 h with ``q``. Searches are audited.
+    """
+    service = _service(request)
+
+    async def call() -> dict[str, Any]:
+        f = ops_logs.parse_filter(
+            _query_filters(
+                level=level,
+                to=to,
+                workspace=workspace,
+                logger=logger_name,
+                module=module,
+                request_id=request_id,
+                run_id=run_id,
+                track_id=track_id,
+                doc_id=doc_id,
+                fingerprint=fingerprint,
+                worker_id=worker_id,
+                q=q,
+                **{"from": from_},
+            )
+        )
+        body = await ops_logs.LogsReader(service).page(
+            f,
+            before=ops_logs.parse_before(before),
+            after=ops_logs.parse_time(after_ts, "invalid_after_ts"),
+            limit=limit,
+        )
+        await _search_audit(service).record(
+            service.store,
+            user=user,
+            action="log_search",
+            filters=ops_logs.search_fields(f),
+            request=request,
+        )
+        return {**body, **await _sink_meta(request, service)}
+
+    return await _answer(
+        service,
+        call,
+        {
+            "items": [],
+            "next_before": None,
+            "newest_ts": None,
+            "enabled": _log_sink(request) is not None,
+        },
+        needs_docs=False,
+    )
+
+
+@router.get("/logs/groups")
+async def log_groups(
+    request: Request,
+    user: UserInfo = Depends(require_admin),
+    hours: int = Query(24, ge=1, le=ops_logs.GROUPS_MAX_HOURS),
+    workspace: Optional[str] = Query(None, max_length=255),
+    level: Optional[str] = Query(None, max_length=16),
+) -> dict[str, Any]:
+    """Log lines grouped by call site (fingerprint), largest first (a log
+    search: audited with hashed filters, like /logs)."""
+    service = _service(request)
+
+    async def call() -> dict[str, Any]:
+        ws = validate_workspace(workspace) if workspace else None
+        min_level = ops_logs.parse_level(level)
+        body = await ops_logs.LogsReader(service).groups(hours, ws, min_level)
+        await _search_audit(service).record(
+            service.store,
+            user=user,
+            action="log_groups",
+            filters={"workspace": ws, "level": min_level, "hours": body["hours"]},
+            request=request,
+        )
+        return body
+
+    return await _answer(
+        service, call, {"hours": hours, "groups": [], "capped": False}, needs_docs=False
+    )
+
+
+@router.get("/logs/{log_id}")
+async def log_entry(
+    request: Request, log_id: int = Path(..., ge=1, le=2**62)
+) -> dict[str, Any]:
+    """One log line with its redacted traceback and pivot links."""
+    service = _service(request)
+    return await _answer(
+        service,
+        lambda: ops_logs.LogsReader(service).entry(log_id),
+        {"entry": None, "exc_withheld": False, "links": {}},
+        needs_docs=False,
+    )
+
+
+class LogExportRequest(BaseModel):
+    filters: dict[str, Any] = Field(default_factory=dict)
+    reason: str = Field(..., min_length=3, max_length=512)
+    include_exc: bool = False
+    format: str = Field("ndjson", pattern="^(ndjson|csv)$")
+    limit: int = Field(ops_logs.EXPORT_MAX, ge=1, le=ops_logs.EXPORT_MAX)
+
+
+def _export_allowed(actor: str) -> bool:
+    now = time.monotonic()
+    with _export_lock:
+        recent = [t for t in _export_times.get(actor, []) if now - t < 60.0]
+        if len(recent) >= _EXPORTS_PER_MINUTE:
+            _export_times[actor] = recent
+            return False
+        recent.append(now)
+        _export_times[actor] = recent
+        if len(_export_times) > 1024:
+            for key in list(_export_times)[:512]:
+                _export_times.pop(key, None)
+        return True
+
+
+@router.post(
+    "/logs/export",
+    dependencies=[*_POST_GUARDS, Depends(require_operator)],
+)
+async def log_export(
+    request: Request,
+    body: LogExportRequest = Body(...),
+    user: UserInfo = Depends(require_live_admin),
+) -> Response:
+    """Redacted export of the current filters (operator-only, audited).
+
+    At most 10 000 rows, newest first; tracebacks only when asked for, and
+    then at most 2 000 rows.
+    NDJSON by default, or CSV with formula-safe cells. The intent is audited
+    before any row is read (no audit, no export) and the outcome after.
+    """
+    service = _service(request)
+    if not service.available:
+        return _err(503, "data_unavailable")
+    if not _export_allowed(user.username):
+        return _rate_limited(60)
+    try:
+        f = ops_logs.parse_filter(
+            {str(k): None if v is None else str(v) for k, v in body.filters.items()}
+        )
+    except OpsBadRequest as e:
+        return _err(400, e.code)
+    params = {
+        **filters_digest(ops_logs.search_fields(f)),
+        "window_s": int((f.end - f.start).total_seconds()),
+        "format": body.format,
+        "include_exc": body.include_exc,
+        "limit": min(
+            body.limit,
+            ops_logs.EXPORT_MAX_WITH_EXC if body.include_exc else ops_logs.EXPORT_MAX,
+        ),
+    }
+    reason = redact(body.reason.strip(), 512)
+    if len(reason) < 3:
+        return _err(400, "invalid_reason")
+    try:
+        audit_id = await write_audit(
+            service.store,
+            user=user,
+            action="log_export",
+            phase="intent",
+            request=request,
+            params=params,
+            reason=reason,
+        )
+    except Exception as e:
+        logger.warning("Ops export refused: audit write failed (%s)", type(e).__name__)
+        return _err(503, "audit_unavailable")
+    try:
+        rows = await ops_logs.LogsReader(service).export_rows(
+            f, include_exc=body.include_exc, limit=body.limit
+        )
+        outcome = "ok"
+    except OpsDataUnavailable:
+        rows, outcome = None, "failed"
+    try:
+        await write_audit(
+            service.store,
+            user=user,
+            action="log_export",
+            phase="result",
+            request=request,
+            params={**params, "intent_id": audit_id, "rows": len(rows or [])},
+            reason=reason,
+            outcome=outcome,
+        )
+    except Exception as e:
+        logger.warning("Ops export result audit failed (%s)", type(e).__name__)
+    if rows is None:
+        return _err(503, "data_unavailable")
+    # Serialising up to 10k rows takes a while: off the event loop.
+    content = await asyncio.to_thread(
+        ops_logs.export_body, rows, body.format, body.include_exc
+    )
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    extension = "csv" if body.format == "csv" else "ndjson"
+    return Response(
+        content=content,
+        media_type="text/csv; charset=utf-8"
+        if body.format == "csv"
+        else "application/x-ndjson",
+        headers={
+            "Content-Disposition": f'attachment; filename="ops-logs-{stamp}.{extension}"',
+            "X-Ops-Export-Rows": str(len(rows)),
+            "X-Ops-Audit-Id": str(audit_id),
+        },
+    )
+
+
+@router.get("/correlate")
+async def correlate(
+    request: Request,
+    user: UserInfo = Depends(require_admin),
+    id: Optional[str] = Query(None, max_length=ops_logs.CORRELATE_INPUT_MAX),
+) -> dict[str, Any]:
+    """Resolve a request, run, track, document or log ID, a workspace or an
+    owner email into at most ten matches with drill-down links (audited)."""
+    service = _service(request)
+
+    async def call() -> dict[str, Any]:
+        body = await ops_logs.correlate(service, id or "")
+        if id and id.strip():
+            await _search_audit(service).record(
+                service.store,
+                user=user,
+                action="correlate",
+                filters={"id": id.strip()},
+                request=request,
+                extra={"kinds": body["kinds"]},
+            )
+        return body
+
+    return await _answer(
+        service, call, {"query": None, "kinds": [], "matches": []}, needs_docs=False
+    )
+
+
 # -- Health and workers ----------------------------------------------------------
 
 
@@ -793,9 +1099,6 @@ async def config(request: Request) -> dict[str, Any]:
         "core_version": status_block.get("core_version"),
         "api_version": status_block.get("api_version"),
     }
-
-
-_POST_GUARDS = [Depends(require_live_admin), Depends(require_ops_client)]
 
 
 def _rate_limited(retry_after: float) -> JSONResponse:

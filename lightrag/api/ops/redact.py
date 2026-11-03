@@ -11,12 +11,14 @@ Rules, in order (FR-72):
 - ``Authorization:`` values, ``api_key=`` / ``token=`` / ``secret=`` /
   ``password=`` style assignments, ``Bearer`` tokens, JWTs and ``sk-`` keys
 - userinfo in DSNs and URLs
+- email subjects (``Subject:`` / ``subject=`` values)
 - email addresses
 - long base64 or hex runs (40+ characters)
 - Malaysian IC numbers, Malaysian phone numbers, digit runs of 12 or more
 - file names (document, mail and image extensions, and the email bundle
   shape), masked with :func:`lightrag.api.insights.analytics.mask_name`; a
-  quoted name is masked whole, spaces included
+  name is masked whole, spaces, brackets and commas included, back to its
+  quote, directory path, the punctuation or ID before it, or a message word
 
 Every rule does bounded work per start position, so a line costs time linear
 in its length whatever a client puts in a request path. Budget (median, per
@@ -80,13 +82,23 @@ _ASSIGNMENT = re.compile(
     r"\\?['\"]?\s*[:=]\s*)" + _SECRET_VALUE
 )
 
+# Email subjects ("Subject: Re: salary", "subject='…'"): the value runs to
+# the closing quote, or to the end of the line.
+_SUBJECT = re.compile(
+    r"(?i)(?<![A-Za-z0-9])(subject\\?['\"]?\s*[:=]\s*)"
+    r"(?:(?P<oq>\\?['\"]).{0,512}?(?P=oq)|[^\n]{1,512})"
+)
+
 _BEARER = re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]{6,}")
 _JWT = re.compile(r"\beyJ[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]*")
 _SK_KEY = re.compile(r"\bsk-[A-Za-z0-9_-]{8,}")
 
-# scheme://user:pass@host -> scheme://<redacted>@host
+# scheme://user:pass@host -> scheme://<redacted>@host. Everything up to the
+# last "@" before whitespace or a quote is userinfo, so a password holding
+# "/" or "@" goes whole (a later "@" in a path costs the host, never a secret).
 _DSN_USERINFO = re.compile(
-    r"(?<![A-Za-z0-9])([a-zA-Z][a-zA-Z0-9+.-]{1,20}://)[^\s/@'\"]{1,256}@"
+    r"(?<![A-Za-z0-9])([a-zA-Z][a-zA-Z0-9+.-]{1,20}://)"
+    r"[^\s'\"@]{0,256}(?:@[^\s'\"@]{0,256}){0,8}@"
 )
 
 # RFC 5321 limits: local part 64, label 63. The lookbehind makes a match start
@@ -105,10 +117,11 @@ _LONG_RUN = re.compile(r"(?<![A-Za-z0-9+/_=-])[A-Za-z0-9+/_-]{40,}={0,2}")
 # The digit rules start with a digit (or "+") rather than a lookbehind, so the
 # regex engine can skip straight to candidate positions. A letter or digit on
 # either side means the digits are part of an identifier (a doc-<md5> ID, a
-# uuid hex request ID) and are kept; "_" and "-" still count as separators.
-_IC_NUMBER = re.compile(r"\d(?<!\w\d)\d{5}-?\d{2}-?\d{4}\b")
+# uuid hex request ID) and are kept; "_" and "-" still count as separators
+# (``nric_900101-13-5678``, ``phone_0123456789``), as in the weekly audit.
+_IC_NUMBER = re.compile(r"\d(?<![0-9A-Za-z]\d)\d{5}-?\d{2}-?\d{4}(?![0-9A-Za-z])")
 _PHONE = re.compile(
-    r"(?:\+(?<![\w+]\+)6?0|6(?<![\w+]6)0|0(?<![\w+]0))"
+    r"(?:\+(?<![0-9A-Za-z+]\+)6?0|6(?<![0-9A-Za-z+]6)0|0(?<![0-9A-Za-z+]0))"
     r"[ \t-]?1\d[ \t-]?\d{3,4}[ \t-]?\d{4}(?![0-9A-Za-z])"
 )
 _DIGIT_RUN = re.compile(r"\d(?<![0-9A-Za-z]\d)\d{11,}(?![0-9A-Za-z])")
@@ -126,10 +139,15 @@ _PATH_EXTENSIONS = "|".join(sorted(_FILE_EXTENSIONS, key=lambda e: (-len(e), e))
 _PATH_HINT = re.compile(
     rf"(?i)__(?:master|inline|attachment)|\.(?:{_PATH_EXTENSIONS})(?![A-Za-z0-9])"
 )
-# A quoted name may contain spaces ("Minit Mesyuarat Jabatan.pdf"): the whole
-# quoted span is masked, not just its last word.
+# A quoted name may contain spaces ("Minit Mesyuarat Jabatan.pdf") and the
+# other quote characters (Python quotes "Ali's Gaji.pdf" with double quotes):
+# the whole quoted span is masked, not just its last word.
 _QUOTED_FILE = re.compile(
-    rf"(?i)(?P<q>['\"`])(?P<name>[^'\"`\n]{{1,255}}?\.(?:{_PATH_EXTENSIONS}))(?P=q)"
+    "|".join(
+        rf"(?P<q{i}>{q})(?P<n{i}>[^{q}\n]{{1,255}}?\.(?:{_PATH_EXTENSIONS})){q}"
+        for i, q in enumerate(("'", '"', "`"))
+    ),
+    re.IGNORECASE,
 )
 # Characters that end a file-name token.
 _PATH_STOP = re.compile(r"[\s'\"`()<>\[\]{},;|=:]")
@@ -137,6 +155,32 @@ _EMAIL_BUNDLE = re.compile(r"email_[0-9a-f]{4,}__(?:master|inline|attachment)")
 # What follows a run of path characters when the run is a path, not a key.
 _EXTENSION_AFTER = re.compile(r"\.[A-Za-z0-9]{1,8}(?![A-Za-z0-9])")
 _MASK_MARK = "•••"
+# How far back from its extension a file name is followed.
+_NAME_CHARS_BACK = 255
+# What ends a file name, walking back from its extension: line breaks, tabs,
+# quotes, markup and assignment punctuation, a colon (not a drive's "C:\\" or
+# a scheme's "://"), an apostrophe that is not inside a word ("Ali's" is), a
+# spaced dash ("error - Report.pdf") and a masked name or placeholder.
+_NAME_STOP = re.compile(
+    r"[\n\t\"`<>{}|=;\u2022]|:(?![\\/])|(?<![A-Za-z])'|'(?![A-Za-z])|\s[-\u2013\u2014]+\s"
+)
+_NAME_BRACKETS = re.compile(r"[()\[\]]")
+_NAME_WORD = re.compile(r"\S+")
+# Words that end a file name with spaces when no punctuation does: the
+# message's own words ("Upload failed for Laporan Prestasi.pdf"). Lower case
+# only, so a title-cased name ("Minutes Of Meeting.pdf") stays whole.
+_NAME_STOP_WORDS = frozenset(
+    (
+        "a an the and or of for to from in into on at by with as via using while "
+        "is was are were be been not no file files filename document documents "
+        "doc attachment attachments image images inline path name named upload "
+        "uploaded uploading process processed processing parse parsed parsing "
+        "read reading open opening save saved saving skip skipped skipping "
+        "delete deleted deleting failed error"
+    ).split()
+)
+# Identifiers that end a name too ("ID: doc-0123 Surat Tawaran.docx").
+_NAME_STOP_ID = re.compile(r"^(?:doc|dup|chunk)-[0-9a-f]{4,}$|^[0-9a-f]{8,}$")
 
 _NEWLINES = re.compile(r"\r\n?")
 _HAS_DIGIT_RUN = re.compile(r"\d\d\d\d")
@@ -213,16 +257,78 @@ def _mask_token(token: str) -> str:
 
 
 def _mask_quoted_file(match: re.Match[str]) -> str:
-    quote = match.group("q")
-    return quote + mask_path(match.group("name")) + quote
+    for i in range(3):
+        name = match.group(f"n{i}")
+        if name is not None:
+            quote = match.group(f"q{i}")
+            return quote + mask_path(name) + quote
+    return match.group(0)  # pragma: no cover - one alternative always matches
+
+
+def _name_start(text: str, run_start: int, name_end: int, floor: int) -> int:
+    """Where a file name whose extension starts at ``name_end`` begins.
+
+    The run at ``run_start`` (the whitespace-free text before the extension)
+    is only the last
+    word of a name with spaces (``Minit Mesyuarat Jabatan.pdf``), so the name
+    is followed back, within :data:`_NAME_CHARS_BACK` characters and never
+    before ``floor``, to the nearest of: a :data:`_NAME_STOP` character, an
+    unclosed ``(`` or ``[`` (``(1)`` and ``[final]`` inside a name are
+    kept), and then
+
+    - with a directory separator in between, the start of the word holding
+      the first one (the directories go with the name, spaces included);
+    - otherwise a document ID or a lower-case message word
+      (:data:`_NAME_STOP_WORDS`), or the start of the message.
+
+    Masking too much costs a few words of context; masking too little puts a
+    person's name in stored logs, so every doubt goes to the name.
+    """
+    lo = max(floor, run_start - _NAME_CHARS_BACK)
+    begin = lo
+    for stop in _NAME_STOP.finditer(text, lo, name_end):
+        begin = stop.end()
+    depth = 0
+    brackets = [m.start() for m in _NAME_BRACKETS.finditer(text, begin, name_end)]
+    for pos in reversed(brackets):
+        if text[pos] in ")]":
+            depth += 1
+        elif depth:
+            depth -= 1
+        else:
+            begin = pos + 1
+            break
+    seps = [
+        i
+        for i in (text.find("/", begin, name_end), text.find("\\", begin, name_end))
+        if i >= 0
+    ]
+    if seps:
+        first = min(seps)
+        start = max(text.rfind(" ", begin, first), text.rfind("\n", begin, first)) + 1
+        start = max(start, begin)
+    else:
+        start = begin
+        # The run itself is part of the name; the words before it may not be.
+        words = list(_NAME_WORD.finditer(text, begin, max(begin, run_start)))
+        for word in reversed(words):
+            value = word.group(0)
+            if value in _NAME_STOP_WORDS or _NAME_STOP_ID.match(value):
+                start = word.end()
+                break
+    while start < name_end and text[start] in " ,;":
+        start += 1
+    return start
 
 
 def _mask_path_tokens(text: str) -> str:
-    """Mask each whitespace-free token that holds a file-name hint.
+    """Mask each file name a hint (an extension, an email bundle) points at.
 
-    Only the neighbourhood of a hint is examined (the token edges are found
+    Only the neighbourhood of a hint is examined (the run edges are found
     with C-level searches, backwards through the reversed text), so a long
     line with one file name costs little more than the hint search itself.
+    A name with spaces, brackets or commas is masked whole
+    (:func:`_name_start`); one already masked is left as it is.
     """
     out: list[str] = []
     last = 0
@@ -238,6 +344,23 @@ def _mask_path_tokens(text: str) -> str:
         start = max(last, size - stop.start() if stop else 0)
         stop = _PATH_STOP.search(text, hint.end())
         end = stop.start() if stop else size
+        if hint.group(0).startswith("."):
+            # The whitespace-free run before the extension.
+            run_start = max(
+                last,
+                text.rfind(" ", last, hint.start()) + 1,
+                text.rfind("\n", last, hint.start()) + 1,
+                text.rfind("\t", last, hint.start()) + 1,
+            )
+            if (
+                run_start == hint.start()
+                or _MASK_MARK in text[run_start : hint.start()]
+            ):
+                # A bare extension (".eml files") names no file; a masked
+                # name stays as it is.
+                start = end
+            else:
+                start = _name_start(text, run_start, hint.start(), last)
         out.append(text[last:start])
         out.append(_mask_token(text[start:end]))
         last = end
@@ -250,6 +373,11 @@ def _mask_path_tokens(text: str) -> str:
 def _secret_value(match: re.Match[str]) -> str:
     """Keep the name and separator; replace the value, keeping its quotes."""
     quote = match.group("q") or match.group("oq") or match.group("uq") or ""
+    return match.group(1) + quote + _REDACTED + quote
+
+
+def _subject_value(match: re.Match[str]) -> str:
+    quote = match.group("oq") or ""
     return match.group(1) + quote + _REDACTED + quote
 
 
@@ -286,6 +414,8 @@ def _apply_rules(text: str) -> str:
         text = _AUTHORIZATION.sub(_secret_value, text)
     if _may_assign_secret(lowered):
         text = _ASSIGNMENT.sub(_secret_value, text)
+    if "subject" in lowered:
+        text = _SUBJECT.sub(_subject_value, text)
     if "bearer" in lowered:
         text = _BEARER.sub("Bearer " + _REDACTED, text)
     if "eyj" in lowered:
@@ -384,7 +514,8 @@ def mask_path(path: Optional[str]) -> str:
 # name; the Operations console masks the whole name, spaces and any extension
 # included, which the token rules above cannot see. Each pattern runs on one
 # line; its "path" and "path2" groups are masked, a "list" group is masked
-# item by item.
+# item by item. Lazy groups are bounded, so a hostile line costs linear time
+# (RedactFilter runs these on every log record).
 _PIPELINE_PATH_LINES = (
     re.compile(
         r"(?:Extracting stage|(?:Completed p|P)rocessing file|Merging stage"
@@ -393,18 +524,18 @@ _PIPELINE_PATH_LINES = (
     ),
     re.compile(
         r"(?:Document deleted|Failed to delete|Error deleting document) "
-        r"\d+/\d+: [^\s\[]+\[(?P<path>.+?)\](?= - |$)"
+        r"\d+/\d+: [^\s\[]{1,255}\[(?P<path>.{1,512}?)\](?= - |$)"
     ),
     re.compile(
         r"Duplicate content skipped after parsing: (?P<path>.+?)"
         r"(?:; archived to (?P<path2>.+))?$"
     ),
-    re.compile(r"Deleting \S+ (?P<path>.+?)\(previous status: "),
+    re.compile(r"Deleting \S{1,255} (?P<path>.{1,512}?)\(previous status: "),
     re.compile(
         r"(?:File deletion skipped, missing or unsafe file|Skipping already "
         r"processed file|Unsafe file path skipped): (?P<path>.+)"
     ),
-    re.compile(r"Failed to delete file (?P<path>.+?): "),
+    re.compile(r"Failed to delete file (?P<path>.{1,512}?): "),
     re.compile(r"Successfully deleted source files: (?P<list>.+)"),
 )
 # Something every pattern above needs, to skip ordinary lines cheaply.
@@ -561,7 +692,9 @@ class RedactFilter(logging.Filter):
                 # last frames, where the exception line is.
                 redacted = redact_traceback(message, self.exc_max)
             else:
-                redacted = redact(message, self.msg_max)
+                # Lines in a known pipeline or deletion shape carry a stored
+                # file_path whatever its extension: masked whole first.
+                redacted = redact_pipeline(message, self.msg_max)
             if redacted != message or args:
                 record.msg = redacted
                 record.args = None

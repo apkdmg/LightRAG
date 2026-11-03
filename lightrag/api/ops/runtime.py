@@ -11,14 +11,17 @@ logged and the console reports what is unavailable instead.
 
 It also starts this worker's heartbeat (every process) and the dependency
 probes (a leased singleton on Postgres; local to each process without it),
-and, on Postgres, run tracking (this worker's buffered run writer) and the
-leased reconcile + attention cycle.
+and, on Postgres, run tracking (this worker's buffered run writer), the
+leased reconcile + attention cycle, the structured log sink (this worker's
+handler and flusher) and the leased log retention.
 
 Switches (all default on): ``OPS_ENABLED`` (the whole backend),
 ``OPS_INDEX_BUILD`` (the background index builder), ``OPS_QUEUE_SCAN``
 (the email re-sync queue scan), ``OPS_PROBES_ENABLED`` (dependency
 probes) and ``OPS_RUN_TRACKING`` (run and failure tracking; off makes
-every pipeline hook a no-op).
+every pipeline hook a no-op). ``OPS_LOG_SINK`` (default **off** until the
+write volume has been measured) stores WARNING+ log lines in
+``LIGHTRAG_OPS_LOGS``; off means no handler is attached at all.
 """
 
 from __future__ import annotations
@@ -67,6 +70,7 @@ class OpsRuntime:
     heartbeat: Optional[Heartbeat] = None
     probes: Any = None
     run_tracker: Any = None
+    log_sink: Any = None
 
     def leases_held(self) -> list[str]:
         return [
@@ -96,6 +100,17 @@ class OpsRuntime:
             )
 
     async def _forget(self, workspace: str) -> None:
+        sink = self.log_sink
+        if sink is not None:
+            # Same rule as the run rows: nothing buffered for the workspace
+            # is written after its stored lines are deleted.
+            try:
+                await sink.forget_flushed(workspace)
+            except Exception as e:
+                logger.warning(
+                    "Dropping a deleted workspace's buffered log lines failed (%s)",
+                    type(e).__name__,
+                )
         tracker = self.run_tracker
         if tracker is not None:
             # Rows buffered for the workspace are dropped before its stored
@@ -241,6 +256,52 @@ def _start_run_tracking(app: Any, runtime: OpsRuntime) -> None:
     logger.info("Operations console: run tracking on")
 
 
+def _start_log_sink(app: Any, runtime: OpsRuntime) -> None:
+    """Attach this worker's structured log handler and start its flusher."""
+    from lightrag.api.ops import log_sink
+
+    level = max(
+        logging.DEBUG,
+        log_sink.level_from(os.getenv("OPS_LOG_LEVEL"), log_sink.DEFAULT_LEVEL),
+    )
+    sink = log_sink.OpsLogSink(
+        runtime.store,
+        runtime.worker_id,
+        level=level,
+        workers=_process(app)["expected"],
+    )
+    sink.start()
+    sink.attach()
+    runtime.log_sink = sink
+    if runtime.heartbeat is not None:
+        runtime.heartbeat.log_sink = sink
+    logger.info(
+        "Operations console: storing %s+ log lines", logging.getLevelName(level)
+    )
+
+
+def _start_log_retention(runtime: OpsRuntime) -> None:
+    from lightrag.api.ops import log_sink
+
+    days = log_sink.retention_days()
+
+    async def cycle(loop: LeasedLoop) -> None:
+        await log_sink.retention_cycle(loop, store=runtime.store, days=days)
+
+    loop = LeasedLoop(
+        runtime.store,
+        log_sink.RETENTION_LEASE,
+        runtime.worker_id,
+        cycle,
+        ttl_s=log_sink.RETENTION_LEASE_TTL_S,
+        interval_s=log_sink.RETENTION_INTERVAL_S,
+        cycle_timeout_s=log_sink.RETENTION_CYCLE_TIMEOUT_S,
+        initial_delay_s=random.uniform(60.0, 300.0),
+    )
+    loop.start()
+    runtime.loops.append(loop)
+
+
 def _start_reconcile(app: Any, runtime: OpsRuntime) -> None:
     from lightrag.api.ops import reconcile
 
@@ -354,6 +415,20 @@ async def _start(app: Any, rag: Any, args: Any) -> OpsRuntime:
         _start_reconcile(app, runtime)
     except Exception:
         logger.error("Operations console attention loop could not start", exc_info=True)
+    if env_flag("OPS_LOG_SINK", default=False):
+        try:
+            _start_log_sink(app, runtime)
+        except Exception:
+            logger.error("Operations console log sink could not start", exc_info=True)
+    else:
+        logger.info(
+            "Operations console: log sink off (OPS_LOG_SINK=false); log views "
+            "show stored lines only"
+        )
+    try:
+        _start_log_retention(runtime)
+    except Exception:
+        logger.error("Operations console log retention could not start", exc_info=True)
 
     add_event_sink(runtime.on_event)
     if env_flag("OPS_INDEX_BUILD"):
@@ -394,6 +469,12 @@ async def stop_ops(app: Any) -> None:
     if not isinstance(runtime, OpsRuntime):
         return
     remove_event_sink(runtime.on_event)
+    if runtime.log_sink is not None:
+        # Detached first, so nothing logged while stopping is buffered.
+        try:
+            await runtime.log_sink.stop()
+        except Exception:
+            logger.debug("Ops log sink did not stop cleanly", exc_info=True)
     if runtime.run_tracker is not None:
         from lightrag.api.ops import runs
 

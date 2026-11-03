@@ -7,6 +7,9 @@ renewal copies forward for up to a week. Every ops POST therefore also uses:
   current ``ADMIN_ACCOUNTS`` (or, for service accounts, the current admin
   client allowlist or shared-key role), and must not be an impersonated
   session;
+- :func:`require_operator` (exports, reveals and other forceful actions):
+  when ``OPS_OPERATOR_ACCOUNTS`` is set, the caller must be listed there
+  (D8); when it is unset every admin is an operator;
 - :func:`require_ops_client`: CSRF protection (FR-77). The request must carry
   ``X-LightRAG-Client: webui`` (axios sends it on every call; a cross-site form
   cannot), a body, if any, must be JSON, and a browser request must come from
@@ -21,6 +24,7 @@ Refusals are fixed codes; nothing about the account is echoed back.
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any, Optional
 from urllib.parse import urlsplit
 
@@ -79,6 +83,33 @@ async def require_live_admin(user: UserInfo = Depends(require_admin)) -> UserInf
         live = False
     if not live:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "admin_not_current")
+    return user
+
+
+def operator_accounts() -> set[str]:
+    """``OPS_OPERATOR_ACCOUNTS`` (comma-separated, case-insensitive)."""
+    raw = os.getenv("OPS_OPERATOR_ACCOUNTS", "")
+    return {a.strip().lower() for a in raw.split(",") if a.strip()}
+
+
+def is_operator(user: UserInfo) -> bool:
+    """When no operator list is set, every admin is an operator (D8)."""
+    accounts = operator_accounts()
+    if not accounts:
+        return True
+    candidates = {user.username}
+    metadata = user.metadata or {}
+    for key in ("email", "preferred_username"):
+        value = metadata.get(key)
+        if isinstance(value, str):
+            candidates.add(value)
+    return any(c and c.strip().lower() in accounts for c in candidates)
+
+
+async def require_operator(user: UserInfo = Depends(require_live_admin)) -> UserInfo:
+    """Operator-only routes: a live admin who is also an operator (D8)."""
+    if not is_operator(user):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "not_operator")
     return user
 
 

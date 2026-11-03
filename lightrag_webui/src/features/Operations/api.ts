@@ -1,4 +1,4 @@
-import { axiosInstance } from '@/api/lightrag'
+import { axiosInstance, toApiError } from '@/api/lightrag'
 import {
   normalizeActive,
   normalizeDocument,
@@ -17,6 +17,8 @@ import {
   normalizeWorkspace
 } from './normalize'
 import { normalizeConfig, normalizeDepDetail, normalizeHealth, normalizeProbeResult, normalizeSmtpTest, normalizeWorkerHistory, normalizeWorkers } from './health/model'
+import { filenameFromDisposition } from './logs'
+import { normalizeCorrelate, normalizeLogDetail, normalizeLogGroups, normalizeLogPage } from './logsNormalize'
 
 /**
  * Operations API client. Every route lives under /admin/ops behind the
@@ -48,7 +50,10 @@ export const post = async <T>(path: string, body?: unknown, signal?: AbortSignal
 export type OpsFeatures = {
   durable: boolean
   runs: boolean
+  /** Stored log lines can be read (the ops store is reachable). */
   logs: boolean
+  /** This server stores new WARNING+ lines (OPS_LOG_SINK); false means nothing new is written. */
+  log_sink: boolean
   probes: boolean
   alerts: boolean
   insights: boolean
@@ -285,7 +290,7 @@ export type RunDetail = Generated & {
   run: OpsRun | null
   /** Documents that failed in this run (at most 200), newest first. */
   failures: DocFailure[]
-  /** Log lines carrying this run_id; null until the log viewer ships. */
+  /** WARNING+ log lines carrying this run_id; null when the server cannot count them. */
   log_count: Num
 }
 
@@ -580,7 +585,8 @@ export type DocumentDetail = Generated & {
   calls: LlmCall[]
   /** False when Token Insights is not recording, so calls cannot be listed. */
   calls_available?: boolean
-  logs?: { count: number | null; first: unknown[] } | null
+  /** WARNING+ log lines carrying this doc_id (PR-5): a capped count and the newest rows. */
+  logs?: { available?: boolean; count: number | null; first: unknown[] } | null
 }
 
 // ---------- health and workers ----------
@@ -741,6 +747,139 @@ export type OpsConfig = Generated & {
 
 export type SmtpTestResult = { ok: boolean; error_class?: string | null; latency_ms?: Num; detail?: Record<string, unknown> | null }
 
+// ---------- logs and correlate (PR-5) ----------
+
+/** The (ts, id) keyset position of a row (FR-21). */
+export type LogCursor = { ts: string; id: number }
+
+/**
+ * One row of LIGHTRAG_OPS_LOGS (§3.5), redacted when it was written. `exc`
+ * (the redacted traceback) comes only from /logs/{id}; list rows say
+ * `has_exc`. `repeat_count` > 1 is identical lines coalesced by the sink.
+ */
+export type LogEntry = {
+  id: number
+  ts: string
+  /** Python level number (30 WARNING, 40 ERROR, 50 CRITICAL). */
+  level: number
+  logger: string
+  module: string | null
+  lineno: number | null
+  pid: number | null
+  worker_id: string | null
+  workspace: string | null
+  request_id: string | null
+  client_request_id: string | null
+  run_id: string | null
+  track_id: string | null
+  doc_id: string | null
+  operation: string | null
+  source: string | null
+  msg: string
+  exc_type: string | null
+  has_exc: boolean
+  exc: string | null
+  fingerprint: string | null
+  repeat_count: number
+}
+
+export type LogPage = Generated & {
+  items: LogEntry[]
+  /** The cursor for the next older page; null on the last one. */
+  next_before: LogCursor | null
+  newest_ts: string | null
+  /** False when the server's log sink is off (OPS_LOG_SINK=false). */
+  enabled?: boolean
+}
+
+export type LogDetail = Generated & { entry: LogEntry | null; exc_withheld: boolean }
+
+/** A call site (fingerprint) in the grouped view (FR-23). */
+export type LogGroup = {
+  fingerprint: string
+  logger: string
+  module: string | null
+  lineno: number | null
+  level: number
+  exc_type: string | null
+  /** A redacted sample message. */
+  sample: string
+  count: number
+  first_seen: string | null
+  last_seen: string | null
+  workspaces: number | null
+}
+
+export type LogGroups = Generated & { groups: LogGroup[] }
+
+export type CorrelateType = 'request' | 'log' | 'run' | 'track' | 'doc' | 'workspace' | 'owner'
+
+/** One thing an ID resolved to (FR-50); owner emails come back masked with their workspace. */
+export type CorrelateMatch = {
+  type: CorrelateType
+  id: string
+  workspace: string | null
+  ts: string | null
+  /** A safe display text (a masked email, a masked file name). */
+  label: string | null
+  /** Rows behind the match (log lines for a request id). */
+  count: number | null
+}
+
+export type Correlate = Generated & { query: string | null; matches: CorrelateMatch[] }
+
+export type LogExportFormat = 'ndjson' | 'csv'
+
+export type LogExportRequest = {
+  filters: Record<string, string>
+  reason: string
+  include_exc: boolean
+  format: LogExportFormat
+}
+
+/** What an export answered: the file is already saved; `auditId` when the server named it. */
+export type LogExportResult = { filename: string; rows: number | null; auditId: string | null }
+
+const headerOf = (headers: unknown, name: string): string | null => {
+  if (!headers || typeof headers !== 'object') return null
+  const h = headers as { get?: (key: string) => unknown } & Record<string, unknown>
+  const value = typeof h.get === 'function' ? h.get(name) : (h[name] ?? h[name.toLowerCase()])
+  return typeof value === 'string' && value ? value : null
+}
+
+/**
+ * POST a redacted export and save the answer as a file (§2.5 Export…). The
+ * response is a blob, so an error body is read back as JSON here: the
+ * refusal code (not_operator, rate_limited) and the request ID reach the
+ * dialog like any other error.
+ */
+async function postDownload(path: string, body: unknown, fallbackName: string): Promise<LogExportResult> {
+  const response = await axiosInstance.post(`${OPS_PREFIX}${path}`, body, { responseType: 'blob', validateStatus: () => true })
+  if (response.status >= 400) {
+    let data: unknown
+    try {
+      const text = await (response.data as Blob).text()
+      data = text ? JSON.parse(text) : null
+    } catch {
+      data = null
+    }
+    throw toApiError({ status: response.status, statusText: response.statusText, data, headers: response.headers }, path)
+  }
+  const filename = filenameFromDisposition(headerOf(response.headers, 'content-disposition'), fallbackName)
+  const url = URL.createObjectURL(response.data as Blob)
+  try {
+    const link = document.createElement('a')
+    link.href = url
+    link.download = filename
+    link.click()
+  } finally {
+    // Revoke after the click has been handled, so the download can start.
+    setTimeout(() => URL.revokeObjectURL(url), 1000)
+  }
+  const rows = Number(headerOf(response.headers, 'x-ops-export-rows'))
+  return { filename, rows: Number.isFinite(rows) && rows >= 0 ? rows : null, auditId: headerOf(response.headers, 'x-ops-audit-id') }
+}
+
 // ---------- the client ----------
 
 const enc = encodeURIComponent
@@ -780,7 +919,17 @@ export const opsApi = {
   /** Re-check one dependency now (rate-limited on the server: one per 10 s per dependency, host-wide). */
   recheck: async (dep: string) => normalizeProbeResult(dep, await post(`/health/${enc(dep)}/probe`)),
   /** EHLO, STARTTLS and NOOP against the configured SMTP server; never sends mail (1 per minute). */
-  smtpTest: async () => normalizeSmtpTest(await post('/smtp/test'))
+  smtpTest: async () => normalizeSmtpTest(await post('/smtp/test')),
+  /** Log rows, newest first (FR-20, FR-21). `before` pages older; `after_ts` follows newer rows (FR-22). */
+  logs: async (params: Params, signal?: AbortSignal) => normalizeLogPage(await get('/logs', params, signal)),
+  logEntry: async (id: string | number, signal?: AbortSignal) => normalizeLogDetail(await get(`/logs/${enc(String(id))}`, undefined, signal)),
+  /** Rows grouped by call site (FR-23). */
+  logGroups: async (params: Params, signal?: AbortSignal) => normalizeLogGroups(await get('/logs/groups', params, signal)),
+  /** Redacted export of the current filters, at most 10k rows, audited and operator-only (FR-25). */
+  exportLogs: (body: LogExportRequest) =>
+    postDownload('/logs/export', body, `ops-logs-${new Date().toISOString().slice(0, 10)}.${body.format === 'csv' ? 'csv' : 'ndjson'}`),
+  /** Resolves a pasted ID or owner email to what it names (FR-50). */
+  correlate: async (id: string, signal?: AbortSignal) => normalizeCorrelate(await get('/correlate', { id }, signal))
 }
 
 /** Pause counts as flat rows, whichever of the two server shapes arrives. */

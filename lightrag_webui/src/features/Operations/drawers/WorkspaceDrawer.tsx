@@ -6,6 +6,7 @@ import { Kv, Seg } from '@/features/TokenInsights/ui'
 import { useSettingsStore } from '@/stores/settings'
 import { Feed, WorkspaceDetail, opsApi } from '../api'
 import ErrorPanel from '../components/ErrorPanel'
+import LogSection from '../components/LogSection'
 import OpsLink from '../components/OpsLink'
 import { ApproxChip, Pager, StaleChip } from '../components/Panel'
 import { RunStateLabel } from '../components/RunState'
@@ -401,6 +402,10 @@ export default function WorkspaceDrawer({ workspace }: { workspace: string }) {
         </div>
       ) : null}
       <LiveFeed workspace={workspace} />
+      <LogSection
+        title={typeof d?.errors_1h === 'number' ? t('operations.workspace.logs', { count: d.errors_1h }) : t('operations.workspace.logsTitle')}
+        filter={{ workspace, window: '24h' }}
+      />
       <Documents workspace={workspace} />
       <div className="flex flex-wrap gap-2 pb-2">
         <button type="button" className="hover:bg-muted inline-flex min-h-8 items-center gap-1.5 rounded-lg border px-3 text-[13px]" onClick={copy}>

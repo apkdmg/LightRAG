@@ -1482,10 +1482,6 @@
     },
     "later": {
       "note": "This section arrives in a later release.",
-      "logs": {
-        "title": "Logs",
-        "body": "A searchable view of WARNING and ERROR log lines, redacted when they are written, will appear here. Error messages already show a Ref: request ID that matches the server log line."
-      },
       "performance": {
         "title": "Performance",
         "body": "LLM, embedding and rerank latency, HTTP routes, throughput and concurrency will appear here. Token use and cost stay in Token Insights."
@@ -2122,11 +2118,12 @@
       "failures_one": "Failed documents ({{count}})",
       "failures_other": "Failed documents ({{count}})",
       "noFailures": "No document failed in this run.",
-      "logCount_one": "{{count}} log line carries this run ID.",
-      "logCount_other": "{{count}} log lines carry this run ID.",
       "retention": "Runs and their failures are kept for 30 days.",
       "notFound": "This run is not in the run table. Runs are kept for 30 days.",
-      "unavailable": "Run details need run tracking and PostgreSQL storage, which this server does not have."
+      "unavailable": "Run details need run tracking and PostgreSQL storage, which this server does not have.",
+      "logs_one": "Log lines ({{count}} carries this run ID)",
+      "logs_other": "Log lines ({{count}} carry this run ID)",
+      "logsTitle": "Log lines for this run"
     },
     "pager": {
       "previous": "Previous",
@@ -2151,7 +2148,8 @@
       },
       "dependencyTitle": "Dependency {{name}}",
       "workerTitle": "Worker {{id}}",
-      "runTitle": "Run {{id}}"
+      "runTitle": "Run {{id}}",
+      "logTitle": "Log entry #{{id}}"
     },
     "workspace": {
       "owner": "Owner {{owner}}",
@@ -2190,7 +2188,10 @@
       "runsOff": "Run tracking is turned off on this server (OPS_RUN_TRACKING=false).",
       "noRuns": "No runs recorded for this workspace in the last 30 days.",
       "allFailures": "All failures",
-      "failuresWindow": "Classified failures in the last 7 days."
+      "failuresWindow": "Classified failures in the last 7 days.",
+      "logs_one": "Errors in logs: {{count}} in the last hour",
+      "logs_other": "Errors in logs: {{count}} in the last hour",
+      "logsTitle": "Log lines for this workspace"
     },
     "document": {
       "path": "{{workspace}} › {{id}}",
@@ -2233,7 +2234,10 @@
       "failureStage": "Stage",
       "failureModel": "Model",
       "firstFailed": "First failed",
-      "lastRun": "Last run"
+      "lastRun": "Last run",
+      "logs": "Log lines for this document",
+      "logsCount_one": "Log lines ({{count}} for this document)",
+      "logsCount_other": "Log lines ({{count}} for this document)"
     },
     "dep": {
       "postgres": "PostgreSQL",
@@ -2613,7 +2617,8 @@
       "configPartial": "The configuration answer is incomplete, so the status card cannot be shown.",
       "configNote": "Configuration is the same for every worker; queues are this worker's. URLs carry no credentials and secrets are redacted on the server.",
       "gone": "This worker is no longer reported. Rows are kept for 24 hours after the last heartbeat.",
-      "privacy": "Command line and environment are never shown."
+      "privacy": "Command line and environment are never shown.",
+      "logs": "Log lines from this process (24 h)"
     },
     "host": {
       "title": "Host and container",
@@ -2731,6 +2736,185 @@
       "targetError": "{{target}}: {{error}}",
       "paths": "Disks",
       "pathRow": "{{path}}: {{free}}% free ({{used}} of {{total}})"
+    },
+    "logs": {
+      "viewLabel": "Log view",
+      "stream": "Stream",
+      "grouped": "Grouped",
+      "followOn": "Following",
+      "followOff": "Follow",
+      "followOnHint": "New lines are added every 5 seconds. Click to pause.",
+      "followOffHint": "Paused. Click to add new lines every 5 seconds.",
+      "following": "Following: new lines every {{seconds}} s.",
+      "followPaused": "Follow is held while “⏸ auto” is on. Resume to add new lines.",
+      "snapshot": "Paused at {{time}}. Follow to add new lines.",
+      "export": "Export…",
+      "filters": "Filters ({{count}})",
+      "level": "Level",
+      "levelOption": {
+        "WARNING": "WARNING and above",
+        "ERROR": "ERROR and above",
+        "CRITICAL": "CRITICAL only",
+        "INFO": "Everything stored (INFO and above)"
+      },
+      "window": {
+        "label": "Time",
+        "15m": "Last 15 min",
+        "1h": "Last hour",
+        "6h": "Last 6 hours",
+        "24h": "Last 24 hours",
+        "7d": "Last 7 days"
+      },
+      "workspace": "Workspace",
+      "workspacePlaceholder": "Exact workspace",
+      "module": "Module",
+      "modulePlaceholder": "pipeline, uvicorn.error…",
+      "text": "Text contains",
+      "textPlaceholder": "Search the last 24 h",
+      "textWindow": "Text search covers at most the last 24 hours, so the time filter is narrowed while it is set.",
+      "id": {
+        "request_id": "request_id",
+        "run_id": "run_id",
+        "track_id": "track_id",
+        "doc_id": "doc_id"
+      },
+      "field": {
+        "workspace": "workspace",
+        "module": "module",
+        "q": "text",
+        "request_id": "request",
+        "run_id": "run",
+        "track_id": "track",
+        "doc_id": "doc",
+        "fingerprint": "call site",
+        "worker_id": "worker"
+      },
+      "active": "Active:",
+      "removeFilter": "Remove the {{field}} filter",
+      "copyLink": "Copy link",
+      "linkCopied": "Link to this view copied",
+      "linkCopyFailed": "Could not copy the link",
+      "clear": "Clear",
+      "listLabel": "Log lines, newest first",
+      "col": {
+        "time": "Time",
+        "level": "Level",
+        "pid": "PID",
+        "source": "Module",
+        "workspace": "Workspace",
+        "message": "Message"
+      },
+      "ctx": {
+        "run": "run {{id}}",
+        "track": "track {{id}}",
+        "doc": "doc {{id}}",
+        "request": "req {{id}}"
+      },
+      "traceback": "traceback",
+      "repeatHint": "Identical lines written together, stored once",
+      "newRows_one": "{{count}} new line",
+      "newRows_other": "{{count}} new lines",
+      "empty": "No {{level}}+ entries for these filters.",
+      "emptyHint": "INFO is not stored by default. Widen the time window or remove a filter.",
+      "sectionEmpty": "No {{level}}+ lines stored for this.",
+      "loadOlder": "Load older",
+      "loading": "Loading…",
+      "end": "That is everything in the window ({{window}}).",
+      "capped": "Showing the newest {{cap}} lines. Narrow the filters, or export, to see older ones.",
+      "footer": "Showing {{count}} · redacted when written",
+      "privacy": "Log lines are redacted when they are written (emails, IC and phone numbers, keys, tokens, file names). Masked values cannot be revealed. Times are local; hover for UTC.",
+      "maskedHint": "Masked on the server when the line was written",
+      "token": {
+        "email": "email",
+        "ic": "ic",
+        "phone": "phone",
+        "redacted": "secret",
+        "jwt": "token",
+        "hex": "hex",
+        "b64": "data",
+        "num": "number"
+      },
+      "openInLogs": "Open in Logs",
+      "sinkOff": "The log sink is off on this server (OPS_LOG_SINK=false), so new lines are not being stored. Lines stored earlier still show.",
+      "sinkOffShort": "The log sink is off on this server; new lines are not stored.",
+      "groupsTitle": "Grouped by call site",
+      "groupsSub": "Lines in the last {{hours}} h, counted by where they were logged.",
+      "groupsEmpty": "No lines in the last {{hours}} h for these filters.",
+      "groupsUnavailable": "The grouped view is not available on this server version. Use the stream view.",
+      "groupCol": {
+        "count": "Count",
+        "level": "Level",
+        "site": "Call site",
+        "message": "Message",
+        "first": "First",
+        "last": "Last",
+        "workspaces": "Workspaces",
+        "show": "Show"
+      }
+    },
+    "logEntry": {
+      "notFound": "This log line no longer exists (lines are kept for 14 days) or the ID is wrong.",
+      "traceback": "Traceback ({{count}} lines)",
+      "excWithheld": "The traceback is stored but not shown to your account.",
+      "excMissing": "{{type}}: no traceback was stored for this line.",
+      "workspace": "Workspace",
+      "request": "Request",
+      "clientRequest": "Client request ID",
+      "run": "Run",
+      "track": "Track",
+      "doc": "Document",
+      "process": "Process",
+      "operation": "Operation",
+      "fingerprint": "Call site",
+      "repeats": "×{{count}} written together",
+      "copyRequest": "Copy request ID",
+      "requestCopied": "Request ID copied",
+      "copyFailed": "Could not copy",
+      "sameRequest": "Same request",
+      "sameRun": "Same run",
+      "sameDoc": "Same document",
+      "sameFingerprint": "Same call site",
+      "maskNote": "Masked spans were redacted when the line was written. They cannot be revealed."
+    },
+    "export": {
+      "title": "Export log lines",
+      "body": "Downloads the lines that match the current filters, newest first, at most {{cap}} rows. Lines are already redacted. The export and its reason are recorded in the audit log.",
+      "operatorOnly": "Only operators can export log lines.",
+      "reason": "Reason",
+      "reasonPlaceholder": "Ticket number or what the export is for",
+      "reasonHint": "Recorded in the audit log with your name.",
+      "format": "Format",
+      "formats": {
+        "ndjson": "NDJSON (one JSON object per line)",
+        "csv": "CSV (spreadsheet-safe)"
+      },
+      "includeExc": "Include tracebacks",
+      "includeExcHint": "Redacted too, but larger and more detailed, so the export stops at 2,000 rows. Leave off unless you need them.",
+      "cancel": "Cancel",
+      "submit": "Export",
+      "working": "Working…",
+      "done": "Export saved as {{file}}",
+      "doneAudit": "Export saved as {{file}} (audit {{audit}})"
+    },
+    "correlate": {
+      "label": "Find by ID",
+      "placeholder": "Paste a request, run, track or doc ID, a workspace or an owner email…",
+      "go": "Go",
+      "invalid": "Paste a single ID or email (no spaces, at most 320 characters).",
+      "matches_one": "{{count}} match",
+      "matches_other": "{{count}} matches",
+      "none": "No match for “{{query}}”.",
+      "noneHint": "Request IDs are kept for 14 days with their log lines; runs for 30 days. Check for a typo, or search the Logs tab.",
+      "close": "Close the results",
+      "type": {
+        "request": "Request (log lines)",
+        "log": "Log line",
+        "run": "Run",
+        "track": "Track (log lines)",
+        "doc": "Document",
+        "workspace": "Workspace",
+        "owner": "Owner’s workspace"
+      }
     }
   }
 }

@@ -14,8 +14,10 @@ import RefreshHairline from './components/RefreshHairline'
 import Skeleton from './components/Skeleton'
 import { OverallStateChip } from './components/StatusChip'
 import { DrawerMove, OpsNav, OpsNavContext, OpsOverviewContext, OpsShellContext, useOpsNav } from './context'
+import CorrelateBar from './components/CorrelateBar'
 import DependencyDrawer from './drawers/DependencyDrawer'
 import DocumentDrawer from './drawers/DocumentDrawer'
+import LogEntryDrawer from './drawers/LogEntryDrawer'
 import RunDrawer from './drawers/RunDrawer'
 import UnsupportedDrawer from './drawers/UnsupportedDrawer'
 import WorkerDrawer from './drawers/WorkerDrawer'
@@ -132,6 +134,9 @@ function Header({ poll, overview, reloadAll }: { poll: OpsPoll<OpsStatus>; overv
         >
           {t('operations.reduceMotion')}
         </button>
+      </div>
+      <div className="basis-full">
+        <CorrelateBar />
       </div>
       <RefreshHairline slow={poll.slow || overview.slow} />
     </div>
@@ -329,6 +334,7 @@ function renderDrawer(drawer: Drawer) {
   if (drawer.kind === 'run') return <RunDrawer runId={drawer.id} />
   if (drawer.kind === 'dependency') return <DependencyDrawer dep={drawer.id} />
   if (drawer.kind === 'worker') return <WorkerDrawer workerId={drawer.id} />
+  if (drawer.kind === 'log') return <LogEntryDrawer id={drawer.id} />
   return <UnsupportedDrawer kind={drawer.kind} />
 }
 

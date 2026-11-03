@@ -146,7 +146,7 @@ def test_run_drawer(client):
     assert run["live"]["busy"] is True
     assert "Senate minutes" not in (run["label"] or "")
     assert [f["error_kind"] for f in body["failures"]] == ["cancelled", "rate_limited"]
-    assert body["log_count"] is None
+    assert body["log_count"] == 0  # no stored log lines carry this run
     orphan = client.get(f"/admin/ops/runs/{ORPHAN_RUN_ID}").json()["run"]
     assert orphan["status"] == "orphaned" and orphan["owns_busy"] is True
     assert client.get("/admin/ops/runs/" + "0" * 32).status_code == 404

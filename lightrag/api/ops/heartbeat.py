@@ -10,9 +10,9 @@ sparklines.
 The snapshot holds whitelisted numbers only: memory, CPU, file descriptors,
 threads, event-loop lag, the shared pool's size and acquire wait, the shared
 state Manager's round-trip time (multi-worker only), queue sums over the
-loaded LightRAG instances, the Insights recorder's health, the email re-sync
-drainers and, once a minute, container and disk usage. Never command lines,
-environment or arguments.
+loaded LightRAG instances, the Insights recorder's and the log sink's health,
+the email re-sync drainers and, once a minute, container and disk usage.
+Never command lines, environment or arguments.
 
 Liveness rules (read side, see :mod:`lightrag.api.ops.service`):
 
@@ -345,6 +345,9 @@ class Heartbeat:
         self.host_sampler = HostSampler(host_paths)
         self._lost = _DropWindow()
         self._dropped = _DropWindow()
+        self._sink_dropped = _DropWindow()
+        self._sink_limited = _DropWindow()
+        self._sink_failures = _DropWindow()
         self.snapshot: dict[str, Any] = {}
         self.last_beat_at: Optional[float] = None
         self.last_write_ok_at: Optional[float] = None
@@ -352,6 +355,8 @@ class Heartbeat:
         self.write_failures = 0
         # Set by the ops runtime when run tracking runs in this process.
         self.run_tracker: Any = None
+        # Set by the ops runtime when the structured log sink runs here.
+        self.log_sink: Any = None
         self._failing = False
         self._last_sample_at = 0.0
         self._last_host_at = 0.0
@@ -481,6 +486,32 @@ class Heartbeat:
             "running": bool(data.get("running")),
         }
 
+    def _log_sink(self, now: float) -> Optional[dict[str, Any]]:
+        """The structured log sink's health (None when it is off here)."""
+        sink = self.log_sink
+        if sink is None:
+            return None
+        stats = sink.stats()
+        dropped = int(stats.get("dropped") or 0)
+        limited = int(stats.get("rate_limited") or 0)
+        failures = int(stats.get("write_failures") or 0)
+        return {
+            "level": stats.get("level"),
+            "attached": bool(stats.get("attached")),
+            "buffer": int(stats.get("buffer") or 0),
+            "written": int(stats.get("written") or 0),
+            "dropped": dropped,
+            "rate_limited": limited,
+            "write_failures": failures,
+            "bad_rows": int(stats.get("bad_rows") or 0),
+            "last_flush_ok_at": stats.get("last_flush_ok_at"),
+            "last_flush_age_s": stats.get("last_flush_age_s"),
+            "last_flush_error": stats.get("last_flush_error"),
+            "dropped_5m": self._sink_dropped.add(now, dropped),
+            "rate_limited_5m": self._sink_limited.add(now, limited),
+            "write_failures_5m": self._sink_failures.add(now, failures),
+        }
+
     def _drainers(self) -> list[dict[str, Any]]:
         queue = getattr(self.app_state, "email_resync_queue", None)
         states = getattr(queue, "drainer_states", None)
@@ -530,7 +561,10 @@ class Heartbeat:
             snapshot["recorder"] = self._recorder(now)
         except Exception:
             snapshot["recorder"] = None
-        snapshot["log_sink"] = None
+        try:
+            snapshot["log_sink"] = self._log_sink(now)
+        except Exception:
+            snapshot["log_sink"] = None
         try:
             tracker = self.run_tracker
             snapshot["run_tracking"] = tracker.stats() if tracker is not None else None
