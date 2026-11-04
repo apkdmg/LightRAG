@@ -1,3 +1,5 @@
+import contextlib
+
 import pytest
 import numpy as np
 from unittest.mock import patch, AsyncMock
@@ -18,6 +20,7 @@ def mock_pg_db():
     db = AsyncMock()
     db.workspace = "test_workspace"
     db.vector_index_type = None
+    db.ddl_lock = contextlib.nullcontext  # start-up DDL lock is a no-op here
 
     # Mock query responses: list for search queries (multirows=True), dict for DDL checks
     async def mock_query(sql, params=None, multirows=False, **kwargs):

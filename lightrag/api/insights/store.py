@@ -509,7 +509,7 @@ class PostgresUsageStore(UsageStore):
         )
         dims = ", ".join(f"{d} VARCHAR(255) NOT NULL DEFAULT ''" for d in DIMENSIONS)
         dim_names = ", ".join(DIMENSIONS)
-        for statement in (
+        statements = (
             f"""CREATE TABLE IF NOT EXISTS {_TABLE_CALLS} (
                 id BIGSERIAL PRIMARY KEY,
                 ts TIMESTAMPTZ NOT NULL,
@@ -555,8 +555,12 @@ class PostgresUsageStore(UsageStore):
                 value JSONB NOT NULL,
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
             )""",
-        ):
-            await self._db.execute(statement)
+        )
+        # Workers starting together against an empty database would race on
+        # CREATE ... IF NOT EXISTS; take turns.
+        async with self._db.ddl_lock():
+            for statement in statements:
+                await self._db.execute(statement)
 
     async def finalize(self) -> None:
         if self._db is not None:

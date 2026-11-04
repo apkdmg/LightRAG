@@ -7,11 +7,13 @@ import re
 import datetime
 from datetime import timezone
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable, TypeVar, Union, final
+from typing import Any, AsyncIterator, Awaitable, Callable, TypeVar, Union, final
 import numpy as np
 import configparser
+import contextvars
 import ssl
 import itertools
+from contextlib import asynccontextmanager
 
 from lightrag.types import KnowledgeGraph, KnowledgeGraphNode, KnowledgeGraphEdge
 
@@ -140,6 +142,41 @@ def _dollar_quote(s: str, tag_prefix: str = "AGE") -> str:
             return f"{wrapper}{s}{wrapper}"
 
 
+# Fixed key for the database-wide advisory lock that serialises startup DDL
+# ("LightRAG" in ASCII). Every process that creates or migrates LightRAG tables
+# takes it, so Gunicorn workers or replicas starting against an empty database
+# don't race on CREATE ... IF NOT EXISTS, which is not safe under concurrency
+# (the loser fails with a unique violation on pg_type / pg_class).
+STARTUP_DDL_LOCK_KEY = 0x4C69676874524147
+
+# Set while the current task (and tasks it spawns) holds the startup DDL lock,
+# so nested ddl_lock() calls don't open a second session and deadlock.
+_ddl_lock_held: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "lightrag_pg_ddl_lock_held", default=False
+)
+_DDL_LOCK_POLL_SECONDS = 0.2
+
+
+async def _acquire_ddl_lock(connection: asyncpg.Connection) -> None:
+    """Take the startup DDL advisory lock on ``connection``, polling until free.
+
+    Waiters poll with ``pg_try_advisory_lock`` instead of blocking in
+    ``pg_advisory_lock``: a blocked statement keeps a snapshot open, and the
+    holder's ``CREATE INDEX CONCURRENTLY`` waits for every older snapshot to
+    finish, which would deadlock without Postgres noticing.
+    """
+    waited = False
+    while not await connection.fetchval(
+        "SELECT pg_try_advisory_lock($1)", STARTUP_DDL_LOCK_KEY
+    ):
+        if not waited:
+            logger.info(
+                "PostgreSQL, waiting for another process to finish start-up DDL"
+            )
+            waited = True
+        await asyncio.sleep(_DDL_LOCK_POLL_SECONDS)
+
+
 class PostgreSQLDB:
     def __init__(self, config: dict[str, Any], **kwargs: Any):
         self.host = config["host"]
@@ -151,6 +188,8 @@ class PostgreSQLDB:
         self.max = int(config["max_connections"])
         self.increment = 1
         self.pool: Pool | None = None
+        # Parameters for standalone (non-pool) connections, filled in by initdb().
+        self._direct_connect_params: dict[str, Any] | None = None
 
         # SSL configuration
         self.ssl_mode = config.get("ssl_mode")
@@ -335,6 +374,15 @@ class PostgreSQLDB:
                     f"PostgreSQL, Failed to parse server_settings: {self.server_settings}, error: {e}"
                 )
 
+        self._direct_connect_params = {
+            "user": self.user,
+            "password": self.password,
+            "database": self.database,
+            "host": self.host,
+            "port": self.port,
+            "ssl": connection_params.get("ssl"),
+        }
+
         wait_strategy = (
             wait_exponential(
                 multiplier=self.connection_retry_backoff,
@@ -424,15 +472,12 @@ class PostgreSQLDB:
             # using a standalone bootstrap connection.
             # Skip this step if vector support is not enabled.
             if self.enable_vector:
-                bootstrap_conn = await asyncpg.connect(
-                    user=self.user,
-                    password=self.password,
-                    database=self.database,
-                    host=self.host,
-                    port=self.port,
-                    ssl=connection_params.get("ssl"),
-                )
+                bootstrap_conn = await asyncpg.connect(**self._direct_connect_params)
                 try:
+                    # Serialise with other processes: concurrent
+                    # CREATE EXTENSION IF NOT EXISTS can fail with a unique
+                    # violation. Closing the connection releases the lock.
+                    await _acquire_ddl_lock(bootstrap_conn)
                     await self.configure_vector_extension(bootstrap_conn)
                 finally:
                     await bootstrap_conn.close()
@@ -473,6 +518,39 @@ class PostgreSQLDB:
             async with self._pool_reconnect_lock:
                 if self.pool is None:
                     await self.initdb()
+
+    @asynccontextmanager
+    async def ddl_lock(self) -> AsyncIterator[None]:
+        """Hold the database-wide startup DDL lock for the duration of the block.
+
+        Wrap every ``CREATE``/``ALTER``/migration sequence that runs at start-up.
+        Postgres's ``IF NOT EXISTS`` is not safe when two sessions create the
+        same object at once, so processes sharing a database (Gunicorn workers,
+        replicas) take turns here; the later ones then find the objects present.
+
+        The lock is a session-level advisory lock held on a standalone
+        connection outside the pool, so the DDL itself can use any pool
+        connection (including ``CREATE INDEX CONCURRENTLY``, which can't run in
+        a transaction) and a small pool can't deadlock against the holder.
+        Closing the connection releases the lock, also when the block raises.
+        Re-entrant within one task.
+        """
+        if _ddl_lock_held.get():
+            yield
+            return
+        if self._direct_connect_params is None:
+            await self._ensure_pool()
+        assert self._direct_connect_params is not None
+        conn = await asyncpg.connect(**self._direct_connect_params)
+        try:
+            await _acquire_ddl_lock(conn)
+            token = _ddl_lock_held.set(True)
+            try:
+                yield
+            finally:
+                _ddl_lock_held.reset(token)
+        finally:
+            await conn.close()
 
     async def _reset_pool(self) -> None:
         async with self._pool_reconnect_lock:
@@ -2361,7 +2439,8 @@ class ClientManager:
             if cls._instances["db"] is None:
                 db = PostgreSQLDB(config)
                 await db.initdb()
-                await db.check_tables()
+                async with db.ddl_lock():
+                    await db.check_tables()
                 cls._instances["db"] = db
                 cls._instances["ref_count"] = 0
                 cls._instances["vector_signature"] = requested_signature
@@ -3544,14 +3623,15 @@ class PGVectorStorage(BaseVectorStorage):
                 self.workspace = "default"
 
             # Setup table (create if not exists and handle migration)
-            await PGVectorStorage.setup_table(
-                self.db,
-                self.table_name,
-                self.workspace,  # CRITICAL: Filter migration by workspace
-                embedding_dim=self.embedding_func.embedding_dim,
-                legacy_table_name=self.legacy_table_name,
-                base_table=self.legacy_table_name,  # base_table for DDL template lookup
-            )
+            async with self.db.ddl_lock():
+                await PGVectorStorage.setup_table(
+                    self.db,
+                    self.table_name,
+                    self.workspace,  # CRITICAL: Filter migration by workspace
+                    embedding_dim=self.embedding_func.embedding_dim,
+                    legacy_table_name=self.legacy_table_name,
+                    base_table=self.legacy_table_name,  # base_table for DDL template lookup
+                )
 
     async def finalize(self):
         if self.db is not None:
@@ -5138,47 +5218,49 @@ class PGGraphStorage(BaseGraphStorage):
                 f"[{self.workspace}] PostgreSQL Graph initialized: graph_name='{self.graph_name}'"
             )
 
-            # Create AGE extension and configure graph environment once at initialization
-            # Use _run_with_retry so transient connection errors are retried and pool=None
-            # is handled safely (unlike a bare pool.acquire() call).
-            async def _do_configure_age_extension(
-                connection: asyncpg.Connection,
-            ) -> None:
-                await PostgreSQLDB.configure_age_extension(connection)
+            # Serialise graph/label/index creation with other processes.
+            async with self.db.ddl_lock():
+                # Create AGE extension and configure graph environment once at initialization
+                # Use _run_with_retry so transient connection errors are retried and pool=None
+                # is handled safely (unlike a bare pool.acquire() call).
+                async def _do_configure_age_extension(
+                    connection: asyncpg.Connection,
+                ) -> None:
+                    await PostgreSQLDB.configure_age_extension(connection)
 
-            await self.db._run_with_retry(_do_configure_age_extension)
+                await self.db._run_with_retry(_do_configure_age_extension)
 
-            # Execute each statement separately and ignore errors
-            queries = [
-                f"SELECT create_graph('{self.graph_name}')",
-                f"SELECT create_vlabel('{self.graph_name}', 'base');",
-                f"SELECT create_elabel('{self.graph_name}', 'DIRECTED');",
-                # f'CREATE INDEX CONCURRENTLY vertex_p_idx ON {self.graph_name}."_ag_label_vertex" (id)',
-                f'CREATE INDEX CONCURRENTLY vertex_idx_node_id ON {self.graph_name}."_ag_label_vertex" (ag_catalog.agtype_access_operator(properties, \'"entity_id"\'::agtype))',
-                # f'CREATE INDEX CONCURRENTLY edge_p_idx ON {self.graph_name}."_ag_label_edge" (id)',
-                f'CREATE INDEX CONCURRENTLY edge_sid_idx ON {self.graph_name}."_ag_label_edge" (start_id)',
-                f'CREATE INDEX CONCURRENTLY edge_eid_idx ON {self.graph_name}."_ag_label_edge" (end_id)',
-                f'CREATE INDEX CONCURRENTLY edge_seid_idx ON {self.graph_name}."_ag_label_edge" (start_id,end_id)',
-                f'CREATE INDEX CONCURRENTLY directed_p_idx ON {self.graph_name}."DIRECTED" (id)',
-                f'CREATE INDEX CONCURRENTLY directed_eid_idx ON {self.graph_name}."DIRECTED" (end_id)',
-                f'CREATE INDEX CONCURRENTLY directed_sid_idx ON {self.graph_name}."DIRECTED" (start_id)',
-                f'CREATE INDEX CONCURRENTLY directed_seid_idx ON {self.graph_name}."DIRECTED" (start_id,end_id)',
-                f'CREATE INDEX CONCURRENTLY entity_p_idx ON {self.graph_name}."base" (id)',
-                f'CREATE INDEX CONCURRENTLY entity_idx_node_id ON {self.graph_name}."base" (ag_catalog.agtype_access_operator(properties, \'"entity_id"\'::agtype))',
-                f'CREATE INDEX CONCURRENTLY entity_node_id_gin_idx ON {self.graph_name}."base" using gin(properties)',
-                f'ALTER TABLE {self.graph_name}."DIRECTED" CLUSTER ON directed_sid_idx',
-            ]
+                # Execute each statement separately and ignore errors
+                queries = [
+                    f"SELECT create_graph('{self.graph_name}')",
+                    f"SELECT create_vlabel('{self.graph_name}', 'base');",
+                    f"SELECT create_elabel('{self.graph_name}', 'DIRECTED');",
+                    # f'CREATE INDEX CONCURRENTLY vertex_p_idx ON {self.graph_name}."_ag_label_vertex" (id)',
+                    f'CREATE INDEX CONCURRENTLY vertex_idx_node_id ON {self.graph_name}."_ag_label_vertex" (ag_catalog.agtype_access_operator(properties, \'"entity_id"\'::agtype))',
+                    # f'CREATE INDEX CONCURRENTLY edge_p_idx ON {self.graph_name}."_ag_label_edge" (id)',
+                    f'CREATE INDEX CONCURRENTLY edge_sid_idx ON {self.graph_name}."_ag_label_edge" (start_id)',
+                    f'CREATE INDEX CONCURRENTLY edge_eid_idx ON {self.graph_name}."_ag_label_edge" (end_id)',
+                    f'CREATE INDEX CONCURRENTLY edge_seid_idx ON {self.graph_name}."_ag_label_edge" (start_id,end_id)',
+                    f'CREATE INDEX CONCURRENTLY directed_p_idx ON {self.graph_name}."DIRECTED" (id)',
+                    f'CREATE INDEX CONCURRENTLY directed_eid_idx ON {self.graph_name}."DIRECTED" (end_id)',
+                    f'CREATE INDEX CONCURRENTLY directed_sid_idx ON {self.graph_name}."DIRECTED" (start_id)',
+                    f'CREATE INDEX CONCURRENTLY directed_seid_idx ON {self.graph_name}."DIRECTED" (start_id,end_id)',
+                    f'CREATE INDEX CONCURRENTLY entity_p_idx ON {self.graph_name}."base" (id)',
+                    f'CREATE INDEX CONCURRENTLY entity_idx_node_id ON {self.graph_name}."base" (ag_catalog.agtype_access_operator(properties, \'"entity_id"\'::agtype))',
+                    f'CREATE INDEX CONCURRENTLY entity_node_id_gin_idx ON {self.graph_name}."base" using gin(properties)',
+                    f'ALTER TABLE {self.graph_name}."DIRECTED" CLUSTER ON directed_sid_idx',
+                ]
 
-            for query in queries:
-                # Use the new flag to silently ignore "already exists" errors
-                # at the source, preventing log spam.
-                await self.db.execute(
-                    query,
-                    upsert=True,
-                    ignore_if_exists=True,  # Pass the new flag
-                    with_age=True,
-                    graph_name=self.graph_name,
-                )
+                for query in queries:
+                    # Use the new flag to silently ignore "already exists" errors
+                    # at the source, preventing log spam.
+                    await self.db.execute(
+                        query,
+                        upsert=True,
+                        ignore_if_exists=True,  # Pass the new flag
+                        with_age=True,
+                        graph_name=self.graph_name,
+                    )
 
     async def finalize(self):
         if self.db is not None:

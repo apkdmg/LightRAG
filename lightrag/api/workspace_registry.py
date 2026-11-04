@@ -460,22 +460,25 @@ class PostgresWorkspaceRegistry(WorkspaceRegistry):
         from lightrag.kg.postgres_impl import ClientManager
 
         self._db = await ClientManager.get_client(self._vector_storage)
-        await self._db.execute(
-            f"""CREATE TABLE IF NOT EXISTS {_PG_TABLE} (
-                workspace_id VARCHAR(255) PRIMARY KEY,
-                identity VARCHAR(512) NOT NULL UNIQUE,
-                email VARCHAR(512),
-                created_at DOUBLE PRECISION NOT NULL,
-                last_login_at DOUBLE PRECISION NOT NULL
-            )"""
-        )
-        await self._db.execute(
-            f"""CREATE TABLE IF NOT EXISTS {_PG_TOMBSTONES_TABLE} (
-                workspace_hash CHAR(64) PRIMARY KEY,
-                identity_hash CHAR(64),
-                deleted_at DOUBLE PRECISION NOT NULL
-            )"""
-        )
+        # Workers starting together against an empty database would race on
+        # CREATE TABLE IF NOT EXISTS; take turns.
+        async with self._db.ddl_lock():
+            await self._db.execute(
+                f"""CREATE TABLE IF NOT EXISTS {_PG_TABLE} (
+                    workspace_id VARCHAR(255) PRIMARY KEY,
+                    identity VARCHAR(512) NOT NULL UNIQUE,
+                    email VARCHAR(512),
+                    created_at DOUBLE PRECISION NOT NULL,
+                    last_login_at DOUBLE PRECISION NOT NULL
+                )"""
+            )
+            await self._db.execute(
+                f"""CREATE TABLE IF NOT EXISTS {_PG_TOMBSTONES_TABLE} (
+                    workspace_hash CHAR(64) PRIMARY KEY,
+                    identity_hash CHAR(64),
+                    deleted_at DOUBLE PRECISION NOT NULL
+                )"""
+            )
 
     async def finalize(self) -> None:
         if self._db is not None:

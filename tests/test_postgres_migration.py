@@ -1,3 +1,5 @@
+import contextlib
+
 import pytest
 from unittest.mock import patch, AsyncMock
 import numpy as np
@@ -14,6 +16,7 @@ def mock_pg_db():
     """Mock PostgreSQL database connection"""
     db = AsyncMock()
     db.workspace = "test_workspace"
+    db.ddl_lock = contextlib.nullcontext  # start-up DDL lock is a no-op here
 
     # Mock query responses with multirows support
     async def mock_query(sql, params=None, multirows=False, **kwargs):
