@@ -135,6 +135,37 @@ async def test_cycle_failures_and_timeouts_never_raise():
     assert loop.failures == 1
 
 
+@pytest.mark.skipif(
+    not hasattr(asyncio.Task, "cancelling"), reason="needs Task.cancelling()"
+)
+async def test_a_stray_cancelled_error_inside_a_cycle_does_not_end_the_loop():
+    store = MemoryOpsStore(clock=Clock())
+    ran = []
+
+    async def cycle(loop):
+        ran.append(1)
+        if len(ran) == 1:
+            fut = asyncio.get_running_loop().create_future()
+            fut.cancel()  # someone else's future, cancelled under us
+            await fut
+
+    loop = LeasedLoop(
+        store, "ops:c", "a", cycle, ttl_s=2, interval_s=0.01, cycle_timeout_s=1
+    )
+    task = loop.start()
+    for _ in range(100):
+        if len(ran) >= 2:
+            break
+        await asyncio.sleep(0.01)
+    try:
+        assert not task.done()
+        assert len(ran) >= 2 and loop.failures == 1
+    finally:
+        await loop.stop()
+    # A real stop still cancels the task.
+    assert task.cancelled()
+
+
 def test_lease_must_outlast_the_cycle():
     with pytest.raises(ValueError):
         LeasedLoop(

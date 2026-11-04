@@ -15,6 +15,8 @@ function DrawerLabel({ drawer }: { drawer: Drawer }) {
   const { t } = useTranslation()
   if (drawer.kind === 'document') return <>{t('operations.drawer.documentTitle', { id: shortId(drawer.id, 10) })}</>
   if (drawer.kind === 'workspace') return <>{t('operations.drawer.workspaceTitle', { id: drawer.id })}</>
+  if (drawer.kind === 'dependency') return <>{t('operations.drawer.dependencyTitle', { name: t(`operations.dep.${drawer.id}`, { defaultValue: drawer.id }) })}</>
+  if (drawer.kind === 'worker') return <>{t('operations.drawer.workerTitle', { id: shortId(drawer.id, 8) })}</>
   return <>{t(`operations.drawer.kind.${drawer.kind}`)}</>
 }
 

@@ -177,6 +177,7 @@ async def _reset(store: PostgresOpsStore) -> None:
         await conn.execute("TRUNCATE lightrag_usage_events")
         await conn.execute("TRUNCATE lightrag_ops_kv")
         await conn.execute("TRUNCATE lightrag_ops_audit")
+        await conn.execute("TRUNCATE lightrag_ops_probes")
 
 
 # -- small dataset: Postgres and the memory store must agree ---------------------
@@ -348,6 +349,161 @@ async def test_kv_and_leases(pg):
     assert (await pg.kv_get("lease:ops:test"))["holder"] == "worker-b"
     await pg.release_lease("ops:test", "worker-b")
     assert await pg.kv_get("lease:ops:test") is None
+
+
+async def test_heartbeat_rows_samples_and_supersede(pg):
+    async with pg.dedicated_connection() as conn:
+        await conn.execute("TRUNCATE lightrag_ops_workers")
+        await conn.execute("TRUNCATE lightrag_ops_worker_samples")
+    started = datetime.now(timezone.utc) - timedelta(minutes=10)
+    old_id, new_id = "a" * 32, "b" * 32
+    row = {
+        "worker_id": old_id,
+        "host": "it-host",
+        "pid": 811,
+        "pid_create_time": 1.5,
+        "mode": "gunicorn",
+        "version": "it",
+        "started_at": started,
+        "leases_held": ["ops:probes"],
+        "snapshot": {"rss": 123, "pool": {"wait_ms": 2.0}},
+    }
+    await pg.worker_beat(
+        row, {"cpu_pct": 12.5, "rss": 123, "loop_lag_ms": 3, "pool_wait_ms": 1}
+    )
+    await pg.worker_beat(
+        row, {"cpu_pct": 20.0, "rss": 456, "loop_lag_ms": 9, "pool_wait_ms": 2}
+    )
+    async with pg.dedicated_connection() as conn:
+        await conn.execute(
+            "UPDATE lightrag_ops_workers SET heartbeat_at = now() - interval '2 minutes'"
+        )
+    new_row = {
+        **row,
+        "worker_id": new_id,
+        "pid": 812,
+        "started_at": datetime.now(timezone.utc),
+    }
+    await pg.worker_beat(new_row)
+    # A row whose process still runs is never superseded.
+    assert (
+        await pg.supersede_workers(
+            "it-host", new_id, new_row["started_at"], 45, alive=lambda pid, ct: True
+        )
+        == 0
+    )
+    seen = []
+    assert (
+        await pg.supersede_workers(
+            "it-host",
+            new_id,
+            new_row["started_at"],
+            45,
+            alive=lambda pid, ct: seen.append((pid, ct)) or False,
+        )
+        == 1
+    )
+    assert seen == [(811, 1.5)]
+    rows = {r["worker_id"]: r for r in await pg.workers(10)}
+    assert rows[old_id]["superseded"] is True and rows[new_id]["superseded"] is False
+    assert rows[new_id]["heartbeat_age_s"] < 5
+    assert rows[old_id]["snapshot"]["pool"] == {"wait_ms": 2.0}
+    assert rows[old_id]["leases_held"] == ["ops:probes"]
+    [sample] = await pg.worker_history(old_id, 24, 60)
+    assert sample["rss"] == 456 and sample["loop_lag"] == 9
+    await pg.worker_exited(new_id)
+    exited = {r["worker_id"]: r for r in await pg.workers(10)}
+    assert exited[new_id]["exited_at"] is not None
+    async with pg.dedicated_connection() as conn:
+        await conn.execute(
+            "UPDATE lightrag_ops_workers SET heartbeat_at = now() - interval '25 hours'"
+            " WHERE worker_id = $1::uuid",
+            old_id,
+        )
+    await pg.cleanup_workers(24, 7)
+    assert [r["worker_id"] for r in await pg.workers(10)] == [new_id]
+    assert pg.pool_stats()["max"] >= 1
+    assert await pg.pool_wait_ms(2.0) >= 0
+
+
+async def test_probe_history_and_postgres_health(pg):
+    async with pg.dedicated_connection() as conn:
+        await conn.execute("TRUNCATE lightrag_ops_probes")
+    await pg.probe_write(
+        [
+            {
+                "dependency": "neo4j",
+                "status": "down",
+                "latency_ms": None,
+                "error_class": "timeout",
+                "detail": {},
+            },
+            {
+                "dependency": "postgres",
+                "status": "ok",
+                "latency_ms": 2,
+                "error_class": None,
+                "detail": {"connect_ms": 1},
+            },
+        ]
+    )
+    await pg.probe_write(
+        [
+            {
+                "dependency": "neo4j",
+                "status": "ok",
+                "latency_ms": 12,
+                "error_class": None,
+                "detail": {},
+            }
+        ]
+    )
+    strips = {
+        (r["dependency"], r["total"], r["down"])
+        for r in await pg.probe_strips(24, 1800)
+    }
+    assert ("neo4j", 2, 1) in strips and ("postgres", 1, 0) in strips
+    series = await pg.probe_series("neo4j", 24, 600)
+    assert sum(r["total"] for r in series) == 2
+    recent = await pg.probe_recent("neo4j", 50)
+    assert [r["status"] for r in recent] == ["ok", "down"]
+    assert await pg.probe_error_classes("neo4j", 24) == [{"key": "timeout", "count": 1}]
+    await pg.probe_cleanup(7)
+    assert len(await pg.probe_recent("neo4j", 50)) == 2
+
+    # A real lock wait: one session holds a row lock, another waits on it.
+    async with pg.dedicated_connection() as holder, pg.dedicated_connection() as waiter:
+        await holder.execute(
+            "CREATE TABLE IF NOT EXISTS ops_it_lock (id int primary key)"
+        )
+        await holder.execute(
+            "INSERT INTO ops_it_lock VALUES (1) ON CONFLICT DO NOTHING"
+        )
+        tx = holder.transaction()
+        await tx.start()
+        await holder.execute("UPDATE ops_it_lock SET id = 1 WHERE id = 1")
+        blocked = asyncio.create_task(
+            waiter.execute("UPDATE ops_it_lock SET id = 1 WHERE id = 1 /* 4242 'x' */")
+        )
+        await asyncio.sleep(0.5)
+        try:
+            health = await pg.postgres_health(extras=True, timeout_s=5)
+        finally:
+            await tx.rollback()
+            await blocked
+            await holder.execute("DROP TABLE ops_it_lock")
+    assert health["latency_ms"] >= 0 and health["max_connections"] > 0
+    assert health["connections"] >= 3 and health["db_size_bytes"] > 0
+    assert health["db_stats"]["xact_commit"] > 0
+    assert {"xact_rollback", "deadlocks", "temp_bytes", "blks_hit"} <= set(
+        health["db_stats"]
+    )
+    waiting = [b for b in health["blocking"] if b["blocked_by"]]
+    assert waiting and waiting[0]["statement_type"] == "UPDATE"
+    assert len(waiting[0]["fingerprint"]) == 16 and waiting[0]["query_length"] > 20
+    assert "query" not in waiting[0]
+    simple = await pg.postgres_health(extras=False, timeout_s=5)
+    assert set(simple) == {"latency_ms", "connect_ms"}
 
 
 async def test_forget_workspace(pg):

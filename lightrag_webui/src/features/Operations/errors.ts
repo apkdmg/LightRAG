@@ -33,7 +33,10 @@ export const REFUSALS = [
   'cas_mismatch',
   'single_process',
   'rate_limited',
-  'feature_disabled'
+  'feature_disabled',
+  'probes_disabled',
+  'not_checkable',
+  'probe_failed'
 ] as const
 export type Refusal = (typeof REFUSALS)[number]
 

@@ -203,6 +203,132 @@
   .ops-stack td[data-label=""]::before { content: none; }
 }
 
+/*
+ * Availability strip (§2.6): 48 half-hour cells. Each state has a non-colour
+ * mark: failed cells are hatched, warnings half filled, unknown cells a dashed
+ * outline. A new slot fades in at the right; a changed cell crossfades its
+ * colour (paint only).
+ */
+.ops-strip {
+  display: grid;
+  grid-template-columns: repeat(48, minmax(0, 1fr));
+  gap: 1px;
+  height: 12px;
+}
+.ops-cell {
+  display: block;
+  min-width: 0;
+  border-radius: 1px;
+  background-color: var(--ops-ok);
+  transition: background-color var(--ops-dur-base) var(--ops-ease-out);
+}
+.ops-cell[data-s="warn"] {
+  background-color: var(--ops-warn-soft);
+  background-image: linear-gradient(to top, var(--ops-warn) 55%, transparent 55%);
+}
+.ops-cell[data-s="down"] {
+  background-color: var(--ops-crit-soft);
+  background-image: repeating-linear-gradient(135deg, var(--ops-crit) 0 2px, transparent 2px 4px);
+}
+.ops-cell[data-s="unknown"] {
+  background-color: transparent;
+  border: 1px dashed var(--ops-unknown);
+}
+.ops-cell-new { animation: ops-fade-in var(--ops-dur-base) var(--ops-ease-out); }
+
+/* Dependency card (§2.6): the whole card opens the Dependency drawer. */
+.ops-dep {
+  transition: border-color var(--ops-dur-fast) var(--ops-ease-out);
+}
+.ops-dep:hover { border-color: var(--ops-info); }
+.ops-dep[data-tone="warn"] { border-color: color-mix(in srgb, var(--ops-warn) 60%, var(--border)); }
+.ops-dep[data-tone="crit"] { border-color: var(--ops-crit); }
+
+/* Worker drawer sparklines: static, no animation. */
+.ops-spark { display: block; width: 100%; height: 40px; }
+
+/*
+ * System topology (§2.13). Static in this release: edges are still lines.
+ * Node state is an outline plus an icon; "not probed" is dashed grey; a down
+ * target turns its edge into a dashed critical line with ✖. The Monitoring
+ * layer shows the collectors' writes and probes and dims the data edges.
+ */
+.ops-topo svg { display: block; width: 100%; min-width: 880px; height: auto; }
+.ops-grp {
+  fill: color-mix(in srgb, var(--ops-info) 4%, transparent);
+  stroke: color-mix(in srgb, var(--muted-foreground) 40%, transparent);
+  stroke-width: 1.2;
+}
+.ops-grp-svc {
+  fill: none;
+  stroke: color-mix(in srgb, var(--muted-foreground) 55%, transparent);
+  stroke-dasharray: 6 5;
+  stroke-width: 1.1;
+}
+.ops-grp-lab { font: 600 11px var(--font-mono, ui-monospace, monospace); fill: var(--muted-foreground); letter-spacing: 0.04em; }
+.ops-tn { cursor: pointer; outline: none; }
+.ops-tn-box {
+  fill: var(--card);
+  stroke: color-mix(in srgb, var(--muted-foreground) 45%, transparent);
+  stroke-width: 1.3;
+  transition: stroke var(--ops-dur-base) var(--ops-ease-out);
+}
+.ops-tn-ext .ops-tn-box,
+.ops-tn-client .ops-tn-box { fill: var(--muted); }
+.ops-tn.is-unprobed .ops-tn-box { stroke: var(--ops-unknown); stroke-dasharray: 3 3; }
+.ops-tn[data-tone="warn"] .ops-tn-box { stroke: var(--ops-warn); stroke-width: 2; }
+.ops-tn[data-tone="serious"] .ops-tn-box { stroke: var(--ops-serious); stroke-width: 2.2; }
+.ops-tn[data-tone="crit"] .ops-tn-box { stroke: var(--ops-crit); stroke-width: 2.4; }
+.ops-tn[data-tone="unknown"] .ops-tn-box { stroke: var(--ops-unknown); stroke-dasharray: 3 3; }
+.ops-tn:hover .ops-tn-box,
+.ops-tn.is-sel .ops-tn-box { stroke-width: 2.6; }
+.ops-tn.is-sel .ops-tn-box { fill: color-mix(in srgb, var(--ops-info) 8%, var(--card)); }
+.ops-tn:focus-visible .ops-tn-box { stroke: var(--ring); stroke-width: 3; stroke-dasharray: none; }
+.ops-tn-l { font: 600 12.5px var(--font-sans, ui-sans-serif, system-ui, sans-serif); fill: var(--foreground); }
+.ops-tn-s { font: 10.5px var(--font-mono, ui-monospace, monospace); fill: var(--muted-foreground); }
+.ops-tn[data-tone="ok"] .ops-tn-ico { color: var(--ops-ok); }
+.ops-tn[data-tone="warn"] .ops-tn-ico { color: var(--ops-warn); }
+.ops-tn[data-tone="serious"] .ops-tn-ico { color: var(--ops-serious); }
+.ops-tn[data-tone="crit"] .ops-tn-ico { color: var(--ops-crit); }
+.ops-tn[data-tone="unknown"] .ops-tn-ico { color: var(--ops-unknown); }
+/* One ring on a node that has just failed (900 ms, attention slot and cooldown apply). */
+.ops-topo-ring {
+  fill: none;
+  stroke: var(--ops-crit);
+  stroke-width: 2;
+  opacity: 0;
+  pointer-events: none;
+  transform-box: fill-box;
+  transform-origin: center;
+}
+.ops-topo-ring.ops-ring-a { animation: ops-ring-a var(--ops-dur-ring) var(--ops-ease-out) forwards; }
+.ops-topo-ring.ops-ring-b { animation: ops-ring-b var(--ops-dur-ring) var(--ops-ease-out) forwards; }
+.ops-te {
+  fill: none;
+  stroke: color-mix(in srgb, var(--muted-foreground) 70%, transparent);
+  stroke-width: 1.5;
+  transition: opacity var(--ops-dur-base) var(--ops-ease-out), stroke var(--ops-dur-base) var(--ops-ease-out);
+}
+.ops-te-unprobed { stroke: var(--ops-unknown); stroke-dasharray: 3 4; }
+.ops-te-bypass { stroke-width: 1.1; stroke-dasharray: 1 3; }
+.ops-te-monitor { stroke: var(--ops-info); stroke-width: 1.7; }
+.ops-te-probe { stroke: var(--ops-info); stroke-width: 1.4; stroke-dasharray: 2 5; }
+.ops-te.is-down { stroke: var(--ops-crit); stroke-dasharray: 5 4; stroke-width: 2; }
+.ops-te-x,
+.ops-te-lab {
+  paint-order: stroke;
+  stroke: var(--card);
+  stroke-width: 4px;
+  stroke-linejoin: round;
+}
+.ops-te-x { font: 700 13px var(--font-sans, ui-sans-serif, system-ui, sans-serif); fill: var(--ops-crit); }
+.ops-te-lab { font: 10.5px var(--font-mono, ui-monospace, monospace); fill: var(--muted-foreground); }
+.ops-te-lab.is-mon { fill: var(--ops-info); }
+.ops-topo:not(.is-mon) .is-mon { display: none; }
+.ops-topo.is-mon .ops-te-data,
+.ops-topo.is-mon .ops-te-bypass,
+.ops-topo.is-mon .ops-te-lab:not(.is-mon) { opacity: 0.25; }
+
 /* "⏸ auto" and stale panels stop every loop. */
 .ops-root[data-paused] .ops-loop,
 .ops-stale .ops-loop { animation: none; }

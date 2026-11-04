@@ -14,8 +14,10 @@ import RefreshHairline from './components/RefreshHairline'
 import Skeleton from './components/Skeleton'
 import { OverallStateChip } from './components/StatusChip'
 import { DrawerMove, OpsNav, OpsNavContext, OpsOverviewContext, OpsShellContext, useOpsNav } from './context'
+import DependencyDrawer from './drawers/DependencyDrawer'
 import DocumentDrawer from './drawers/DocumentDrawer'
 import UnsupportedDrawer from './drawers/UnsupportedDrawer'
+import WorkerDrawer from './drawers/WorkerDrawer'
 import WorkspaceDrawer from './drawers/WorkspaceDrawer'
 import { ageSeconds, fmtAge, fmtClock } from './format'
 import { DEFAULT_OPS_HASH, Drawer, OPS_TABS, OpsHash, OpsTab, readOpsHash, sameDrawer, writeOpsHash } from './hashState'
@@ -323,6 +325,8 @@ function OperationsPage() {
 function renderDrawer(drawer: Drawer) {
   if (drawer.kind === 'workspace') return <WorkspaceDrawer workspace={drawer.id} />
   if (drawer.kind === 'document') return <DocumentDrawer workspace={drawer.workspace} docId={drawer.id} />
+  if (drawer.kind === 'dependency') return <DependencyDrawer dep={drawer.id} />
+  if (drawer.kind === 'worker') return <WorkerDrawer workerId={drawer.id} />
   return <UnsupportedDrawer kind={drawer.kind} />
 }
 

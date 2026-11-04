@@ -252,3 +252,114 @@ def build_app(
         )
     app.dependency_overrides[require_admin] = admin
     return app
+
+
+WORKER_ID = "0123456789abcdef0123456789abcdef"
+OTHER_WORKER_ID = "fedcba9876543210fedcba9876543210"
+
+
+def health_runner(store: Optional[MemoryOpsStore]):
+    """A probe runner with fixed specs: Postgres (async), Neo4j and SMTP
+    (threads), the passive LLM card and an unprobed etcd card."""
+    from lightrag.api.ops.probes import ProbeResult, ProbeRunner, ProbeSpec
+
+    async def postgres(timeout):
+        return ProbeResult("ok", 2.0, None, {"connect_ms": 1.0})
+
+    def neo4j(timeout):
+        return ProbeResult("ok", 12.0, None, {"target": "neo4j:7687"})
+
+    def smtp(timeout):
+        return ProbeResult(
+            "ok", 120.0, None, {"target": "mail.example:587", "starttls": True}
+        )
+
+    async def llm(timeout):
+        return ProbeResult("ok", None, None, {"calls": 0, "low_volume": True})
+
+    specs = [
+        ProbeSpec("postgres", "PostgreSQL", "database", arun=postgres),
+        ProbeSpec("neo4j", "Neo4j", "graph", target="neo4j:7687", run=neo4j),
+        ProbeSpec("smtp", "SMTP", "mail", interval_s=900, run=smtp),
+        ProbeSpec("llm", "LLM provider", "llm", arun=llm, passive=True),
+        ProbeSpec("etcd", "etcd", "vector_backend", probed=False),
+    ]
+    return ProbeRunner(specs, store=store, holder=WORKER_ID)
+
+
+def seed_health(app: FastAPI, store: MemoryOpsStore) -> None:
+    """Probe results, probe history and two worker rows, as if the probe
+    lease holder and two heartbeats had run."""
+    now = time.time()
+    runner = health_runner(store)
+    service = app.state.ops.service
+    service.probes = runner
+    service.worker_id = WORKER_ID
+    for dep, status, latency in (
+        ("postgres", "ok", 2.0),
+        ("neo4j", "down", None),
+        ("smtp", "ok", 120.0),
+    ):
+        store.kv[f"probe:{dep}"] = {
+            "id": dep,
+            "status": status,
+            "latency_ms": latency,
+            "error_class": "timeout" if status == "down" else None,
+            "detail": {"target": f"{dep}:1"},
+            "checked_epoch": now - 5,
+            "checked_at": datetime.fromtimestamp(now - 5, timezone.utc).isoformat(),
+            "last_ok_epoch": now - 5 if status != "down" else now - 600,
+            "last_ok_at": None,
+            "consecutive_failures": 4 if status == "down" else 0,
+            "consecutive_slow": 0,
+        }
+    store.kv["probe_cycle"] = {
+        "at": datetime.fromtimestamp(now - 5, timezone.utc).isoformat(),
+        "at_epoch": now - 5,
+        "duration_ms": 140.0,
+        "holder": WORKER_ID,
+        "holder_pid": 812,
+        "interval_s": 30.0,
+    }
+    for minutes in (1, 31, 61):
+        for dep, status in (("postgres", "ok"), ("neo4j", "down")):
+            store.probe_rows.append(
+                {
+                    "ts": datetime.now(timezone.utc) - timedelta(minutes=minutes),
+                    "dependency": dep,
+                    "status": status,
+                    "latency_ms": 3 if status == "ok" else None,
+                    "error_class": None if status == "ok" else "timeout",
+                    "detail": {},
+                }
+            )
+    started = datetime.now(timezone.utc) - timedelta(hours=2)
+    for worker_id, pid, age in ((WORKER_ID, 812, 5), (OTHER_WORKER_ID, 811, 600)):
+        store.worker_rows[worker_id] = {
+            "worker_id": worker_id,
+            "host": "lightrag-1",
+            "pid": pid,
+            "pid_create_time": now - 7200,
+            "mode": "uvicorn",
+            "version": "0295",
+            "started_at": started,
+            "heartbeat_at": datetime.now(timezone.utc) - timedelta(seconds=age),
+            "exited_at": None,
+            "superseded": False,
+            "leases_held": ["ops:probes"] if worker_id == WORKER_ID else [],
+            "snapshot": {
+                "rss": 2_100_000_000,
+                "cpu_pct": 12.0,
+                "loop_lag_ms": 3.0,
+                "pool": {"size": 12, "idle": 10, "max": 50, "wait_ms": 3.0},
+                "host": {"mem_used": 7, "mem_limit": 16, "load": [3.2, 2.9, 2.7]},
+            },
+        }
+        store.sample_rows[(worker_id, int(now // 60 * 60))] = {
+            "worker_id": worker_id,
+            "minute": int(now // 60 * 60),
+            "cpu_pct": 12.0,
+            "rss": 2_100_000_000,
+            "loop_lag_ms": 3,
+            "pool_wait_ms": 1,
+        }

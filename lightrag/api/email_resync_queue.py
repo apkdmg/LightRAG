@@ -146,6 +146,10 @@ class DeferredResyncQueue:
             return
         self._drainers[workspace] = asyncio.create_task(self._drain(workspace))
 
+    def active_drainers(self) -> list[str]:
+        """Workspaces this process is draining now (read-only, for heartbeats)."""
+        return sorted(w for w, task in self._drainers.items() if not task.done())
+
     async def start(self) -> None:
         """Resume draining anything left over from a previous run."""
         if not self._base.exists():

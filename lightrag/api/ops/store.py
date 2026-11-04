@@ -2,11 +2,12 @@
 
 ``PostgresOpsStore`` creates its own tables idempotently on the shared
 ``ClientManager`` pool, and only when the server runs on Postgres KV storage
-(``kv_storage == "PGKVStorage"``). This PR creates ``LIGHTRAG_OPS_KV`` (small
-JSON values, renewable leases) and ``LIGHTRAG_OPS_AUDIT``; the other ops
-tables arrive with the features that write them. Indexes on the large existing
-tables are never built here: :mod:`lightrag.api.ops.indexes` builds them in
-the background.
+(``kv_storage == "PGKVStorage"``): ``LIGHTRAG_OPS_KV`` (small JSON values,
+renewable leases), ``LIGHTRAG_OPS_AUDIT``, the worker heartbeat tables
+(``LIGHTRAG_OPS_WORKERS``, ``LIGHTRAG_OPS_WORKER_SAMPLES``) and the dependency
+probe history (``LIGHTRAG_OPS_PROBES``); the other ops tables arrive with the
+features that write them. Indexes on the large existing tables are never built
+here: :mod:`lightrag.api.ops.indexes` builds them in the background.
 
 Rules every query follows:
 
@@ -15,7 +16,9 @@ Rules every query follows:
   so the planner can match the partial doc-status index under generic plans;
 - sort columns come from a whitelist; every other value is a bound parameter;
 - ``LIGHTRAG_DOC_STATUS.updated_at`` is a naive UTC ``TIMESTAMP``, so it is
-  always compared with :data:`UTC_NOW_SQL`, whatever the server's TimeZone.
+  always compared with :data:`UTC_NOW_SQL`, whatever the server's TimeZone;
+- heartbeats and leases go through connections of their own, never the shared
+  pool, so a starved pool cannot make a live worker look dead.
 
 ``MemoryOpsStore`` has the same behaviour for offline tests.
 """
@@ -34,7 +37,7 @@ from collections import defaultdict
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any, AsyncIterator, Iterable, Optional
+from typing import Any, AsyncIterator, Callable, Iterable, Optional
 
 logger = logging.getLogger("lightrag.api.ops")
 
@@ -50,8 +53,12 @@ WORKSPACE_ROW_TABLES = (
     "LIGHTRAG_OPS_RUNS",
 )
 TABLE_ALERTS = "LIGHTRAG_OPS_ALERTS"
+TABLE_WORKERS = "LIGHTRAG_OPS_WORKERS"
+TABLE_WORKER_SAMPLES = "LIGHTRAG_OPS_WORKER_SAMPLES"
+TABLE_PROBES = "LIGHTRAG_OPS_PROBES"
 
 READ_TIMEOUT_MS = 3000
+DEDICATED_QUERY_TIMEOUT_S = 5.0
 WRITE_TIMEOUT_MS = 5000
 POOL_ACQUIRE_TIMEOUT_S = 5.0
 CONNECT_TIMEOUT_S = 10.0
@@ -295,6 +302,87 @@ class OpsStore(ABC):
     async def forget_workspace(self, workspace: str) -> None:
         """Delete a workspace's ops rows and KV; hash it where rows are kept."""
 
+    # -- workers (heartbeat; writes on a dedicated connection) ------------------
+    @abstractmethod
+    async def worker_beat(
+        self, row: dict[str, Any], sample: Optional[dict[str, Any]] = None
+    ) -> None:
+        """Upsert this worker's row (``heartbeat_at`` from the database clock)
+        and, when given, its sample for the current minute."""
+
+    @abstractmethod
+    async def supersede_workers(
+        self,
+        host: str,
+        worker_id: str,
+        started_at: datetime,
+        stale_s: float,
+        alive: Optional[Callable[[Any, Any], bool]] = None,
+    ) -> int:
+        """Mark rows of earlier workers on ``host`` that stopped beating.
+
+        Only rows started before ``started_at`` qualify. ``alive(pid,
+        pid_create_time)``, when given, vetoes rows whose process still runs
+        (a hung sibling is not superseded, it is a dead worker to show).
+        """
+
+    @abstractmethod
+    async def worker_exited(self, worker_id: str) -> None: ...
+
+    @abstractmethod
+    async def cleanup_workers(self, row_hours: int, sample_days: int) -> None: ...
+
+    @abstractmethod
+    async def workers(self, limit: int) -> list[dict[str, Any]]:
+        """Worker rows, newest beat first, with ``heartbeat_age_s`` by the
+        database clock."""
+
+    @abstractmethod
+    async def worker_history(
+        self, worker_id: str, hours: int, bucket_s: int
+    ) -> list[dict[str, Any]]: ...
+
+    def pool_stats(self) -> Optional[dict[str, Any]]:
+        """Size of the shared connection pool, when there is one."""
+        return None
+
+    async def pool_wait_ms(self, timeout_s: float) -> Optional[float]:
+        """How long taking a connection from the shared pool takes now."""
+        return None
+
+    # -- dependency probes ------------------------------------------------------
+    @abstractmethod
+    async def postgres_health(
+        self, *, extras: bool, timeout_s: float
+    ) -> dict[str, Any]:
+        """``SELECT 1`` on a connection of its own; with ``extras`` also
+        connections, database size and blocked backends (never query text)."""
+
+    @abstractmethod
+    async def probe_write(self, rows: list[dict[str, Any]]) -> None: ...
+
+    @abstractmethod
+    async def probe_strips(self, hours: int, slot_s: int) -> list[dict[str, Any]]:
+        """Result counts per dependency and time slot."""
+
+    @abstractmethod
+    async def probe_recent(
+        self, dependency: str, limit: int
+    ) -> list[dict[str, Any]]: ...
+
+    @abstractmethod
+    async def probe_series(
+        self, dependency: str, hours: int, bucket_s: int
+    ) -> list[dict[str, Any]]: ...
+
+    @abstractmethod
+    async def probe_error_classes(
+        self, dependency: str, hours: int
+    ) -> list[dict[str, Any]]: ...
+
+    @abstractmethod
+    async def probe_cleanup(self, days: int) -> None: ...
+
 
 def _workspace_keys(workspace: str) -> list[str]:
     return [template.format(ws=workspace) for template in WORKSPACE_KV_KEYS]
@@ -312,6 +400,8 @@ class PostgresOpsStore(OpsStore):
         self._db: Any = None
         self._lease_conn: Any = None
         self._lease_lock: Optional[asyncio.Lock] = None
+        self._beat_conn: Any = None
+        self._beat_lock: Optional[asyncio.Lock] = None
         self._tables: set[str] = set()
         self._tables_at = 0.0
         self.ready = False
@@ -346,6 +436,41 @@ class PostgresOpsStore(OpsStore):
             )""",
             f"CREATE INDEX IF NOT EXISTS idx_ops_audit_ts ON {TABLE_AUDIT} (ts DESC)",
             f"CREATE INDEX IF NOT EXISTS idx_ops_audit_actor ON {TABLE_AUDIT} (actor, ts DESC)",
+            f"""CREATE TABLE IF NOT EXISTS {TABLE_WORKERS} (
+                worker_id UUID PRIMARY KEY,
+                host VARCHAR(255) NOT NULL,
+                pid INT NOT NULL,
+                pid_create_time DOUBLE PRECISION,
+                mode VARCHAR(16) NOT NULL,
+                version VARCHAR(64),
+                started_at TIMESTAMPTZ NOT NULL,
+                heartbeat_at TIMESTAMPTZ NOT NULL,
+                exited_at TIMESTAMPTZ,
+                superseded BOOLEAN NOT NULL DEFAULT false,
+                leases_held TEXT[] NOT NULL DEFAULT '{{}}',
+                snapshot JSONB NOT NULL
+            )""",
+            f"CREATE INDEX IF NOT EXISTS idx_ops_workers_hb ON {TABLE_WORKERS} (heartbeat_at DESC)",
+            f"""CREATE TABLE IF NOT EXISTS {TABLE_WORKER_SAMPLES} (
+                worker_id UUID NOT NULL,
+                minute TIMESTAMPTZ NOT NULL,
+                cpu_pct REAL,
+                rss BIGINT,
+                loop_lag_ms INT,
+                pool_wait_ms INT,
+                PRIMARY KEY (worker_id, minute)
+            )""",
+            f"CREATE INDEX IF NOT EXISTS idx_ops_worker_samples_minute ON {TABLE_WORKER_SAMPLES} (minute)",
+            f"""CREATE TABLE IF NOT EXISTS {TABLE_PROBES} (
+                ts TIMESTAMPTZ NOT NULL,
+                dependency VARCHAR(32) NOT NULL,
+                status VARCHAR(8) NOT NULL,
+                latency_ms INT,
+                error_class VARCHAR(64),
+                detail JSONB NOT NULL DEFAULT '{{}}'::jsonb,
+                PRIMARY KEY (dependency, ts)
+            )""",
+            f"CREATE INDEX IF NOT EXISTS idx_ops_probes_ts ON {TABLE_PROBES} (ts DESC)",
         ):
             await self._db.execute(statement)
         await self._refresh_tables(force=True)
@@ -354,9 +479,11 @@ class PostgresOpsStore(OpsStore):
 
     async def finalize(self) -> None:
         self.ready = False
-        conn, self._lease_conn = self._lease_conn, None
-        if conn is not None:
-            await _close_quietly(conn)
+        for attr in ("_lease_conn", "_beat_conn"):
+            conn = getattr(self, attr)
+            setattr(self, attr, None)
+            if conn is not None:
+                await _close_quietly(conn)
         if self._db is not None:
             from lightrag.kg.postgres_impl import ClientManager
 
@@ -531,25 +658,48 @@ class PostgresOpsStore(OpsStore):
             self._lease_lock = asyncio.Lock()
         return self._lease_lock
 
-    async def _lease_query(self, sql: str, *args: Any) -> list[Any]:
+    async def _dedicated_query(
+        self, attr: str, guard: asyncio.Lock, sql: str, *args: Any
+    ) -> list[Any]:
+        """One statement on the long-lived connection kept in ``attr``.
+
+        A broken connection is replaced once; a second failure raises.
+        """
         import asyncpg
 
-        async with self._lease_guard():
+        async with guard:
             for attempt in (1, 2):
-                if self._lease_conn is None or self._lease_conn.is_closed():
-                    self._lease_conn = await asyncpg.connect(**self.connect_kwargs())
+                conn = getattr(self, attr)
+                if conn is None or conn.is_closed():
+                    conn = await asyncpg.connect(**self.connect_kwargs())
+                    setattr(self, attr, conn)
                 try:
-                    return await self._lease_conn.fetch(sql, *args, timeout=5)
+                    return await conn.fetch(
+                        sql, *args, timeout=DEDICATED_QUERY_TIMEOUT_S
+                    )
                 except (
                     asyncpg.InterfaceError,
                     asyncpg.PostgresConnectionError,
                     OSError,
                 ):
-                    await _close_quietly(self._lease_conn)
-                    self._lease_conn = None
+                    await _close_quietly(conn)
+                    setattr(self, attr, None)
                     if attempt == 2:
                         raise
         return []  # pragma: no cover - loop always returns or raises
+
+    async def _lease_query(self, sql: str, *args: Any) -> list[Any]:
+        return await self._dedicated_query(
+            "_lease_conn", self._lease_guard(), sql, *args
+        )
+
+    def _beat_guard(self) -> asyncio.Lock:
+        if self._beat_lock is None:
+            self._beat_lock = asyncio.Lock()
+        return self._beat_lock
+
+    async def _beat_query(self, sql: str, *args: Any) -> list[Any]:
+        return await self._dedicated_query("_beat_conn", self._beat_guard(), sql, *args)
 
     async def try_lease(self, name: str, holder: str, ttl_s: float) -> bool:
         # The database clock decides expiry, so workers never disagree.
@@ -991,6 +1141,324 @@ class PostgresOpsStore(OpsStore):
                         hashed,
                     )
 
+    # -- workers (heartbeat) ------------------------------------------------------------------
+    async def worker_beat(self, row, sample=None):
+        await self._beat_query(
+            f"""INSERT INTO {TABLE_WORKERS} (worker_id, host, pid, pid_create_time, mode,
+                version, started_at, heartbeat_at, leases_held, snapshot)
+            VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, now(), $8::text[], $9::jsonb)
+            ON CONFLICT (worker_id) DO UPDATE SET
+                heartbeat_at = now(), pid = EXCLUDED.pid,
+                pid_create_time = EXCLUDED.pid_create_time, mode = EXCLUDED.mode,
+                version = EXCLUDED.version, leases_held = EXCLUDED.leases_held,
+                snapshot = EXCLUDED.snapshot, exited_at = NULL, superseded = false""",
+            row["worker_id"],
+            row["host"][:255],
+            int(row["pid"]),
+            row.get("pid_create_time"),
+            row["mode"][:16],
+            (row.get("version") or "")[:64] or None,
+            row["started_at"],
+            list(row.get("leases_held") or []),
+            json.dumps(row.get("snapshot") or {}, default=str),
+        )
+        if sample is not None:
+            await self._beat_query(
+                f"""INSERT INTO {TABLE_WORKER_SAMPLES}
+                    (worker_id, minute, cpu_pct, rss, loop_lag_ms, pool_wait_ms)
+                VALUES ($1::uuid, date_trunc('minute', now()), $2, $3, $4, $5)
+                ON CONFLICT (worker_id, minute) DO UPDATE SET
+                    cpu_pct = EXCLUDED.cpu_pct, rss = EXCLUDED.rss,
+                    loop_lag_ms = EXCLUDED.loop_lag_ms,
+                    pool_wait_ms = EXCLUDED.pool_wait_ms""",
+                row["worker_id"],
+                sample.get("cpu_pct"),
+                sample.get("rss"),
+                sample.get("loop_lag_ms"),
+                sample.get("pool_wait_ms"),
+            )
+
+    async def supersede_workers(self, host, worker_id, started_at, stale_s, alive=None):
+        where = """host = $1 AND worker_id <> $2::uuid AND started_at < $3
+              AND NOT superseded AND exited_at IS NULL
+              AND heartbeat_at < now() - make_interval(secs => $4::float8)"""
+        args = (host[:255], worker_id, started_at, float(stale_s))
+        if alive is None:
+            rows = await self._beat_query(
+                f"""UPDATE {TABLE_WORKERS} SET superseded = true
+                WHERE {where} RETURNING worker_id""",
+                *args,
+            )
+            return len(rows)
+        candidates = await self._beat_query(
+            f"""SELECT worker_id::text AS worker_id, pid, pid_create_time
+            FROM {TABLE_WORKERS} WHERE {where} LIMIT 500""",
+            *args,
+        )
+        ids = [
+            r["worker_id"]
+            for r in candidates
+            if not _still_running(alive, r["pid"], r["pid_create_time"])
+        ]
+        if not ids:
+            return 0
+        rows = await self._beat_query(
+            f"""UPDATE {TABLE_WORKERS} SET superseded = true
+            WHERE {where} AND worker_id = ANY($5::uuid[]) RETURNING worker_id""",
+            *args,
+            ids,
+        )
+        return len(rows)
+
+    async def worker_exited(self, worker_id):
+        await self._beat_query(
+            f"UPDATE {TABLE_WORKERS} SET exited_at = now() WHERE worker_id = $1::uuid",
+            worker_id,
+        )
+
+    async def cleanup_workers(self, row_hours, sample_days):
+        await self._beat_query(
+            f"""DELETE FROM {TABLE_WORKERS}
+            WHERE heartbeat_at < now() - make_interval(hours => $1::int)""",
+            int(row_hours),
+        )
+        await self._beat_query(
+            f"""DELETE FROM {TABLE_WORKER_SAMPLES}
+            WHERE minute < now() - make_interval(days => $1::int)""",
+            int(sample_days),
+        )
+
+    async def workers(self, limit):
+        rows = await self._read(
+            f"""SELECT worker_id, host, pid, pid_create_time, mode, version, started_at,
+                heartbeat_at, exited_at, superseded, leases_held, snapshot,
+                extract(epoch FROM (now() - heartbeat_at))::float8 AS heartbeat_age_s
+            FROM {TABLE_WORKERS} ORDER BY heartbeat_at DESC LIMIT $1""",
+            int(limit),
+        )
+        for row in rows:
+            row["worker_id"] = _uuid_hex(row["worker_id"])
+            row["snapshot"] = self._decode(row.get("snapshot")) or {}
+            row["leases_held"] = list(row.get("leases_held") or [])
+        return rows
+
+    async def worker_history(self, worker_id, hours, bucket_s):
+        return await self._read(
+            f"""SELECT floor(extract(epoch FROM minute) / $3)::bigint * $3 AS t,
+                max(rss)::bigint AS rss, avg(cpu_pct)::float8 AS cpu,
+                max(loop_lag_ms)::int AS loop_lag, max(pool_wait_ms)::int AS pool_wait
+            FROM {TABLE_WORKER_SAMPLES}
+            WHERE worker_id = $1::uuid AND minute >= now() - make_interval(hours => $2::int)
+            GROUP BY 1 ORDER BY 1""",
+            worker_id,
+            int(hours),
+            int(bucket_s),
+        )
+
+    def pool_stats(self):
+        pool = getattr(self._db, "pool", None) if self._db is not None else None
+        if pool is None:
+            return None
+        try:
+            return {
+                "size": pool.get_size(),
+                "idle": pool.get_idle_size(),
+                "max": pool.get_max_size(),
+                "min": pool.get_min_size(),
+            }
+        except Exception:
+            return None
+
+    async def pool_wait_ms(self, timeout_s):
+        pool = getattr(self._db, "pool", None) if self._db is not None else None
+        if pool is None:
+            return None
+        started = time.perf_counter()
+        async with pool.acquire(timeout=timeout_s):
+            return (time.perf_counter() - started) * 1000.0
+
+    # -- dependency probes ----------------------------------------------------------------------
+    async def postgres_health(self, *, extras, timeout_s):
+        import asyncpg
+
+        kwargs = self.connect_kwargs()
+        kwargs["timeout"] = timeout_s
+        started = time.perf_counter()
+        conn = await asyncpg.connect(**kwargs)
+        connect_ms = (time.perf_counter() - started) * 1000.0
+        try:
+            started = time.perf_counter()
+            await conn.fetchval("SELECT 1", timeout=timeout_s)
+            out: dict[str, Any] = {
+                "latency_ms": (time.perf_counter() - started) * 1000.0,
+                "connect_ms": connect_ms,
+            }
+            if not extras:
+                return out
+            await conn.execute(
+                f"SET statement_timeout = {int(min(timeout_s, 10) * 1000)}"
+            )
+            summary = await conn.fetchrow(
+                """SELECT current_setting('max_connections')::int AS max_connections,
+                    (SELECT count(*) FROM pg_stat_activity
+                     WHERE backend_type = 'client backend')::int AS connections,
+                    pg_database_size(current_database())::bigint AS db_size_bytes,
+                    current_setting('server_version') AS server_version""",
+                timeout=timeout_s,
+            )
+            out.update(dict(summary))
+            states = await conn.fetch(
+                """SELECT COALESCE(state, 'unknown') AS state, count(*)::int AS n
+                FROM pg_stat_activity WHERE backend_type = 'client backend'
+                GROUP BY 1""",
+                timeout=timeout_s,
+            )
+            out["states"] = {r["state"]: r["n"] for r in states}
+            # Cumulative counters; the probe turns them into 5-minute deltas.
+            db_stats = await conn.fetchrow(
+                """SELECT xact_commit::bigint AS xact_commit,
+                    xact_rollback::bigint AS xact_rollback,
+                    deadlocks::bigint AS deadlocks,
+                    temp_bytes::bigint AS temp_bytes,
+                    blks_read::bigint AS blks_read,
+                    blks_hit::bigint AS blks_hit
+                FROM pg_stat_database WHERE datname = current_database()""",
+                timeout=timeout_s,
+            )
+            out["db_stats"] = dict(db_stats) if db_stats is not None else None
+            # Blocked backends and the ones blocking them: durations, statement
+            # type, a fingerprint and the length of the query. The query text
+            # itself never leaves the database.
+            blocking = await conn.fetch(
+                """WITH blocked AS (
+                    SELECT pid, pg_blocking_pids(pid) AS blockers
+                    FROM pg_stat_activity
+                    WHERE cardinality(pg_blocking_pids(pid)) > 0
+                    LIMIT 50
+                ), involved AS (
+                    SELECT pid FROM blocked
+                    UNION SELECT unnest(blockers) FROM blocked
+                )
+                SELECT a.pid, COALESCE(b.blockers, '{}'::int[]) AS blocked_by,
+                    a.state, a.wait_event_type, a.wait_event,
+                    extract(epoch FROM (now() - COALESCE(
+                        a.query_start, a.xact_start, a.backend_start)))::float8
+                        AS duration_s,
+                    left(upper(substring(ltrim(a.query) FROM '^[A-Za-z]+')), 16)
+                        AS statement_type,
+                    left(md5(regexp_replace(COALESCE(a.query, ''),
+                        '[0-9]+|''[^'']*''', '?', 'g')), 16) AS fingerprint,
+                    length(a.query) AS query_length
+                FROM pg_stat_activity a
+                JOIN involved i ON i.pid = a.pid
+                LEFT JOIN blocked b ON b.pid = a.pid
+                ORDER BY duration_s DESC NULLS LAST
+                LIMIT 40""",
+                timeout=timeout_s,
+            )
+            out["blocking"] = [dict(r) for r in blocking]
+            return out
+        finally:
+            await _close_quietly(conn)
+
+    async def probe_write(self, rows):
+        if not rows:
+            return
+        values = [
+            (
+                r["dependency"][:32],
+                r["status"][:8],
+                int(r["latency_ms"]) if r.get("latency_ms") is not None else None,
+                (r.get("error_class") or None) and r["error_class"][:64],
+                json.dumps(r.get("detail") or {}, default=str),
+            )
+            for r in rows
+        ]
+        async with self._conn() as conn:
+            async with conn.transaction():
+                await conn.execute(f"SET LOCAL statement_timeout = {WRITE_TIMEOUT_MS}")
+                await conn.executemany(
+                    f"""INSERT INTO {TABLE_PROBES}
+                        (ts, dependency, status, latency_ms, error_class, detail)
+                    VALUES (clock_timestamp(), $1, $2, $3, $4, $5::jsonb)
+                    ON CONFLICT DO NOTHING""",
+                    values,
+                )
+
+    async def probe_strips(self, hours, slot_s):
+        return await self._read(
+            f"""SELECT dependency, floor(extract(epoch FROM ts) / $2)::bigint AS slot,
+                count(*) FILTER (WHERE status = 'ok')::int AS ok,
+                count(*) FILTER (WHERE status = 'warn')::int AS warn,
+                count(*) FILTER (WHERE status = 'down')::int AS down,
+                count(*)::int AS total
+            FROM {TABLE_PROBES}
+            WHERE ts >= now() - make_interval(hours => $1::int)
+            GROUP BY 1, 2""",
+            int(hours),
+            int(slot_s),
+        )
+
+    async def probe_recent(self, dependency, limit):
+        rows = await self._read(
+            f"""SELECT ts, status, latency_ms, error_class, detail FROM {TABLE_PROBES}
+            WHERE dependency = $1 ORDER BY ts DESC LIMIT $2""",
+            dependency,
+            int(limit),
+        )
+        for row in rows:
+            row["detail"] = self._decode(row.get("detail")) or {}
+        return rows
+
+    async def probe_series(self, dependency, hours, bucket_s):
+        return await self._read(
+            f"""SELECT floor(extract(epoch FROM ts) / $3)::bigint * $3 AS t,
+                avg(latency_ms)::float8 AS avg_ms, max(latency_ms)::int AS max_ms,
+                count(*) FILTER (WHERE status = 'down')::int AS down,
+                count(*) FILTER (WHERE status = 'warn')::int AS warn,
+                count(*)::int AS total
+            FROM {TABLE_PROBES}
+            WHERE dependency = $1 AND ts >= now() - make_interval(hours => $2::int)
+            GROUP BY 1 ORDER BY 1""",
+            dependency,
+            int(hours),
+            int(bucket_s),
+        )
+
+    async def probe_error_classes(self, dependency, hours):
+        return await self._read(
+            f"""SELECT error_class AS key, count(*)::int AS count FROM {TABLE_PROBES}
+            WHERE dependency = $1 AND error_class IS NOT NULL
+              AND ts >= now() - make_interval(hours => $2::int)
+            GROUP BY 1 ORDER BY 2 DESC, 1 LIMIT 20""",
+            dependency,
+            int(hours),
+        )
+
+    async def probe_cleanup(self, days):
+        await self._write(
+            f"DELETE FROM {TABLE_PROBES} WHERE ts < now() - make_interval(days => $1::int)",
+            int(days),
+        )
+
+
+def _still_running(
+    alive: Optional[Callable[[Any, Any], bool]], pid, create_time
+) -> bool:
+    """The supersede veto; a failing check never blocks superseding."""
+    if alive is None:
+        return False
+    try:
+        return bool(alive(pid, create_time))
+    except Exception:
+        return False
+
+
+def _uuid_hex(value: Any) -> str:
+    """Worker IDs travel as 32 hex characters; asyncpg returns ``uuid.UUID``."""
+    hex_value = getattr(value, "hex", None)
+    return hex_value if isinstance(hex_value, str) else str(value).replace("-", "")
+
 
 async def _close_quietly(conn: Any) -> None:
     try:
@@ -1070,6 +1538,12 @@ class MemoryOpsStore(OpsStore):
         self.audit_rows: list[dict[str, Any]] = []
         self.workspace_rows: dict[str, list[dict[str, Any]]] = defaultdict(list)
         self.alert_rows: list[dict[str, Any]] = []
+        self.worker_rows: dict[str, dict[str, Any]] = {}
+        self.sample_rows: dict[tuple[str, int], dict[str, Any]] = {}
+        self.probe_rows: list[dict[str, Any]] = []
+        # What postgres_health answers (or raises), for probe tests.
+        self.pg_health: dict[str, Any] = {"latency_ms": 1.0, "connect_ms": 2.0}
+        self.pg_health_error: Optional[BaseException] = None
         self.fail_reads: Optional[BaseException] = None
         self.ready = True
         self.doc_status_ready = True
@@ -1081,6 +1555,9 @@ class MemoryOpsStore(OpsStore):
 
     def _utc_now(self) -> datetime:
         return datetime.fromtimestamp(self.clock(), timezone.utc).replace(tzinfo=None)
+
+    def _aware_now(self) -> datetime:
+        return datetime.fromtimestamp(self.clock(), timezone.utc)
 
     @staticmethod
     def _not_dup(row: dict[str, Any]) -> bool:
@@ -1578,3 +2055,215 @@ class MemoryOpsStore(OpsStore):
             if (alert.get("scope") or {}).get("workspace") == workspace:
                 alert["title"] = alert["title"].replace(workspace, hashed)
                 alert["scope"]["workspace"] = hashed
+
+    # -- workers ---------------------------------------------------------------------------
+    async def worker_beat(self, row, sample=None):
+        self._check()
+        now = self._aware_now()
+        current = self.worker_rows.get(row["worker_id"]) or {}
+        self.worker_rows[row["worker_id"]] = {
+            "worker_id": row["worker_id"],
+            "host": row["host"],
+            "pid": row["pid"],
+            "pid_create_time": row.get("pid_create_time"),
+            "mode": row["mode"],
+            "version": row.get("version"),
+            "started_at": current.get("started_at", row["started_at"]),
+            "heartbeat_at": now,
+            "exited_at": None,
+            "superseded": False,
+            "leases_held": list(row.get("leases_held") or []),
+            "snapshot": json.loads(json.dumps(row.get("snapshot") or {}, default=str)),
+        }
+        if sample is not None:
+            minute = int(self.clock() // 60 * 60)
+            self.sample_rows[(row["worker_id"], minute)] = {
+                "worker_id": row["worker_id"],
+                "minute": minute,
+                **{
+                    k: sample.get(k)
+                    for k in ("cpu_pct", "rss", "loop_lag_ms", "pool_wait_ms")
+                },
+            }
+
+    async def supersede_workers(self, host, worker_id, started_at, stale_s, alive=None):
+        self._check()
+        now = self._aware_now()
+        count = 0
+        for row in self.worker_rows.values():
+            if (
+                row["host"] == host
+                and row["worker_id"] != worker_id
+                and row["started_at"] < started_at
+                and not row["superseded"]
+                and row["exited_at"] is None
+                and (now - row["heartbeat_at"]).total_seconds() > stale_s
+                and not _still_running(alive, row["pid"], row["pid_create_time"])
+            ):
+                row["superseded"] = True
+                count += 1
+        return count
+
+    async def worker_exited(self, worker_id):
+        row = self.worker_rows.get(worker_id)
+        if row is not None:
+            row["exited_at"] = self._aware_now()
+
+    async def cleanup_workers(self, row_hours, sample_days):
+        self._check()
+        now = self._aware_now()
+        for key in [
+            k
+            for k, r in self.worker_rows.items()
+            if (now - r["heartbeat_at"]).total_seconds() > row_hours * 3600
+        ]:
+            del self.worker_rows[key]
+        cutoff = self.clock() - sample_days * 86400
+        for key in [k for k, r in self.sample_rows.items() if r["minute"] < cutoff]:
+            del self.sample_rows[key]
+
+    async def workers(self, limit):
+        self._check()
+        now = self._aware_now()
+        rows = sorted(
+            (copy.deepcopy(r) for r in self.worker_rows.values()),
+            key=lambda r: r["heartbeat_at"],
+            reverse=True,
+        )[:limit]
+        for row in rows:
+            row["heartbeat_age_s"] = (now - row["heartbeat_at"]).total_seconds()
+        return rows
+
+    async def worker_history(self, worker_id, hours, bucket_s):
+        self._check()
+        cutoff = self.clock() - hours * 3600
+        buckets: dict[int, list[dict[str, Any]]] = defaultdict(list)
+        for (wid, minute), row in self.sample_rows.items():
+            if wid == worker_id and minute >= cutoff:
+                buckets[minute // bucket_s * bucket_s].append(row)
+        out = []
+        for t in sorted(buckets):
+            rows = buckets[t]
+
+            def values(key: str) -> list:
+                return [r[key] for r in rows if r.get(key) is not None]
+
+            cpu = values("cpu_pct")
+            out.append(
+                {
+                    "t": t,
+                    "rss": max(values("rss"), default=None),
+                    "cpu": sum(cpu) / len(cpu) if cpu else None,
+                    "loop_lag": max(values("loop_lag_ms"), default=None),
+                    "pool_wait": max(values("pool_wait_ms"), default=None),
+                }
+            )
+        return out
+
+    # -- probes ----------------------------------------------------------------------------
+    async def postgres_health(self, *, extras, timeout_s):
+        if self.pg_health_error is not None:
+            raise self.pg_health_error
+        out = dict(self.pg_health)
+        if not extras:
+            for key in (
+                "max_connections",
+                "connections",
+                "db_size_bytes",
+                "states",
+                "blocking",
+                "db_stats",
+            ):
+                out.pop(key, None)
+        return out
+
+    async def probe_write(self, rows):
+        self._check()
+        now = self._aware_now()
+        for row in rows:
+            self.probe_rows.append(
+                {
+                    "ts": now,
+                    "dependency": row["dependency"],
+                    "status": row["status"],
+                    "latency_ms": None
+                    if row.get("latency_ms") is None
+                    else int(row["latency_ms"]),
+                    "error_class": row.get("error_class"),
+                    "detail": json.loads(
+                        json.dumps(row.get("detail") or {}, default=str)
+                    ),
+                }
+            )
+
+    def _probe_window(self, hours: int, dependency: Optional[str] = None) -> list:
+        cutoff = self._aware_now() - timedelta(hours=hours)
+        return [
+            r
+            for r in self.probe_rows
+            if r["ts"] >= cutoff
+            and (dependency is None or r["dependency"] == dependency)
+        ]
+
+    async def probe_strips(self, hours, slot_s):
+        self._check()
+        cells: dict[tuple[str, int], dict[str, Any]] = {}
+        for row in self._probe_window(hours):
+            slot = int(row["ts"].timestamp() // slot_s)
+            cell = cells.setdefault(
+                (row["dependency"], slot),
+                {
+                    "dependency": row["dependency"],
+                    "slot": slot,
+                    "ok": 0,
+                    "warn": 0,
+                    "down": 0,
+                    "total": 0,
+                },
+            )
+            if row["status"] in ("ok", "warn", "down"):
+                cell[row["status"]] += 1
+            cell["total"] += 1
+        return list(cells.values())
+
+    async def probe_recent(self, dependency, limit):
+        self._check()
+        rows = [dict(r) for r in self.probe_rows if r["dependency"] == dependency]
+        rows.sort(key=lambda r: r["ts"], reverse=True)
+        return rows[:limit]
+
+    async def probe_series(self, dependency, hours, bucket_s):
+        self._check()
+        buckets: dict[int, list[dict[str, Any]]] = defaultdict(list)
+        for row in self._probe_window(hours, dependency):
+            buckets[int(row["ts"].timestamp()) // bucket_s * bucket_s].append(row)
+        out = []
+        for t in sorted(buckets):
+            rows = buckets[t]
+            latencies = [r["latency_ms"] for r in rows if r["latency_ms"] is not None]
+            out.append(
+                {
+                    "t": t,
+                    "avg_ms": sum(latencies) / len(latencies) if latencies else None,
+                    "max_ms": max(latencies, default=None),
+                    "down": sum(1 for r in rows if r["status"] == "down"),
+                    "warn": sum(1 for r in rows if r["status"] == "warn"),
+                    "total": len(rows),
+                }
+            )
+        return out
+
+    async def probe_error_classes(self, dependency, hours):
+        self._check()
+        counts: dict[str, int] = defaultdict(int)
+        for row in self._probe_window(hours, dependency):
+            if row.get("error_class"):
+                counts[row["error_class"]] += 1
+        return [
+            {"key": k, "count": n}
+            for k, n in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+        ][:20]
+
+    async def probe_cleanup(self, days):
+        cutoff = self._aware_now() - timedelta(days=days)
+        self.probe_rows = [r for r in self.probe_rows if r["ts"] >= cutoff]

@@ -9,6 +9,7 @@ import type {
   Feed,
   OpsEvent,
   OpsOverview,
+  OpsWorker,
   OverviewKpis,
   Page,
   PauseItem,
@@ -19,6 +20,7 @@ import type {
 } from './api'
 import { ageSeconds } from './format'
 import { readOpsHash } from './hashState'
+import { depCounts, normalizeDeps, normalizeWorker, sortWorkers } from './health/model'
 
 /**
  * Server answers → the shapes the views read. The routes follow §3.7 but
@@ -52,7 +54,9 @@ function targetOfLink(link: unknown): AttentionItem['target'] {
     sub: view.sub,
     workspace: d?.kind === 'workspace' ? d.id : d?.kind === 'document' ? d.workspace : null,
     doc_id: d?.kind === 'document' ? d.id : null,
-    run_id: d?.kind === 'run' ? d.id : null
+    run_id: d?.kind === 'run' ? d.id : null,
+    dep: d?.kind === 'dependency' ? d.id : null,
+    worker_id: d?.kind === 'worker' ? d.id : null
   }
 }
 
@@ -71,6 +75,8 @@ export function normalizeAttention(raw: unknown): AttentionItem[] {
       since: str(a.since),
       count: num(a.count) ?? num(obj(a.params).count),
       workspace: str(a.workspace) ?? str(obj(a.params).workspace),
+      dep: str(a.dep) ?? str(obj(a.params).dep) ?? str(obj(a.params).dependency),
+      worker_id: str(a.worker_id) ?? str(obj(a.params).worker_id),
       target: a.target ? obj(a.target) : targetOfLink(a.link)
     }))
 }
@@ -141,13 +147,19 @@ export function normalizeEvents(raw: unknown): OpsEvent[] {
 
 export function normalizeOverview(raw: unknown): OpsOverview {
   const o = obj(raw)
+  const parsedAt = str(o.generated_at) ? Date.parse(o.generated_at) : Number.NaN
+  const generatedAt = Number.isFinite(parsedAt) ? parsedAt : null
   const c = obj(o.checked)
   const timeline = obj(o.timeline)
+  const deps = normalizeDeps(o.deps, generatedAt)
+  const kpis = normalizeKpis(o.kpis, str(o.generated_at))
+  // An older server may list dependencies without the summary tile: count them here.
+  if (!kpis.deps && deps.length) kpis.deps = depCounts(deps)
   return {
     ...o,
     state: str(o.state) ?? 'unknown',
     worst: str(o.worst),
-    kpis: normalizeKpis(o.kpis, str(o.generated_at)),
+    kpis,
     attention: normalizeAttention(o.attention),
     checked: o.checked
       ? {
@@ -159,7 +171,8 @@ export function normalizeOverview(raw: unknown): OpsOverview {
       : null,
     timeline: o.timeline ? { buckets: arr(timeline.buckets), events: Array.isArray(timeline.events) ? normalizeEvents(timeline.events) : undefined } : null,
     active_top: arr(o.active_top),
-    deps: arr(o.deps)
+    deps,
+    workers: sortWorkers(arr(o.workers).map((w) => normalizeWorker(w, generatedAt)).filter((w): w is OpsWorker => w !== null))
   } as OpsOverview
 }
 

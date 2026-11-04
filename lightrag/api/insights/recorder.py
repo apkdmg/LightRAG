@@ -2,14 +2,20 @@
 
 A write failure never reaches the LLM call that produced the record. Records are
 kept and retried; once the buffer is full, new ones are counted as lost so the
-page can show what share of usage is missing.
+page can show what share of usage is missing. System events dropped for the
+same reason are counted too.
+
+The read-only accessors (:meth:`UsageRecorder.health` and the properties) let
+the Operations console report the recorder's state through each worker's
+heartbeat.
 """
 
 from __future__ import annotations
 
 import asyncio
 import hashlib
-from typing import Optional
+import time
+from typing import Any, Optional
 
 from lightrag.usage import (
     SystemEvent,
@@ -49,17 +55,61 @@ class UsageRecorder:
         self._records: list[UsageRecord] = []
         self._events: list[SystemEvent] = []
         self._lost = 0
+        # Cumulative counters for health reporting; never reset.
+        self._lost_total = 0
+        self._dropped_events = 0
+        self._flush_failures = 0
+        self._last_flush_ok_at: Optional[float] = None
         self._task: Optional[asyncio.Task] = None
 
     def record(self, record: UsageRecord) -> None:
         if len(self._records) >= self._max_buffer:
             self._lost += 1
+            self._lost_total += 1
             return
         self._records.append(record)
 
     def event(self, event: SystemEvent) -> None:
         if len(self._events) < self._max_buffer:
             self._events.append(event)
+        else:
+            self._dropped_events += 1
+
+    # -- health (read-only) --------------------------------------------------
+    @property
+    def buffer_len(self) -> int:
+        """Records and events waiting to be written."""
+        return len(self._records) + len(self._events)
+
+    @property
+    def last_flush_ok_at(self) -> Optional[float]:
+        """Epoch seconds of the last flush that left nothing unwritten."""
+        return self._last_flush_ok_at
+
+    @property
+    def flush_failures(self) -> int:
+        """Flushes that failed since start (each is retried)."""
+        return self._flush_failures
+
+    @property
+    def dropped_events(self) -> int:
+        """System events dropped since start because the buffer was full."""
+        return self._dropped_events
+
+    @property
+    def lost_rows(self) -> int:
+        """Usage records lost since start because the buffer was full."""
+        return self._lost_total
+
+    def health(self) -> dict[str, Any]:
+        return {
+            "buffer": self.buffer_len,
+            "last_flush_ok_at": self._last_flush_ok_at,
+            "flush_failures": self._flush_failures,
+            "lost_rows": self._lost_total,
+            "dropped_events": self._dropped_events,
+            "running": self._task is not None and not self._task.done(),
+        }
 
     def start(self) -> None:
         add_usage_sink(self.record)
@@ -103,5 +153,7 @@ class UsageRecorder:
                     await self.store.kv_set(LOST_ROWS_KEY, (total or 0) + self._lost)
                     self._lost = 0
             except Exception as e:
+                self._flush_failures += 1
                 logger.warning(f"Usage write failed, will retry: {e}")
                 return
+        self._last_flush_ok_at = time.time()

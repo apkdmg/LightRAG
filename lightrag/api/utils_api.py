@@ -2,9 +2,10 @@
 Utility functions for the LightRAG API.
 """
 
+import hmac
 import os
 import argparse
-from typing import Optional, List, Tuple
+from typing import Callable, Optional, List, Tuple
 import sys
 import time
 import logging
@@ -348,6 +349,58 @@ def get_combined_auth_dependency(api_key: Optional[str] = None):
         )
 
     return combined_dependency
+
+
+def get_request_authenticator(
+    api_key: Optional[str] = None,
+) -> Callable[[Request], bool]:
+    """Non-raising twin of :func:`get_combined_auth_dependency`.
+
+    For whitelisted paths that answer everyone but tell authenticated callers
+    more (``/health``): returns whether the request carries credentials the
+    combined dependency would accept on a protected path. It never renews a
+    token and never raises. A server with neither logins nor an API key
+    configured is open to everyone, so every caller counts as authenticated.
+    """
+    api_key_configured = bool(api_key)
+
+    def is_authenticated(request: Request) -> bool:
+        if not auth_configured and not api_key_configured:
+            return True
+        auth_header = request.headers.get("Authorization", "")
+        if auth_header.startswith("Bearer sk-lightrag-"):
+            try:
+                from .routers.apikey_routes import validate_user_api_key
+
+                return validate_user_api_key(auth_header[7:]) is not None
+            except Exception:
+                return False
+        scheme, _, credentials = auth_header.partition(" ")
+        token = credentials.strip() if scheme.lower() == "bearer" else ""
+        if not token:
+            token = request.cookies.get("lightrag_token") or ""
+        if token:
+            try:
+                from .auth import validate_any_token
+
+                token_info = validate_any_token(token)
+            except Exception:
+                token_info = None
+            if token_info:
+                is_guest = token_info.get("role") == "guest"
+                if auth_configured and not is_guest:
+                    return True
+                if not auth_configured and is_guest and not api_key_configured:
+                    return True
+        if api_key_configured:
+            value = request.headers.get("X-API-Key") or ""
+            if value and hmac.compare_digest(
+                value.encode("utf-8"), str(api_key).encode("utf-8")
+            ):
+                return True
+        return False
+
+    return is_authenticated
 
 
 def display_splash_screen(args: argparse.Namespace) -> None:

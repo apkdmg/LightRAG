@@ -56,7 +56,7 @@ describe('overview from the /overview route', () => {
 
   test('attention links become drill targets; counts come from params', () => {
     const [a] = normalizeOverview(raw).attention
-    expect(a.target).toEqual({ tab: 'processing', sub: 'stuck', workspace: null, doc_id: null, run_id: null })
+    expect(a.target).toEqual({ tab: 'processing', sub: 'stuck', workspace: null, doc_id: null, run_id: null, dep: null, worker_id: null })
     expect(a.count).toBe(27)
   })
 

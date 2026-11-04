@@ -28,7 +28,15 @@ async def test_without_postgres_the_service_reports_unavailable():
         assert rt.service.unavailable_reason == "postgres_required"
         assert len(rt.worker_id) == 32 and rt.pid == os.getpid()
         assert context.current_worker_id() == rt.worker_id
-        assert rt.loops == [] and rt.index_task is None
+        # Without Postgres only this process's heartbeat and its own
+        # (unleased) probes run.
+        assert [loop.name for loop in rt.loops] == ["ops:probes"]
+        assert rt.index_task is None
+        assert rt.heartbeat is not None and rt.heartbeat.store is None
+        assert rt.probes is not None and rt.probes.store is None
+        assert rt.service.probes is rt.probes
+        assert rt.service.heartbeat is rt.heartbeat
+        assert rt.leases_held() == []
         # Same process: the runtime is reused, not recreated.
         assert (
             await runtime.start_ops(
@@ -120,8 +128,11 @@ async def test_postgres_starts_builder_and_scan_loop(monkeypatch, tmp_path):
         await asyncio.wait_for(built.wait(), 2)
         await asyncio.sleep(0)
         assert rt.index_outcome == {"idx": "valid"}
-        [loop] = rt.loops
-        assert loop.name == "ops:scan" and loop.holder == rt.worker_id
+        loops = {loop.name: loop for loop in rt.loops}
+        assert set(loops) == {"ops:scan", "ops:probes", "ops:reconcile"}
+        assert all(loop.holder == rt.worker_id for loop in loops.values())
+        assert all(loop.store is rt.store for loop in loops.values())
+        assert rt.heartbeat is not None and rt.heartbeat.store is rt.store
         assert rt.on_event in _event_sinks
     finally:
         await runtime.stop_ops(app)
@@ -140,9 +151,20 @@ async def test_flags_turn_off_builder_and_scan(monkeypatch, tmp_path):
     monkeypatch.setattr(PostgresOpsStore, "finalize", finalize)
     monkeypatch.setenv("OPS_INDEX_BUILD", "0")
     monkeypatch.setenv("OPS_QUEUE_SCAN", "off")
+    monkeypatch.setenv("OPS_PROBES_ENABLED", "false")
     app = _app(email_resync_queue=SimpleNamespace(base_dir=tmp_path))
     rt = await runtime.start_ops(app, None, SimpleNamespace(kv_storage="PGKVStorage"))
-    assert rt.index_task is None and rt.loops == []
+    assert rt.index_task is None
+    assert [loop.name for loop in rt.loops] == ["ops:reconcile"]
+    assert rt.probes is None and rt.service.probes is None
+    await runtime.stop_ops(app)
+
+
+async def test_disabled_backend_starts_no_background_work(monkeypatch):
+    monkeypatch.setenv("OPS_ENABLED", "false")
+    app = _app()
+    rt = await runtime.start_ops(app, None, SimpleNamespace(kv_storage="JsonKVStorage"))
+    assert rt.loops == [] and rt.heartbeat is None and rt.probes is None
     await runtime.stop_ops(app)
 
 
