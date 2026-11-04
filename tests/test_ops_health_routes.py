@@ -54,7 +54,9 @@ def test_health_grid(client):
     body = response.json()
     assert body["enabled"] is True and body["available"] is True
     deps = {d["id"]: d for d in body["deps"]}
-    assert set(deps) == {"postgres", "neo4j", "smtp", "llm", "etcd"}
+    # Sign-in is the passive card from the auth counters (no probe of its own).
+    assert set(deps) == {"postgres", "neo4j", "smtp", "llm", "etcd", "signin"}
+    assert deps["signin"]["passive"] is True and deps["signin"]["status"] == "ok"
     assert deps["postgres"]["status"] == "ok"
     assert deps["neo4j"]["status"] == "down"
     assert deps["neo4j"]["consecutive_failures"] == 4
@@ -67,7 +69,7 @@ def test_health_grid(client):
     assert strip[0]["start"] < strip[-1]["start"]
     assert deps["etcd"]["strip"] == []
     assert body["cycle"]["holder"] == WORKER_ID and body["cycle"]["holder_self"]
-    assert body["summary"]["total"] == 4 and body["summary"]["down"] == 1
+    assert body["summary"]["total"] == 5 and body["summary"]["down"] == 1
 
 
 def test_status_reports_probes_and_heartbeat_workers(client):
@@ -164,7 +166,8 @@ def test_overview_fills_deps_and_workers(client):
     assert all(d["strip"] == [] for d in body["deps"])
     assert body["workers"][0]["worker_id"] == WORKER_ID
     tile = body["kpis"]["deps"]
-    assert tile["available"] is True and tile["ok"] == 2 and tile["total"] == 4
+    # postgres, smtp and sign-in ok; neo4j down; etcd not probed.
+    assert tile["available"] is True and tile["ok"] == 3 and tile["total"] == 5
     assert tile["state"] == "critical"
     down = [a for a in body["attention"] if a["rule"] == "dependency_down"]
     assert down and down[0]["severity"] == "critical"

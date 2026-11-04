@@ -13,6 +13,10 @@ index builder, then checks that:
 - the store agrees with ``MemoryOpsStore`` on a small dataset;
 - leases, KV helpers, the index builder's invalid-index handling and the
   workspace-deletion hook behave as specified.
+- the performance metrics (insert-only minute rows, hourly rollup, retention,
+  the hour/minute split read) and Q5 LLM latency percentiles agree with the
+  memory stores, and Q5 range-scans ``LIGHTRAG_USAGE_CALLS`` by ``ts``
+  (``OPS_IT_USAGE_CALLS`` rows, default 1M).
 
 Runs only with ``LIGHTRAG_RUN_INTEGRATION=true``, ``--run-integration`` and
 ``POSTGRES_HOST`` / ``POSTGRES_PORT`` / ``POSTGRES_USER`` /
@@ -801,6 +805,9 @@ class _Capture(PostgresOpsStore):
 def _literal(value) -> str:
     if isinstance(value, int):
         return str(value)
+    if isinstance(value, (list, tuple)):
+        # An array parameter as a text array literal ('{"a","b"}').
+        return _literal("{" + ",".join(f'"{v}"' for v in value) + "}")
     return "'" + str(value).replace("'", "''") + "'"
 
 
@@ -1282,3 +1289,401 @@ async def test_log_follow_sees_late_commits_from_another_connection(pg):
 
 def same_dt(epoch: float) -> datetime:
     return datetime.fromtimestamp(epoch, timezone.utc)
+
+
+# -- performance metrics and Q5 (PR-6) ------------------------------------------------
+
+
+async def _reset_perf(store: PostgresOpsStore) -> None:
+    async with store.dedicated_connection() as conn:
+        for table in (
+            "lightrag_ops_metrics_min",
+            "lightrag_ops_metrics_hour",
+            "lightrag_ops_kv",
+            "lightrag_ops_runs",
+            "lightrag_ops_doc_failures",
+            "lightrag_usage_calls",
+            "lightrag_usage_hourly",
+        ):
+            await conn.execute(f"TRUNCATE {table}")
+
+
+def _metric_row(minute: float, worker: str, series: str, key: str, latencies, errors):
+    from lightrag.api.ops.metrics import BUCKETS, bucket_index
+
+    buckets = [0] * BUCKETS
+    for ms in latencies:
+        buckets[bucket_index(ms)] += 1
+    return {
+        "minute": int(minute) // 60 * 60,
+        "worker_id": worker,
+        "series": series,
+        "key": key,
+        "count": len(latencies),
+        "errors": errors,
+        "sum_ms": int(sum(latencies)),
+        "max_ms": int(max(latencies, default=0)),
+        "buckets": buckets,
+    }
+
+
+class _HeldLease:
+    async def still_held(self) -> bool:
+        return True
+
+
+async def test_metrics_write_rollup_read_and_retention(pg):
+    """Insert-only minute rows, the hourly rollup, the hour/minute split read
+    and batched retention agree with ``MemoryOpsStore``."""
+    from lightrag.api.ops import metrics
+
+    await _reset_perf(pg)
+    memory = MemoryOpsStore()
+    workers = ["0123456789abcdef0123456789abcdef", "fedcba9876543210fedcba9876543210"]
+    now = time.time()
+    hour = int(now) // 3600 * 3600
+    rows = []
+    for m in range(0, 180, 7):  # three hours of minutes, two workers
+        for w, worker in enumerate(workers):
+            minute = hour - 3 * 3600 + m * 60
+            rows.append(
+                _metric_row(
+                    minute, worker, "http", "GET /documents", [5 + w, 40, 900], w
+                )
+            )
+            rows.append(_metric_row(minute, worker, "embed", "bge-m3", [30, 31], 0))
+    # Past retention: 15 days of minutes, 91 days of hours.
+    old = _metric_row(now - 15 * 86400, workers[0], "http", "<unmatched>", [2], 0)
+    for store in (pg, memory):
+        await store.metrics_write(rows + [old])
+        # A retried write is ignored (insert-only), not added twice.
+        await store.metrics_write(rows[:4])
+    start = metrics._hour_floor(hour - 3 * 3600)
+    end = metrics._hour_floor(hour)
+
+    def norm(items):
+        return sorted(
+            (
+                r["t"],
+                r["series"],
+                r["key"],
+                r["count"],
+                r["errors"],
+                r["sum_ms"],
+                r["max_ms"],
+                tuple(r["buckets"]),
+            )
+            for r in items
+        )
+
+    # Minutes only, then the rollup and the hour/minute split.
+    span = (same_dt(hour - 4 * 3600), same_dt(hour - 4 * 3600), same_dt(now + 60))
+    minute_pg = await pg.metrics_read(["http", "embed"], *span, 3600)
+    minute_mem = await memory.metrics_read(["http", "embed"], *span, 3600)
+    assert norm(minute_pg) == norm(minute_mem) and minute_pg
+    for store in (pg, memory):
+        assert await store.metrics_rollup(start, end) == 6  # 3 hours x 2 keys
+        # Re-rolling is an upsert: same totals.
+        await store.metrics_rollup(start, end)
+    split = (same_dt(hour - 4 * 3600), end, same_dt(now + 60))
+    hourly_pg = await pg.metrics_read(["http", "embed"], *split, 3600)
+    hourly_mem = await memory.metrics_read(["http", "embed"], *split, 3600)
+    assert norm(hourly_pg) == norm(hourly_mem)
+    # The rollup keeps every count: the split read equals the minutes-only one.
+    assert norm(hourly_pg) == norm(minute_pg)
+    assert await pg.metrics_cleanup(14, 90) == await memory.metrics_cleanup(14, 90)
+    async with pg.dedicated_connection() as conn:
+        assert (
+            await conn.fetchval(
+                "SELECT count(*) FROM lightrag_ops_metrics_min WHERE key = '<unmatched>'"
+            )
+            == 0
+        )
+    # The leased job: watermark stored, nothing past retention left.
+    out = await metrics.rollup_cycle(_HeldLease(), store=pg)
+    assert out["rolled"] >= 0
+    assert await metrics.rollup_through(pg) is not None
+
+
+async def test_metrics_read_uses_the_time_keys(pg):
+    """The minute and hour reads range-scan their primary keys."""
+    await _reset_perf(pg)
+    worker = "0123456789abcdef0123456789abcdef"
+    now = time.time()
+    async with pg.dedicated_connection() as conn:
+        await conn.execute(
+            """INSERT INTO lightrag_ops_metrics_min (minute, worker_id, series, key,
+                count, errors, sum_ms, max_ms, buckets)
+            SELECT to_timestamp($1::float8 - g * 60), $2::uuid, 'http',
+                'GET /r' || (g % 150), 1, 0, 10, 10, array_fill(0, ARRAY[20])
+            FROM generate_series(1, 200000) AS g""",
+            now,
+            worker,
+        )
+        await conn.execute("ANALYZE lightrag_ops_metrics_min")
+    capture = _Capture(pg)
+    end = same_dt(now)
+    await capture.metrics_read(
+        ["http"], end - timedelta(hours=1), end - timedelta(hours=1), end, 300
+    )
+    sql, args = capture.statements[-1]
+    async with pg.dedicated_connection() as conn:
+        plan = await conn.fetchval("EXPLAIN (FORMAT JSON) " + sql, *args)
+    scans = _seq_scans(json.loads(plan) if isinstance(plan, str) else plan)
+    assert "lightrag_ops_metrics_min" not in scans, plan
+
+
+async def test_q5_latency_percentiles_use_the_ts_index(pg):
+    """Q5 (and the baseline and calls-per-minute reads) range-scan
+    ``LIGHTRAG_USAGE_CALLS`` by ``ts``: no Seq Scan, at release-like volume."""
+    from lightrag.api.insights.store import MemoryUsageStore, PostgresUsageStore
+    from lightrag.usage import UsageRecord
+
+    await _reset_perf(pg)
+    usage = PostgresUsageStore()
+    await usage.initialize()
+    try:
+        rng = random.Random(6)
+        now = time.time()
+        total = int(os.getenv("OPS_IT_USAGE_CALLS", "1000000"))
+        purposes = ["extract", "query", "summary", "keywords"]
+        statuses = ["ok"] * 95 + ["error"] * 3 + ["truncated", "abandoned"]
+        columns = [
+            "ts",
+            "workspace",
+            "purpose",
+            "operation",
+            "source",
+            "model",
+            "billing",
+            "latency_ms",
+            "status",
+            "cache_hit",
+        ]
+
+        def record(ts: float) -> tuple:
+            return (
+                same_dt(ts),
+                f"user{rng.randrange(3000):04d}_unimas_my",
+                rng.choice(purposes),
+                "llm",
+                "api",
+                rng.choice(["gpt-4o-mini", "gpt-4o"]),
+                "system",
+                int(rng.lognormvariate(7, 0.6)),
+                rng.choice(statuses),
+                rng.random() < 0.1,
+            )
+
+        async with pg.dedicated_connection() as conn:
+            batch = []
+            for i in range(total):
+                # 30 days of calls, a denser last day.
+                age = rng.random() * (86400 if i % 3 == 0 else 30 * 86400)
+                batch.append(record(now - age))
+                if len(batch) >= 50_000:
+                    await conn.copy_records_to_table(
+                        "lightrag_usage_calls", records=batch, columns=columns
+                    )
+                    batch = []
+            if batch:
+                await conn.copy_records_to_table(
+                    "lightrag_usage_calls", records=batch, columns=columns
+                )
+            await conn.execute("ANALYZE lightrag_usage_calls")
+
+        statements: list[tuple[str, list]] = []
+        original = usage._rows
+
+        async def capture(sql, params):
+            statements.append((sql, params))
+            return await original(sql, params)
+
+        usage._rows = capture
+        end = same_dt(now)
+        timings = {}
+        for name, window in (("15m", 900), ("1h", 3600), ("24h", 86400)):
+            start = end - timedelta(seconds=window)
+            started = time.perf_counter()
+            series = await usage.latency_percentiles(
+                start, end, group="purpose", bucket_s=60 if window <= 3600 else 3600
+            )
+            table = await usage.latency_percentiles(start, end, group="model")
+            timings[name] = round((time.perf_counter() - started) * 1000, 1)
+            assert table and series
+            assert all(r["p50_ms"] <= r["p95_ms"] <= r["p99_ms"] for r in table)
+        hour = int(now) // 3600 * 3600
+        baseline = await usage.latency_baseline(
+            [same_dt(hour - d * 86400) for d in range(1, 8)]
+        )
+        assert baseline["calls"] > 0 and baseline["p95_ms"] > 0
+        assert await usage.call_counts(end - timedelta(hours=24), end, 300)
+        assert await usage.top_workspace_calls(end - timedelta(hours=1), end, limit=20)
+        print(f"\nQ5 timings over {total} usage calls (ms): {timings}")
+
+        async with pg.dedicated_connection() as conn:
+            for sql, params in statements:
+                if "lightrag_usage_calls" not in sql.lower():
+                    continue
+                for generic in (False, True):
+                    scans = await _explain(conn, sql, tuple(params), generic)
+                    assert "lightrag_usage_calls" not in scans, (generic, sql)
+
+        # Same answers as the memory store on a small, exact dataset.
+        await _reset_perf(pg)
+        memory = MemoryUsageStore()
+        records = [
+            UsageRecord(
+                operation="llm",
+                ts=now - 30 - 60 * i,  # clear of the window's edges
+                workspace="fsktm",
+                purpose=purposes[i % 4],
+                model="gpt-4o-mini",
+                latency_ms=100 + 37 * i,
+                status="error" if i % 9 == 0 else "ok",
+                cache_hit=i % 10 == 5,
+            )
+            for i in range(50)
+        ]
+        await usage.write(records, [])
+        await memory.write(records, [])
+        start = end - timedelta(hours=1)
+        exact = await usage.latency_percentiles(start, end, group="purpose")
+        expected = await memory.latency_percentiles(start, end, group="purpose")
+        assert len(exact) == len(expected) == 4
+        for got, want in zip(exact, expected):
+            assert set(got) == set(want)
+            for name, value in want.items():
+                if isinstance(value, float):
+                    assert got[name] == pytest.approx(value), name
+                else:
+                    assert got[name] == value, name
+    finally:
+        await usage.finalize()
+
+
+async def test_throughput_and_top_workspaces_match_memory_store(pg):
+    await _reset_perf(pg)
+    memory = MemoryOpsStore()
+    now = time.time()
+    ids = [f"{i:032x}" for i in range(1, 9)]
+    runs = [
+        _run_row(ids[0], "ws1", "succeeded", now - 3 * 3600),
+        _run_row(ids[1], "ws1", "succeeded", now - 2 * 3600),
+        _run_row(ids[2], "ws2", "failed", now - 3600),
+        _run_row(ids[3], "ws2", "running", now - 600),
+        _run_row(ids[4], "ws3", "succeeded", now - 1800, kind="email_batch"),
+        _run_row(ids[5], "ws3", "failed", now - 1700, kind="email_batch"),
+    ]
+    failures = [
+        {
+            "ts": now - 300 * i,
+            "workspace": f"ws{1 + i % 3}",
+            "doc_id": f"doc-{i}",
+            "track_id": None,
+            "run_id": ids[0],
+            "stage": "extract",
+            "error_kind": ("timeout", "cancelled", "duplicate", "rate_limited")[i % 4],
+            "http_status": None,
+            "exc_type": "x.Error",
+            "message": "masked",
+            "attempt": 1,
+            "model": "gpt-4o-mini",
+        }
+        for i in range(10)
+    ]
+    for store in (pg, memory):
+        await store.runs_write(runs)
+        await store.doc_failures_write(failures)
+    start = same_dt(int(now) // 3600 * 3600 + 3600 - 86400)
+    end = same_dt(int(now) // 3600 * 3600 + 3600)
+    assert await pg.throughput(start, end, 3600) == await memory.throughput(
+        start, end, 3600
+    )
+    for metric in ("failures", "runs"):
+        assert await pg.top_workspaces(
+            metric, start, end, 20
+        ) == await memory.top_workspaces(metric, start, end, 20), metric
+    minutes_pg = await pg.top_workspaces("processing_minutes", start, end, 20)
+    minutes_mem = await memory.top_workspaces("processing_minutes", start, end, 20)
+    assert [r["workspace"] for r in minutes_pg] == [r["workspace"] for r in minutes_mem]
+    for a, b in zip(minutes_pg, minutes_mem):
+        assert abs(a["value"] - b["value"]) < 0.5  # running runs count up to now()
+
+
+async def test_vllm_and_llm_queue_history_match_memory_store(pg):
+    """The vLLM history (probe rows) and the summed LLM queue history
+    (heartbeat samples) agree with the memory store, skip non-numeric
+    detail values, and range-scan their primary keys."""
+    async with pg.dedicated_connection() as conn:
+        await conn.execute("TRUNCATE lightrag_ops_probes")
+        await conn.execute("TRUNCATE lightrag_ops_worker_samples")
+    memory = MemoryOpsStore()
+    probes = [
+        {"running": 2, "waiting": 0, "kv_cache_pct": 10.5},
+        {"running": 4, "waiting": 30, "kv_cache_pct": 55.0},
+        {"running": "x", "waiting": None},  # nothing numeric: skipped
+    ]
+    for detail in probes:
+        row = {
+            "dependency": "embed",
+            "status": "ok",
+            "latency_ms": 5,
+            "error_class": None,
+            "detail": detail,
+        }
+        other = {**row, "dependency": "postgres", "detail": {"running": 99}}
+        for store in (pg, memory):
+            await store.probe_write([row, other])
+    end = datetime.now(timezone.utc) + timedelta(minutes=1)
+    start = end - timedelta(hours=1)
+    got = await pg.vllm_series(start, end, 3600)
+    want = await memory.vllm_series(start, end, 3600)
+    assert len(got) == len(want) >= 1
+    assert {r["dependency"] for r in got} == {"embed"}
+    assert sum(r["running"] for r in got) == pytest.approx(
+        sum(r["running"] for r in want)
+    )
+    assert max(r["waiting"] for r in got) == 30
+    assert max(r["kv_cache_pct"] for r in got) == 55.0
+
+    workers = ("c" * 32, "d" * 32)
+    for worker, queued in zip(workers, (7, 3)):
+        row = {
+            "worker_id": worker,
+            "host": "it-host",
+            "pid": 900,
+            "pid_create_time": 1.0,
+            "mode": "gunicorn",
+            "version": "it",
+            "started_at": datetime.now(timezone.utc),
+            "leases_held": [],
+            "snapshot": {},
+        }
+        sample = {
+            "cpu_pct": 1.0,
+            "llm_running": 2,
+            "llm_in_flight": 3,
+            "llm_queued": queued,
+        }
+        for store in (pg, memory):
+            await store.worker_beat(row, sample)
+    queue_pg = await pg.llm_queue_series(start, end, 300)
+    queue_mem = await memory.llm_queue_series(start, end, 300)
+    assert [(r["running"], r["in_flight"], r["queued"]) for r in queue_pg] == [
+        (r["running"], r["in_flight"], r["queued"]) for r in queue_mem
+    ]
+    assert queue_pg[-1]["queued"] == 10 and queue_pg[-1]["running"] == 4
+
+    capture = _Capture(pg)
+    await capture.vllm_series(start, end, 300)
+    sql, args = capture.statements[-1]
+    async with pg.dedicated_connection() as conn:
+        await conn.execute("SET enable_seqscan = off")
+        try:
+            plan = await conn.fetchval("EXPLAIN (FORMAT JSON) " + sql, *args)
+        finally:
+            await conn.execute("RESET enable_seqscan")
+    assert "lightrag_ops_probes" not in _seq_scans(
+        json.loads(plan) if isinstance(plan, str) else plan
+    ), plan

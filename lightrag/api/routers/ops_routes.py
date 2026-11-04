@@ -61,6 +61,7 @@ from lightrag.api.ops.service import (
     SEARCH_MAX_LENGTH,
     validate_workspace,
 )
+from lightrag.api.ops.perf import PerfBadRequest
 from lightrag.api.ops.probes import SMTP_TEST_INTERVAL_S, recheck_limit
 from lightrag.api.ops.redact import redact, sanitize_config
 from lightrag.api.ops.snapshot import NamespaceReader
@@ -393,6 +394,9 @@ async def status(
             "insights": getattr(request.app.state, "insights", None) is not None,
             "release_busy": False,
             "gpu": False,
+            # HTTP, embed/rerank and sign-in metrics recorded in this worker.
+            "metrics": getattr(getattr(request.app.state, "ops", None), "metrics", None)
+            is not None,
         },
         "process": {
             "mode": mode,
@@ -1171,3 +1175,137 @@ async def smtp_test(request: Request) -> dict[str, Any]:
         "detail": record.get("detail") or {},
         "checked_at": record.get("checked_at"),
     }
+
+
+# -- Performance and sign-in ------------------------------------------------------
+
+
+async def _perf_answer(
+    service: OpsService,
+    call: Callable[[], Any],
+    empty: dict[str, Any],
+    *,
+    needs_store: bool = True,
+) -> Any:
+    """Answer a Performance route: ``empty`` (``available: false``) without
+    the ops store when the view needs it, 400 on a bad parameter, 503 when
+    the database cannot answer."""
+    if needs_store and not service.available:
+        return _payload(service, empty, needs_docs=False)
+    try:
+        body = await call()
+    except PerfBadRequest as e:
+        return _err(400, e.code)
+    except OpsBadRequest as e:
+        return _err(400, e.code)
+    except OpsDataUnavailable:
+        return _err(503, "data_unavailable")
+    return _payload(service, body, needs_docs=False)
+
+
+_WINDOW = Query("1h", max_length=8)
+
+
+@router.get("/performance/llm")
+async def performance_llm(
+    request: Request,
+    window: str = _WINDOW,
+    group: str = Query("purpose", max_length=16),
+) -> dict[str, Any]:
+    """LLM p50/p95/p99 per purpose or model from usage calls (≤24 h); the
+    7 d window reads hourly rollups and shows average and max only."""
+    service = _service(request)
+    return await _perf_answer(
+        service,
+        lambda: service.perf.llm(window, group),
+        {},
+        needs_store=False,
+    )
+
+
+@router.get("/performance/deps")
+async def performance_deps(request: Request, window: str = _WINDOW) -> dict[str, Any]:
+    """Embedding and rerank latency and errors (timed inside the queue), with
+    vLLM running/waiting/KV cache from the probes."""
+    service = _service(request)
+    return await _perf_answer(
+        service,
+        lambda: service.perf.deps(window),
+        {
+            "window": window,
+            "series": {"embed": [], "rerank": []},
+            "models": {"embed": [], "rerank": []},
+            "totals": {},
+            "vllm": {"embed": None, "rerank": None},
+        },
+    )
+
+
+@router.get("/performance/http")
+async def performance_http(request: Request, window: str = _WINDOW) -> dict[str, Any]:
+    """Latency, rate and 5xx share per route template (``<unmatched>`` for
+    requests no route matched)."""
+    service = _service(request)
+    return await _perf_answer(
+        service,
+        lambda: service.perf.http(window),
+        {"window": window, "routes": [], "top_p95": [], "series": [], "totals": {}},
+    )
+
+
+@router.get("/performance/concurrency")
+async def performance_concurrency(request: Request) -> dict[str, Any]:
+    """Queue sums per role over every live worker, and the top 10 instances
+    by queued work (from heartbeats; no workspace is loaded)."""
+    service = _service(request)
+    return await _perf_answer(service, service.perf.concurrency, {}, needs_store=False)
+
+
+@router.get("/performance/throughput")
+async def performance_throughput(
+    request: Request, days: int = Query(7, ge=1, le=30)
+) -> dict[str, Any]:
+    """Documents processed and failed per hour, email batches per hour and
+    LLM calls per minute (last 24 h)."""
+    service = _service(request)
+    return await _perf_answer(
+        service,
+        lambda: service.perf.throughput(days),
+        {"days": days, "docs": [], "email_batches": [], "llm_calls_per_min": []},
+    )
+
+
+@router.get("/performance/top-workspaces")
+async def performance_top_workspaces(
+    request: Request,
+    metric: str = Query("llm_calls", max_length=32),
+    window: str = Query("24h", max_length=8),
+) -> dict[str, Any]:
+    """Top 20 workspaces by LLM calls, processing minutes, failures or runs."""
+    service = _service(request)
+    return await _perf_answer(
+        service,
+        lambda: service.perf.top_workspaces(metric, window),
+        {"metric": metric, "window": window, "items": []},
+    )
+
+
+@router.get("/signin")
+async def signin(
+    request: Request, window: str = Query("24h", max_length=8)
+) -> dict[str, Any]:
+    """Sign-in health: SSO callback errors, 401s and lockouts (counts only,
+    never who), for the window and the last 15 minutes."""
+    service = _service(request)
+    return await _perf_answer(
+        service,
+        lambda: service.perf.signin(window),
+        {
+            "window": window,
+            "sso_errors": 0,
+            "token_401": 0,
+            "lockouts": 0,
+            "last_15m": None,
+            "series": [],
+        },
+    )

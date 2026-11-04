@@ -36,6 +36,19 @@
   --ops-ease-in: cubic-bezier(0.42, 0, 1, 1);
   --ops-ease-loop: ease-in-out;
   --ops-ease-flow: linear;
+
+  /*
+   * Chart series (Performance, Sign-in, topology traffic). A validated
+   * categorical trio shared with Token Insights' purpose palette, and a
+   * one-hue ramp for ordered percentiles (p50 light → p99 dark). Status
+   * colours above stay reserved for state.
+   */
+  --ops-s1: #2a78d6;
+  --ops-s2: #eda100;
+  --ops-s3: #1baf7a;
+  --ops-q1: #6da7ec;
+  --ops-q2: #2a78d6;
+  --ops-q3: #184f95;
 }
 .dark .ops-root,
 .dark .ops-portal {
@@ -55,6 +68,13 @@
   --ops-paused-soft: #262040;
   --ops-stale-fg: #a3aaa3;
   --ops-flash: #33270f;
+  --ops-s1: #3987e5;
+  --ops-s2: #c98500;
+  --ops-s3: #199e70;
+  /* On a dark surface the ramp runs the other way: p99 is the most prominent. */
+  --ops-q1: #256abf;
+  --ops-q2: #5598e7;
+  --ops-q3: #b7d3f6;
 }
 
 /* Status chips: fill + text colour per tone, icon and label always present. */
@@ -326,6 +346,35 @@
 .ops-te-x { font: 700 13px var(--font-sans, ui-sans-serif, system-ui, sans-serif); fill: var(--ops-crit); }
 .ops-te-lab { font: 10.5px var(--font-mono, ui-monospace, monospace); fill: var(--muted-foreground); }
 .ops-te-lab.is-mon { fill: var(--ops-info); }
+/*
+ * Live traffic (PR-6). Thickness carries the rate bucket at all times; the
+ * dash loop (6/6, a 12 px period) only while the edge may move. Speeds are
+ * 4, 8 and 16 px/s. Only stroke-dashoffset animates (paint, no layout), on at
+ * most five edges. Reduced motion, "⏸ auto" and a stale panel stop it and
+ * leave a still solid line (dashes would read as "unknown").
+ */
+@keyframes ops-flow {
+  from { stroke-dashoffset: 0; }
+  to { stroke-dashoffset: -12; }
+}
+.ops-te-rate-low,
+.ops-te-rate-medium,
+.ops-te-rate-high { stroke: var(--ops-s1); }
+.ops-te-rate-low { stroke-width: 1.6; }
+.ops-te-rate-medium { stroke-width: 2.1; }
+.ops-te-rate-high { stroke-width: 2.8; }
+.ops-te-flow { stroke-dasharray: 6 6; }
+.ops-flow { animation: ops-flow 1.5s var(--ops-ease-flow) infinite; }
+.ops-flow-low { animation-duration: 3s; }
+.ops-flow-medium { animation-duration: 1.5s; }
+.ops-flow-high { animation-duration: 0.75s; }
+.ops-te-rate { fill: var(--foreground); }
+.ops-root[data-paused] .ops-te-flow,
+.ops-stale .ops-te-flow,
+.ops-root[data-motion="reduced"] .ops-te-flow { stroke-dasharray: none; }
+@media (prefers-reduced-motion: reduce) {
+  .ops-root .ops-te-flow { stroke-dasharray: none; }
+}
 .ops-topo:not(.is-mon) .is-mon { display: none; }
 .ops-topo.is-mon .ops-te-data,
 .ops-topo.is-mon .ops-te-bypass,

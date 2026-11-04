@@ -42,11 +42,20 @@ from lightrag.api.ops.health import (
     health_attention,
     host_info,
     order_workers,
+    signin_dep,
     strip_cell_status,
     worker_item,
 )
 from lightrag.api.ops.heartbeat import ALIVE_WITHIN_S
 from lightrag.api.ops.pauses import OwnProviderCache, read_pauses
+from lightrag.api.ops import metrics as ops_metrics
+from lightrag.api.ops.perf import (
+    METRIC_THRESHOLDS,
+    PerformanceViews,
+    merge_thresholds,
+    metric_attention,
+    signin_severity,
+)
 from lightrag.api.ops.probes import STRIP_SLOT_S, ProbeSpec
 from lightrag.api.ops.queue_scan import SCAN_INTERVAL_S, SUMMARY_KEY
 from lightrag.api.ops.redact import mask_path, redact, redact_pipeline
@@ -85,6 +94,8 @@ ATTENTION_KEY = "attention"
 ATTENTION_FRESH_S = 180.0
 # Health cards read from heartbeats rather than probes.
 DERIVED_DEPS = ("manager", "recorder", "log_sink")
+# Built from the ops metrics (the auth counters), not from heartbeats.
+SIGNIN_DEP = "signin"
 
 TTL = {
     "totals": 10.0,
@@ -136,6 +147,9 @@ DEFAULT_THRESHOLDS = {
     "llm_error_rate": 0.05,
     "llm_error_rate_serious": 0.20,
     "llm_min_calls": 20,
+    # llm_p95_15m, http_5xx_rate_5m, embed_rerank_error_rate_15m and
+    # signin_failures_15m (PR-6).
+    **METRIC_THRESHOLDS,
 }
 
 FAILURE_WINDOWS = {"1h": 1, "24h": 24, "7d": 168}
@@ -186,6 +200,14 @@ RUNBOOK = {
     "is processing, or whether it is paused.",
     "llm_error_rate_15m": "Open Performance > LLM to see which model fails, then "
     "Failures grouped by model.",
+    "llm_p95_15m": "Open Performance > LLM grouped by model: a slow provider "
+    "shows as high p95 with short queues, our own backlog as long queues.",
+    "http_5xx_rate_5m": "Open Performance > HTTP for the failing route, then "
+    "Logs filtered to it at ERROR.",
+    "embed_rerank_error_rate_15m": "Open Performance > Embed & Rerank and the "
+    "vLLM card in Health; queries and ingestion that need it fail meanwhile.",
+    "signin_failures_15m": "Check the Sign-in card in Health: SSO errors point "
+    "at the identity provider, lockouts at repeated wrong passwords.",
     "manager_rtt": "Shared pipeline state is slow or not answering; check the "
     "workers' CPU and restart the container if it persists.",
     "pg_probe": "Postgres is slow or not answering; check the database container "
@@ -492,6 +514,8 @@ class OpsService:
         self.worker_id: Optional[str] = None
         # Log searches are audited once per actor and filters every 5 min.
         self.search_audit = SearchAudit()
+        # Performance tab and Sign-in card read models (same cache).
+        self.perf = PerformanceViews(self)
 
     # -- availability --------------------------------------------------------
     @property
@@ -563,17 +587,7 @@ class OpsService:
 
         async def load():
             stored = await self.store.kv_get("thresholds") or {}
-            merged = dict(DEFAULT_THRESHOLDS)
-            if isinstance(stored, dict):
-                for key, default in DEFAULT_THRESHOLDS.items():
-                    value = stored.get(key)
-                    if (
-                        isinstance(value, (int, float))
-                        and not isinstance(value, bool)
-                        and value > 0
-                    ):
-                        merged[key] = type(default)(value)
-            return merged
+            return merge_thresholds(DEFAULT_THRESHOLDS, stored)
 
         try:
             return await self._cached(("thresholds",), "thresholds", load)
@@ -2348,7 +2362,20 @@ class OpsService:
                     card["strip"] = []
                 cards.append(card)
         cards.extend(derived_deps(worker_items or [], mode or "uvicorn", now))
+        signin = await self._signin_card(now)
+        if signin is not None:
+            cards.append(signin)
         return cards, cycle, partial
+
+    async def _signin_card(self, now: float) -> Optional[dict[str, Any]]:
+        """The passive Sign-in card: none without the ops store or with
+        OPS_METRICS_ENABLED off (no counters exist then)."""
+        if not self.available or not ops_metrics.metrics_enabled():
+            return None
+        inputs = await self.perf.rule_inputs()
+        counts = (inputs or {}).get("signin") if inputs is not None else None
+        thresholds = await self.thresholds()
+        return signin_dep(counts, signin_severity(counts, thresholds), now)
 
     def _cycle_view(self, cycle: Optional[dict], now: float) -> Optional[dict]:
         if not isinstance(cycle, dict):
@@ -2408,6 +2435,11 @@ class OpsService:
             "error_classes": [],
             "enabled": self.probes is not None,
         }
+        if spec is None and dep == SIGNIN_DEP:
+            card = await self._signin_card(now)
+            if card is None:
+                raise OpsNotFound(dep)
+            return {**empty, "dep": card, "detail": card["detail"]}
         if spec is None and dep in DERIVED_DEPS:
             try:
                 worker_items = await self._worker_items()
@@ -2672,6 +2704,7 @@ class OpsService:
             "deps": deps,
             "cycle": cycle,
             "deploy_recent": deploy_recent,
+            "metrics": await self.perf.rule_inputs(),
         }
 
     async def _overview(self, workers: dict[str, Any]) -> dict[str, Any]:
@@ -3021,6 +3054,13 @@ class OpsService:
                     _hash_link(otab="performance", osub="llm"),
                     params={"error_rate": rate, "calls": llm.get("calls")},
                 )
+        metric_attention(
+            add,
+            inputs.get("metrics"),
+            llm,
+            thresholds,
+            _hash_link,
+        )
         self._run_attention(add, inputs, thresholds, process)
         new_streaks = health_attention(
             add,
@@ -3145,7 +3185,7 @@ _TILE_RULES = {
     ),
     "backlog": ("oldest_pending",),
     "email_queue": ("email_queue_bad", "email_queue_stalled"),
-    "llm": ("llm_error_rate_15m",),
+    "llm": ("llm_error_rate_15m", "llm_p95_15m"),
     "active": ("provider_paused",),
     "deps": (
         "pg_probe",

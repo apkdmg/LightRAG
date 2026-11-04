@@ -49,6 +49,8 @@ CALLS_LIMIT_MAX = 200
 CALL_RETENTION_DAYS = 90
 HOURLY_RETENTION_DAYS = 730
 UNKNOWN_MODEL = "unknown"
+# Groupings of the LLM latency percentiles (Q5).
+LATENCY_GROUPS = ("purpose", "model")
 
 _TABLE_CALLS = "LIGHTRAG_USAGE_CALLS"
 _TABLE_HOURLY = "LIGHTRAG_USAGE_HOURLY"
@@ -242,6 +244,41 @@ class UsageStore(ABC):
         self, start: datetime, end: datetime
     ) -> list[dict[str, Any]]:
         """Busiest minute on the system key, with each purpose's share of it."""
+
+    @abstractmethod
+    async def latency_percentiles(
+        self,
+        start: datetime,
+        end: datetime,
+        *,
+        group: str,
+        bucket_s: Optional[int] = None,
+    ) -> list[dict[str, Any]]:
+        """LLM latency by ``group`` (purpose or model), cache hits excluded.
+
+        Rows carry ``key``, ``calls``, ``errors``, ``truncated``,
+        ``abandoned`` and ``p50_ms``/``p95_ms``/``p99_ms``; with ``bucket_s``
+        also ``t`` (epoch seconds, floored to the bucket). Shared with the
+        Operations console's Performance tab (windows up to 24 h).
+        """
+
+    @abstractmethod
+    async def latency_baseline(self, hour_starts: list[datetime]) -> dict[str, Any]:
+        """``{calls, p95_ms}`` over the one-hour windows starting at
+        ``hour_starts`` (the same hour on earlier days), cache hits excluded."""
+
+    @abstractmethod
+    async def call_counts(
+        self, start: datetime, end: datetime, bucket_s: int
+    ) -> list[dict[str, Any]]:
+        """``[{t, calls, errors}]`` per epoch bucket, cache hits excluded."""
+
+    @abstractmethod
+    async def top_workspace_calls(
+        self, start: datetime, end: datetime, *, limit: int, hourly: bool = False
+    ) -> list[dict[str, Any]]:
+        """``[{workspace, value}]``: most LLM calls in the window (cache hits
+        excluded). ``hourly`` reads the hourly rollup (whole hours)."""
 
     @abstractmethod
     async def events(
@@ -461,6 +498,81 @@ class MemoryUsageStore(UsageStore):
         return [
             {"minute": ts, "purpose": k, "tokens": v} for k, v in minutes[peak].items()
         ]
+
+    async def latency_percentiles(self, start, end, *, group, bucket_s=None):
+        if group not in LATENCY_GROUPS:
+            raise ValueError(f"Unknown group: {group}")
+        groups: dict[tuple, dict[str, Any]] = {}
+        for r in self._matching_calls(start, end, None):
+            if r.cache_hit:
+                continue
+            t = int(r.ts // bucket_s * bucket_s) if bucket_s else 0
+            key = getattr(r, group) or ""
+            row = groups.setdefault(
+                (t, key),
+                {
+                    "key": key,
+                    "calls": 0,
+                    "errors": 0,
+                    "truncated": 0,
+                    "abandoned": 0,
+                    "_latencies": [],
+                },
+            )
+            if bucket_s:
+                row["t"] = t
+            row["calls"] += 1
+            row["_latencies"].append(float(r.latency_ms))
+            if r.status in ("error", "truncated", "abandoned"):
+                row["errors" if r.status == "error" else r.status] += 1
+        out = []
+        for _, row in sorted(groups.items(), key=lambda kv: kv[0]):
+            values = sorted(row.pop("_latencies"))
+            row["p50_ms"] = _percentile(values, 0.5)
+            row["p95_ms"] = _percentile(values, 0.95)
+            row["p99_ms"] = _percentile(values, 0.99)
+            out.append(row)
+        return out
+
+    async def latency_baseline(self, hour_starts):
+        values: list[float] = []
+        for begin in hour_starts:
+            end = begin + timedelta(hours=1)
+            values.extend(
+                float(r.latency_ms)
+                for r in self._matching_calls(begin, end, None)
+                if not r.cache_hit
+            )
+        values.sort()
+        return {"calls": len(values), "p95_ms": _percentile(values, 0.95)}
+
+    async def call_counts(self, start, end, bucket_s):
+        bucket = max(60, int(bucket_s))
+        out: dict[int, dict[str, Any]] = {}
+        for r in self._matching_calls(start, end, None):
+            if r.cache_hit:
+                continue
+            t = int(r.ts // bucket * bucket)
+            row = out.setdefault(t, {"t": t, "calls": 0, "errors": 0})
+            row["calls"] += 1
+            row["errors"] += 1 if r.status == "error" else 0
+        return [out[t] for t in sorted(out)]
+
+    async def top_workspace_calls(self, start, end, *, limit, hourly=False):
+        counts: dict[str, int] = defaultdict(int)
+        if hourly:
+            for key, row in self.hourly.items():
+                if start <= key[0] < end:
+                    counts[key[1]] += int(row["calls"])
+        else:
+            for r in self._matching_calls(start, end, None):
+                if not r.cache_hit:
+                    counts[r.workspace] += 1
+        ranked = sorted(
+            ((ws, n) for ws, n in counts.items() if n > 0),
+            key=lambda kv: (-kv[1], kv[0]),
+        )
+        return [{"workspace": ws, "value": n} for ws, n in ranked[: int(limit)]]
 
     async def events(self, start, end, *, workspace=None, limit=500):
         rows = [
@@ -894,6 +1006,98 @@ class PostgresUsageStore(UsageStore):
             JOIN peak ON p.minute = peak.minute""",
             [start, end],
         )
+
+    async def latency_percentiles(self, start, end, *, group, bucket_s=None):
+        if group not in LATENCY_GROUPS:
+            raise ValueError(f"Unknown group: {group}")
+        bucket = int(bucket_s) if bucket_s else None
+        t_sql = (
+            f"(floor(extract(epoch FROM ts) / {bucket}) * {bucket})::bigint AS t, "
+            if bucket
+            else ""
+        )
+        positions = "1, 2" if bucket else "1"
+        # Q5: the (ts) index bounds the scan; cache hits are not LLM latency.
+        rows = await self._rows(
+            f"""SELECT {t_sql}{group} AS key,
+                COUNT(*)::bigint AS calls,
+                COUNT(*) FILTER (WHERE status = 'error')::bigint AS errors,
+                COUNT(*) FILTER (WHERE status = 'truncated')::bigint AS truncated,
+                COUNT(*) FILTER (WHERE status = 'abandoned')::bigint AS abandoned,
+                percentile_cont(ARRAY[0.5, 0.95, 0.99]) WITHIN GROUP (ORDER BY latency_ms)
+                    AS pct
+            FROM {_TABLE_CALLS}
+            WHERE ts >= $1 AND ts < $2 AND NOT cache_hit
+            GROUP BY {positions} ORDER BY {positions}""",
+            [start, end],
+        )
+        out = []
+        for row in rows:
+            row = dict(row)
+            pct = row.pop("pct", None) or [None, None, None]
+            item: dict[str, Any] = {
+                "key": row.get("key") or "",
+                **{
+                    k: int(row.get(k) or 0)
+                    for k in ("calls", "errors", "truncated", "abandoned")
+                },
+                "p50_ms": float(pct[0]) if pct[0] is not None else None,
+                "p95_ms": float(pct[1]) if pct[1] is not None else None,
+                "p99_ms": float(pct[2]) if pct[2] is not None else None,
+            }
+            if bucket:
+                item["t"] = int(row["t"])
+            out.append(item)
+        return out
+
+    async def latency_baseline(self, hour_starts):
+        if not hour_starts:
+            return {"calls": 0, "p95_ms": None}
+        # One index range scan per one-hour window (a nested loop over the array).
+        rows = await self._rows(
+            f"""SELECT COUNT(*)::bigint AS calls,
+                percentile_cont(0.95) WITHIN GROUP (ORDER BY c.latency_ms)::float8 AS p95
+            FROM unnest($1::timestamptz[]) AS h(start)
+            JOIN {_TABLE_CALLS} c
+                ON c.ts >= h.start AND c.ts < h.start + interval '1 hour'
+            WHERE NOT c.cache_hit""",
+            [list(hour_starts)],
+        )
+        row = dict(rows[0]) if rows else {}
+        p95 = row.get("p95")
+        return {
+            "calls": int(row.get("calls") or 0),
+            "p95_ms": float(p95) if p95 is not None else None,
+        }
+
+    async def call_counts(self, start, end, bucket_s):
+        bucket = max(60, int(bucket_s))
+        rows = await self._rows(
+            f"""SELECT (floor(extract(epoch FROM ts) / {bucket}) * {bucket})::bigint AS t,
+                COUNT(*)::bigint AS calls,
+                COUNT(*) FILTER (WHERE status = 'error')::bigint AS errors
+            FROM {_TABLE_CALLS}
+            WHERE ts >= $1 AND ts < $2 AND NOT cache_hit
+            GROUP BY 1 ORDER BY 1""",
+            [start, end],
+        )
+        return [
+            {"t": int(r["t"]), "calls": int(r["calls"]), "errors": int(r["errors"])}
+            for r in rows
+        ]
+
+    async def top_workspace_calls(self, start, end, *, limit, hourly=False):
+        if hourly:
+            sql = f"""SELECT workspace, SUM(calls)::bigint AS value FROM {_TABLE_HOURLY}
+                WHERE bucket >= $1 AND bucket < $2
+                GROUP BY workspace HAVING SUM(calls) > 0
+                ORDER BY value DESC, workspace LIMIT $3"""
+        else:
+            sql = f"""SELECT workspace, COUNT(*)::bigint AS value FROM {_TABLE_CALLS}
+                WHERE ts >= $1 AND ts < $2 AND NOT cache_hit
+                GROUP BY workspace ORDER BY value DESC, workspace LIMIT $3"""
+        rows = await self._rows(sql, [start, end, int(limit)])
+        return [{"workspace": r["workspace"], "value": int(r["value"])} for r in rows]
 
     async def events(self, start, end, *, workspace=None, limit=500):
         params: list[Any] = [start, end]

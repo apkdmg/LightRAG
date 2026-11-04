@@ -4,6 +4,7 @@ import { useTranslation } from 'react-i18next'
 import { PauseIcon, PlayIcon, RefreshCwIcon } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { useSettingsStore } from '@/stores/settings'
+import { InsightsTarget, insightsLink } from '@/features/TokenInsights/hash'
 import { Card, ViewBoundary } from '@/features/TokenInsights/ui'
 import ActivityTab from './ActivityTab'
 import { OpsOverview, OpsStatus, opsApi } from './api'
@@ -306,12 +307,11 @@ function OperationsPage() {
   /**
    * Cost and token questions belong to Token Insights (§2.1). The Insights page
    * reads its hash while it renders, before this page's unmount clears the
-   * URL, so a workspace link lands on that workspace.
+   * URL, so a workspace, purpose or document link (`idoc`) lands where it points.
    */
-  const openInsights = useCallback((workspace?: string) => {
-    if (workspace) {
-      const q = new URLSearchParams({ insights: '1', itab: 'explore', iws: workspace })
-      window.history.replaceState(null, '', `#/?${q.toString()}`)
+  const openInsights = useCallback((target?: InsightsTarget) => {
+    if (target && (target.workspace || target.docId || target.purpose || target.tab)) {
+      window.history.replaceState(null, '', insightsLink(target))
     }
     useSettingsStore.getState().setCurrentTab('insights')
   }, [])
@@ -346,7 +346,7 @@ function StatusShell({
 }: {
   fadeTab: OpsTab | null
   selectTab: (tab: OpsTab) => void
-  openInsights: (workspace?: string) => void
+  openInsights: (target?: InsightsTarget) => void
   animateDrawer: boolean
 }) {
   const { t } = useTranslation()

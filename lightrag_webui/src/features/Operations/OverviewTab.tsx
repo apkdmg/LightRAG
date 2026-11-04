@@ -19,12 +19,12 @@ import { KPI_TARGETS, KpiId, OVERVIEW_REFRESH_SECONDS, kpiState, stuckTotal } fr
 import { OpsPoll } from './poll'
 import { isMultiWorker } from './severity'
 
-const FEATURE_ORDER: (keyof OpsFeatures)[] = ['durable', 'runs', 'logs', 'probes', 'alerts', 'release_busy', 'gpu', 'insights']
+const FEATURE_ORDER: (keyof OpsFeatures)[] = ['durable', 'runs', 'logs', 'probes', 'metrics', 'alerts', 'release_busy', 'gpu', 'insights']
 const TOP_ACTIVE = 5
 
-/** Why a feature is off: Insights and probes can be switched off, release busy needs Gunicorn, the rest ships later. */
+/** Why a feature is off: Insights, probes and metrics can be switched off, release busy needs Gunicorn, the rest ships later. */
 const offLabel = (key: keyof OpsFeatures, singleProcess: boolean) => {
-  if (key === 'insights' || key === 'probes') return 'operations.feature.off'
+  if (key === 'insights' || key === 'probes' || key === 'metrics') return 'operations.feature.off'
   if (key === 'release_busy' && singleProcess) return 'operations.feature.multiWorkerOnly'
   return 'operations.feature.later'
 }
@@ -66,7 +66,8 @@ export function ServerCard() {
       <div>
         <h3 className="m-0 mb-1.5 text-[13px] font-semibold">{t('operations.system.features')}</h3>
         <ul className="m-0 grid list-none grid-cols-1 gap-1 p-0 sm:grid-cols-2">
-          {FEATURE_ORDER.map((key) => (
+          {/* A server one release behind does not report `metrics`: no row rather than a false "Off". */}
+          {FEATURE_ORDER.filter((key) => key !== 'metrics' || typeof features.metrics === 'boolean').map((key) => (
             <li key={key} className="flex items-center justify-between gap-3 text-xs">
               <span className="text-muted-foreground">{t(`operations.feature.${key}`)}</span>
               {features[key] ? (

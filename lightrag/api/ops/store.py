@@ -6,8 +6,10 @@
 renewable leases), ``LIGHTRAG_OPS_AUDIT``, the worker heartbeat tables
 (``LIGHTRAG_OPS_WORKERS``, ``LIGHTRAG_OPS_WORKER_SAMPLES``), the dependency
 probe history (``LIGHTRAG_OPS_PROBES``), run tracking
-(``LIGHTRAG_OPS_RUNS``, ``LIGHTRAG_OPS_DOC_FAILURES``) and the structured
-WARNING+ log store (``LIGHTRAG_OPS_LOGS``); the other ops tables arrive with
+(``LIGHTRAG_OPS_RUNS``, ``LIGHTRAG_OPS_DOC_FAILURES``), the structured
+WARNING+ log store (``LIGHTRAG_OPS_LOGS``) and the latency histograms
+(``LIGHTRAG_OPS_METRICS_MIN`` per worker-minute, ``LIGHTRAG_OPS_METRICS_HOUR``
+rolled up hourly); the other ops tables arrive with
 the features that write them. Indexes on the large existing tables are never built
 here: :mod:`lightrag.api.ops.indexes` builds them in the background.
 
@@ -62,6 +64,14 @@ TABLE_WORKERS = "LIGHTRAG_OPS_WORKERS"
 TABLE_WORKER_SAMPLES = "LIGHTRAG_OPS_WORKER_SAMPLES"
 TABLE_PROBES = "LIGHTRAG_OPS_PROBES"
 TABLE_LOGS = "LIGHTRAG_OPS_LOGS"
+TABLE_METRICS_MIN = "LIGHTRAG_OPS_METRICS_MIN"
+TABLE_METRICS_HOUR = "LIGHTRAG_OPS_METRICS_HOUR"
+METRIC_BUCKETS = 20
+# Probe rows that carry vLLM /metrics (running, waiting, KV cache).
+VLLM_DEPENDENCIES = ("embed", "rerank")
+# Failure kinds that are not real failures (excluded from throughput/top).
+NOT_REAL_FAILURE_KINDS = ("cancelled", "duplicate")
+TOP_WORKSPACE_METRICS = ("processing_minutes", "failures", "runs")
 # Built by ops/indexes.py; correlate reads doc status by id only through it.
 DOC_STATUS_ID_INDEX = "idx_lightrag_doc_status_id"
 # Columns the log sink writes, in COPY order.
@@ -699,6 +709,69 @@ class OpsStore(ABC):
     async def workspace_presence(self, workspace: str) -> dict[str, bool]:
         """Whether a workspace has documents, runs or log lines."""
 
+    # -- performance metrics (PR-6) -----------------------------------------------
+    @abstractmethod
+    async def metrics_write(self, rows: list[dict[str, Any]]) -> None:
+        """Insert per worker-minute histogram rows (epoch-second ``minute``).
+
+        Insert-only: a row already stored (a retried write) is left as is.
+        """
+
+    @abstractmethod
+    async def metrics_rollup(self, start: datetime, end: datetime) -> int:
+        """Recompute the hour rows for ``[start, end)`` from the minute rows."""
+
+    @abstractmethod
+    async def metrics_cleanup(
+        self, minute_days: int, hour_days: int
+    ) -> tuple[int, int]:
+        """Delete minute and hour rows past retention (batched)."""
+
+    @abstractmethod
+    async def metrics_read(
+        self,
+        series: list[str],
+        start: datetime,
+        cut: datetime,
+        end: datetime,
+        bucket_s: int,
+    ) -> list[dict[str, Any]]:
+        """Histograms summed per ``(t, series, key)``, ``t`` an epoch bucket.
+
+        Hour rows cover ``[start, cut)`` and minute rows ``[cut, end)``, so a
+        window reads the rollup where it exists and minutes for the rest.
+        """
+
+    @abstractmethod
+    async def vllm_series(
+        self, start: datetime, end: datetime, bucket_s: int
+    ) -> list[dict[str, Any]]:
+        """vLLM ``/metrics`` from the embed and rerank probe rows per bucket:
+        ``[{dependency, t, running, waiting, kv_cache_pct}]`` (running
+        averaged, waiting and KV cache use at their maximum)."""
+
+    @abstractmethod
+    async def llm_queue_series(
+        self, start: datetime, end: datetime, bucket_s: int
+    ) -> list[dict[str, Any]]:
+        """LLM calls running, in flight and queued per bucket, summed over
+        the workers (each worker's maximum in the bucket), from the
+        once-a-minute heartbeat samples: ``[{t, running, in_flight, queued}]``."""
+
+    @abstractmethod
+    async def throughput(
+        self, start: datetime, end: datetime, bucket_s: int
+    ) -> dict[str, list[dict[str, Any]]]:
+        """Documents processed and failed (runs, real failures) and email
+        batches per bucket."""
+
+    @abstractmethod
+    async def top_workspaces(
+        self, metric: str, start: datetime, end: datetime, limit: int
+    ) -> list[dict[str, Any]]:
+        """``[{workspace, value}]`` by processing minutes, real failures or
+        runs in the window, largest first."""
+
 
 def _workspace_keys(workspace: str) -> list[str]:
     return [template.format(ws=workspace) for template in WORKSPACE_KV_KEYS]
@@ -775,8 +848,15 @@ class PostgresOpsStore(OpsStore):
                 rss BIGINT,
                 loop_lag_ms INT,
                 pool_wait_ms INT,
+                llm_running INT,
+                llm_in_flight INT,
+                llm_queued INT,
                 PRIMARY KEY (worker_id, minute)
             )""",
+            # Summed LLM queue counts per sample (PR-6), for tables made before.
+            f"ALTER TABLE {TABLE_WORKER_SAMPLES} ADD COLUMN IF NOT EXISTS llm_running INT",
+            f"ALTER TABLE {TABLE_WORKER_SAMPLES} ADD COLUMN IF NOT EXISTS llm_in_flight INT",
+            f"ALTER TABLE {TABLE_WORKER_SAMPLES} ADD COLUMN IF NOT EXISTS llm_queued INT",
             f"CREATE INDEX IF NOT EXISTS idx_ops_worker_samples_minute ON {TABLE_WORKER_SAMPLES} (minute)",
             f"""CREATE TABLE IF NOT EXISTS {TABLE_PROBES} (
                 ts TIMESTAMPTZ NOT NULL,
@@ -878,6 +958,31 @@ class PostgresOpsStore(OpsStore):
                 (doc_id, ts) WHERE doc_id IS NOT NULL""",
             f"""CREATE INDEX IF NOT EXISTS idx_ops_logs_track ON {TABLE_LOGS}
                 (track_id) WHERE track_id IS NOT NULL""",
+            # Insert-only per worker-minute histograms (14 d) and their hourly
+            # rollup (90 d); 20 log buckets from 5 ms to 120 s.
+            f"""CREATE TABLE IF NOT EXISTS {TABLE_METRICS_MIN} (
+                minute TIMESTAMPTZ NOT NULL,
+                worker_id UUID NOT NULL,
+                series VARCHAR(16) NOT NULL,
+                key VARCHAR(160) NOT NULL,
+                count INT NOT NULL,
+                errors INT NOT NULL,
+                sum_ms BIGINT NOT NULL,
+                max_ms INT NOT NULL,
+                buckets INT[] NOT NULL,
+                PRIMARY KEY (minute, worker_id, series, key)
+            )""",
+            f"""CREATE TABLE IF NOT EXISTS {TABLE_METRICS_HOUR} (
+                hour TIMESTAMPTZ NOT NULL,
+                series VARCHAR(16) NOT NULL,
+                key VARCHAR(160) NOT NULL,
+                count BIGINT NOT NULL,
+                errors BIGINT NOT NULL,
+                sum_ms BIGINT NOT NULL,
+                max_ms INT NOT NULL,
+                buckets BIGINT[] NOT NULL,
+                PRIMARY KEY (hour, series, key)
+            )""",
         ):
             await self._db.execute(statement)
         await self._refresh_tables(force=True)
@@ -1582,17 +1687,25 @@ class PostgresOpsStore(OpsStore):
         if sample is not None:
             await self._beat_query(
                 f"""INSERT INTO {TABLE_WORKER_SAMPLES}
-                    (worker_id, minute, cpu_pct, rss, loop_lag_ms, pool_wait_ms)
-                VALUES ($1::uuid, date_trunc('minute', now()), $2, $3, $4, $5)
+                    (worker_id, minute, cpu_pct, rss, loop_lag_ms, pool_wait_ms,
+                    llm_running, llm_in_flight, llm_queued)
+                VALUES ($1::uuid, date_trunc('minute', now()), $2, $3, $4, $5, $6, $7,
+                    $8)
                 ON CONFLICT (worker_id, minute) DO UPDATE SET
                     cpu_pct = EXCLUDED.cpu_pct, rss = EXCLUDED.rss,
                     loop_lag_ms = EXCLUDED.loop_lag_ms,
-                    pool_wait_ms = EXCLUDED.pool_wait_ms""",
+                    pool_wait_ms = EXCLUDED.pool_wait_ms,
+                    llm_running = EXCLUDED.llm_running,
+                    llm_in_flight = EXCLUDED.llm_in_flight,
+                    llm_queued = EXCLUDED.llm_queued""",
                 row["worker_id"],
                 sample.get("cpu_pct"),
                 sample.get("rss"),
                 sample.get("loop_lag_ms"),
                 sample.get("pool_wait_ms"),
+                _opt_int(sample.get("llm_running")),
+                _opt_int(sample.get("llm_in_flight")),
+                _opt_int(sample.get("llm_queued")),
             )
 
     async def supersede_workers(self, host, worker_id, started_at, stale_s, alive=None):
@@ -2562,6 +2675,287 @@ class PostgresOpsStore(OpsStore):
             "logs": bool(row.get("logs")),
         }
 
+    # -- performance metrics -------------------------------------------------------------
+    async def metrics_write(self, rows):
+        if not rows:
+            return
+        values = [_metric_record(r) for r in rows]
+        async with self._conn() as conn:
+            async with conn.transaction():
+                await conn.execute(f"SET LOCAL statement_timeout = {WRITE_TIMEOUT_MS}")
+                await conn.executemany(
+                    f"""INSERT INTO {TABLE_METRICS_MIN} (minute, worker_id, series, key,
+                        count, errors, sum_ms, max_ms, buckets)
+                    VALUES (to_timestamp($1::float8), $2::uuid, $3, $4, $5, $6, $7, $8,
+                        $9::int[])
+                    ON CONFLICT (minute, worker_id, series, key) DO NOTHING""",
+                    values,
+                )
+
+    async def metrics_rollup(self, start, end):
+        async with self._conn() as conn:
+            async with conn.transaction():
+                # Hours of every worker's rows: a longer budget than reads.
+                await conn.execute("SET LOCAL statement_timeout = 60000")
+                result = await conn.execute(
+                    f"""WITH src AS (
+                        SELECT date_trunc('hour', minute) AS hour, series, key, count,
+                            errors, sum_ms, max_ms, buckets
+                        FROM {TABLE_METRICS_MIN}
+                        WHERE minute >= $1 AND minute < $2
+                    ), totals AS (
+                        SELECT hour, series, key, sum(count)::bigint AS count,
+                            sum(errors)::bigint AS errors, sum(sum_ms)::bigint AS sum_ms,
+                            max(max_ms)::int AS max_ms
+                        FROM src GROUP BY hour, series, key
+                    ), cells AS (
+                        SELECT hour, series, key, u.i, sum(u.v)::bigint AS v
+                        FROM src, unnest(src.buckets) WITH ORDINALITY AS u(v, i)
+                        GROUP BY hour, series, key, u.i
+                    ), arrays AS (
+                        SELECT hour, series, key, array_agg(v ORDER BY i) AS buckets
+                        FROM cells GROUP BY hour, series, key
+                    )
+                    INSERT INTO {TABLE_METRICS_HOUR} AS h (hour, series, key, count,
+                        errors, sum_ms, max_ms, buckets)
+                    SELECT t.hour, t.series, t.key, t.count, t.errors, t.sum_ms, t.max_ms,
+                        a.buckets
+                    FROM totals t JOIN arrays a USING (hour, series, key)
+                    ON CONFLICT (hour, series, key) DO UPDATE SET
+                        count = EXCLUDED.count, errors = EXCLUDED.errors,
+                        sum_ms = EXCLUDED.sum_ms, max_ms = EXCLUDED.max_ms,
+                        buckets = EXCLUDED.buckets""",
+                    start,
+                    end,
+                )
+        try:
+            return int(str(result).rsplit(" ", 1)[-1])
+        except (ValueError, IndexError):
+            return 0
+
+    async def metrics_cleanup(self, minute_days, hour_days):
+        deleted = []
+        for table, column, days in (
+            (TABLE_METRICS_MIN, "minute", minute_days),
+            (TABLE_METRICS_HOUR, "hour", hour_days),
+        ):
+            total = 0
+            for _ in range(LOG_RETENTION_MAX_BATCHES):
+                # No id column: batches by ctid, found through the primary
+                # key's leading time column.
+                rows = await self._write(
+                    f"""DELETE FROM {table} WHERE ctid = ANY(ARRAY(
+                        SELECT ctid FROM {table}
+                        WHERE {column} < now() - make_interval(days => $1::int)
+                        LIMIT {RETENTION_BATCH}))
+                    RETURNING 1""",
+                    int(days),
+                )
+                total += len(rows)
+                if len(rows) < RETENTION_BATCH:
+                    break
+            deleted.append(total)
+        return deleted[0], deleted[1]
+
+    async def metrics_read(self, series, start, cut, end, bucket_s):
+        bucket = max(60, int(bucket_s))
+        rows = await self._read(
+            f"""WITH src AS (
+                SELECT hour AS ts, series, key, count, errors, sum_ms, max_ms, buckets
+                FROM {TABLE_METRICS_HOUR}
+                WHERE series = ANY($1::text[]) AND hour >= $2 AND hour < $3
+                UNION ALL
+                SELECT minute, series, key, count, errors, sum_ms, max_ms,
+                    buckets::bigint[]
+                FROM {TABLE_METRICS_MIN}
+                WHERE minute >= $3 AND minute < $4 AND series = ANY($1::text[])
+            ), keyed AS (
+                SELECT (floor(extract(epoch FROM ts) / {bucket}) * {bucket})::bigint AS t,
+                    series, key, count, errors, sum_ms, max_ms, buckets
+                FROM src
+            ), totals AS (
+                SELECT t, series, key, sum(count)::bigint AS count,
+                    sum(errors)::bigint AS errors, sum(sum_ms)::bigint AS sum_ms,
+                    max(max_ms)::bigint AS max_ms
+                FROM keyed GROUP BY t, series, key
+            ), cells AS (
+                SELECT t, series, key, u.i, sum(u.v)::bigint AS v
+                FROM keyed, unnest(keyed.buckets) WITH ORDINALITY AS u(v, i)
+                GROUP BY t, series, key, u.i
+            ), arrays AS (
+                SELECT t, series, key, array_agg(v ORDER BY i) AS buckets
+                FROM cells GROUP BY t, series, key
+            )
+            SELECT t.t, t.series, t.key, t.count, t.errors, t.sum_ms, t.max_ms,
+                a.buckets
+            FROM totals t JOIN arrays a USING (t, series, key)
+            ORDER BY t.t, t.series, t.key""",
+            list(series),
+            start,
+            max(start, min(cut, end)),
+            end,
+        )
+        for row in rows:
+            row["buckets"] = [int(v) for v in (row.get("buckets") or [])]
+        return rows
+
+    async def vllm_series(self, start, end, bucket_s):
+        bucket = max(60, int(bucket_s))
+        # The primary key (dependency, ts) bounds the scan; detail values a
+        # probe could not read as numbers are skipped, never cast.
+        return await self._read(
+            f"""WITH src AS (
+                SELECT dependency,
+                    (floor(extract(epoch FROM ts) / {bucket}) * {bucket})::bigint AS t,
+                    CASE WHEN jsonb_typeof(detail->'running') = 'number'
+                        THEN (detail->>'running')::float8 END AS running,
+                    CASE WHEN jsonb_typeof(detail->'waiting') = 'number'
+                        THEN (detail->>'waiting')::float8 END AS waiting,
+                    CASE WHEN jsonb_typeof(detail->'kv_cache_pct') = 'number'
+                        THEN (detail->>'kv_cache_pct')::float8 END AS kv_cache_pct
+                FROM {TABLE_PROBES}
+                WHERE dependency = ANY($1::text[]) AND ts >= $2 AND ts < $3
+            )
+            SELECT dependency, t, avg(running)::float8 AS running,
+                max(waiting)::float8 AS waiting, max(kv_cache_pct)::float8 AS kv_cache_pct
+            FROM src
+            WHERE running IS NOT NULL OR waiting IS NOT NULL OR kv_cache_pct IS NOT NULL
+            GROUP BY dependency, t ORDER BY dependency, t""",
+            list(VLLM_DEPENDENCIES),
+            start,
+            end,
+        )
+
+    async def llm_queue_series(self, start, end, bucket_s):
+        bucket = max(60, int(bucket_s))
+        return await self._read(
+            f"""WITH per_worker AS (
+                SELECT (floor(extract(epoch FROM minute) / {bucket}) * {bucket})::bigint
+                        AS t,
+                    worker_id, max(llm_running) AS running,
+                    max(llm_in_flight) AS in_flight, max(llm_queued) AS queued
+                FROM {TABLE_WORKER_SAMPLES}
+                WHERE minute >= $1 AND minute < $2
+                    AND (llm_running IS NOT NULL OR llm_queued IS NOT NULL)
+                GROUP BY 1, worker_id
+            )
+            SELECT t, sum(running)::bigint AS running,
+                sum(in_flight)::bigint AS in_flight, sum(queued)::bigint AS queued
+            FROM per_worker GROUP BY t ORDER BY t""",
+            start,
+            end,
+        )
+
+    async def throughput(self, start, end, bucket_s):
+        bucket = max(60, int(bucket_s))
+        not_real = sql_in(NOT_REAL_FAILURE_KINDS)
+        docs = await self._read(
+            f"""SELECT (floor(extract(epoch FROM finished_at) / {bucket}) * {bucket})::bigint
+                    AS t,
+                sum(docs_done)::bigint AS processed
+            FROM {TABLE_RUNS}
+            WHERE kind = 'process' AND started_at >= $1::timestamptz - interval '1 day'
+                AND finished_at >= $1 AND finished_at < $2
+            GROUP BY 1 ORDER BY 1""",
+            start,
+            end,
+        )
+        failed = await self._read(
+            f"""SELECT (floor(extract(epoch FROM ts) / {bucket}) * {bucket})::bigint AS t,
+                count(*)::bigint AS failed
+            FROM {TABLE_DOC_FAILURES}
+            WHERE ts >= $1 AND ts < $2 AND error_kind NOT IN {not_real}
+            GROUP BY 1 ORDER BY 1""",
+            start,
+            end,
+        )
+        batches = await self._read(
+            f"""SELECT (floor(extract(epoch FROM started_at) / {bucket}) * {bucket})::bigint
+                    AS t,
+                count(*)::bigint AS batches,
+                count(*) FILTER (WHERE status IN ('failed', 'orphaned'))::bigint AS failed
+            FROM {TABLE_RUNS}
+            WHERE kind = 'email_batch' AND started_at >= $1 AND started_at < $2
+            GROUP BY 1 ORDER BY 1""",
+            start,
+            end,
+        )
+        return _throughput_rows(docs, failed, batches)
+
+    async def top_workspaces(self, metric, start, end, limit):
+        if metric not in TOP_WORKSPACE_METRICS:
+            raise ValueError(f"Unknown metric: {metric}")
+        if metric == "failures":
+            not_real = sql_in(NOT_REAL_FAILURE_KINDS)
+            sql = f"""SELECT workspace, count(*)::float8 AS value
+                FROM {TABLE_DOC_FAILURES}
+                WHERE ts >= $1 AND ts < $2 AND error_kind NOT IN {not_real}
+                GROUP BY workspace ORDER BY value DESC, workspace LIMIT $3"""
+        elif metric == "runs":
+            sql = f"""SELECT workspace, count(*)::float8 AS value
+                FROM {TABLE_RUNS}
+                WHERE started_at >= $1 AND started_at < $2
+                GROUP BY workspace ORDER BY value DESC, workspace LIMIT $3"""
+        else:
+            # Minutes of processing inside the window (running runs up to now).
+            sql = f"""SELECT workspace, (sum(extract(epoch FROM (
+                    LEAST(COALESCE(finished_at, now()), $2::timestamptz)
+                    - GREATEST(started_at, $1::timestamptz)
+                ))) / 60.0)::float8 AS value
+                FROM {TABLE_RUNS}
+                WHERE kind = 'process' AND started_at < $2
+                    AND (finished_at IS NULL OR finished_at >= $1)
+                    AND started_at >= $1::timestamptz - interval '7 days'
+                GROUP BY workspace ORDER BY value DESC, workspace LIMIT $3"""
+        rows = await self._read(sql, start, end, int(limit))
+        return [
+            {"workspace": r["workspace"], "value": round(float(r["value"] or 0), 2)}
+            for r in rows
+        ]
+
+
+def _metric_record(r: dict[str, Any]) -> tuple:
+    buckets = [int(v or 0) for v in (r.get("buckets") or [])][:METRIC_BUCKETS]
+    buckets += [0] * (METRIC_BUCKETS - len(buckets))
+    return (
+        float(r["minute"]),
+        str(r["worker_id"]),
+        str(r["series"])[:16],
+        str(r["key"])[:160],
+        int(r.get("count") or 0),
+        int(r.get("errors") or 0),
+        int(r.get("sum_ms") or 0),
+        min(int(r.get("max_ms") or 0), 2_147_483_647),
+        buckets,
+    )
+
+
+def _throughput_rows(
+    docs: list[dict[str, Any]],
+    failed: list[dict[str, Any]],
+    batches: list[dict[str, Any]],
+) -> dict[str, list[dict[str, Any]]]:
+    merged: dict[int, dict[str, Any]] = {}
+    for row in docs:
+        merged.setdefault(int(row["t"]), {"processed": 0, "failed": 0})["processed"] = (
+            int(row["processed"] or 0)
+        )
+    for row in failed:
+        merged.setdefault(int(row["t"]), {"processed": 0, "failed": 0})["failed"] = int(
+            row["failed"] or 0
+        )
+    return {
+        "docs": [{"t": t, **merged[t]} for t in sorted(merged)],
+        "email_batches": [
+            {
+                "t": int(r["t"]),
+                "batches": int(r["batches"] or 0),
+                "failed": int(r["failed"] or 0),
+            }
+            for r in batches
+        ],
+    }
+
 
 def _still_running(
     alive: Optional[Callable[[Any, Any], bool]], pid, create_time
@@ -2573,6 +2967,13 @@ def _still_running(
         return bool(alive(pid, create_time))
     except Exception:
         return False
+
+
+def _opt_int(value: Any) -> Optional[int]:
+    """A count for a nullable INT column; anything else is NULL."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return int(value)
 
 
 def _uuid_hex(value: Any) -> str:
@@ -2773,6 +3174,9 @@ class MemoryOpsStore(OpsStore):
         self.failure_rows: list[dict[str, Any]] = []
         self.log_rows: list[dict[str, Any]] = []
         self._log_seq = 0
+        # Performance histograms: minute rows, and hour rows by (hour, series, key).
+        self.metric_rows: list[dict[str, Any]] = []
+        self.metric_hours: dict[tuple, dict[str, Any]] = {}
         self.fail_writes: Optional[BaseException] = None
         self.write_delay_s: float = 0.0
         self.ready = True
@@ -3323,6 +3727,10 @@ class MemoryOpsStore(OpsStore):
                 **{
                     k: sample.get(k)
                     for k in ("cpu_pct", "rss", "loop_lag_ms", "pool_wait_ms")
+                },
+                **{
+                    k: _opt_int(sample.get(k))
+                    for k in ("llm_running", "llm_in_flight", "llm_queued")
                 },
             }
 
@@ -4131,3 +4539,233 @@ class MemoryOpsStore(OpsStore):
             "runs": any(r["workspace"] == workspace for r in self.run_rows.values()),
             "logs": any(r.get("workspace") == workspace for r in self.log_rows),
         }
+
+    # -- performance metrics -------------------------------------------------------------
+    async def metrics_write(self, rows):
+        await self._write_gate()
+        stored = {
+            (r["minute"], r["worker_id"], r["series"], r["key"])
+            for r in self.metric_rows
+        }
+        for r in rows:
+            record = _metric_record(r)
+            minute = datetime.fromtimestamp(record[0], timezone.utc)
+            identity = (minute, uuid.UUID(record[1]).hex, record[2], record[3])
+            if identity in stored:
+                continue
+            stored.add(identity)
+            self.metric_rows.append(
+                {
+                    "minute": minute,
+                    "worker_id": identity[1],
+                    "series": record[2],
+                    "key": record[3],
+                    "count": record[4],
+                    "errors": record[5],
+                    "sum_ms": record[6],
+                    "max_ms": record[7],
+                    "buckets": list(record[8]),
+                }
+            )
+
+    async def metrics_rollup(self, start, end):
+        await self._write_gate()
+        hours: dict[tuple, dict[str, Any]] = {}
+        for r in self.metric_rows:
+            if not start <= r["minute"] < end:
+                continue
+            hour = r["minute"].replace(minute=0, second=0, microsecond=0)
+            row = hours.setdefault(
+                (hour, r["series"], r["key"]),
+                {
+                    "count": 0,
+                    "errors": 0,
+                    "sum_ms": 0,
+                    "max_ms": 0,
+                    "buckets": [0] * METRIC_BUCKETS,
+                },
+            )
+            row["count"] += r["count"]
+            row["errors"] += r["errors"]
+            row["sum_ms"] += r["sum_ms"]
+            row["max_ms"] = max(row["max_ms"], r["max_ms"])
+            for i, v in enumerate(r["buckets"][:METRIC_BUCKETS]):
+                row["buckets"][i] += v
+        self.metric_hours.update(hours)
+        return len(hours)
+
+    async def metrics_cleanup(self, minute_days, hour_days):
+        now = self._aware_now()
+        minute_cut = now - timedelta(days=minute_days)
+        hour_cut = now - timedelta(days=hour_days)
+        before = len(self.metric_rows)
+        self.metric_rows = [r for r in self.metric_rows if r["minute"] >= minute_cut]
+        old_hours = [k for k in self.metric_hours if k[0] < hour_cut]
+        for key in old_hours:
+            del self.metric_hours[key]
+        return before - len(self.metric_rows), len(old_hours)
+
+    async def metrics_read(self, series, start, cut, end, bucket_s):
+        self._check()
+        bucket = max(60, int(bucket_s))
+        cut = max(start, min(cut, end))
+        wanted = set(series)
+        sources: list[tuple[datetime, str, str, dict[str, Any]]] = [
+            (hour, s, k, row)
+            for (hour, s, k), row in self.metric_hours.items()
+            if s in wanted and start <= hour < cut
+        ]
+        sources += [
+            (r["minute"], r["series"], r["key"], r)
+            for r in self.metric_rows
+            if r["series"] in wanted and cut <= r["minute"] < end
+        ]
+        out: dict[tuple, dict[str, Any]] = {}
+        for ts, s, k, row in sources:
+            t = int(ts.timestamp()) // bucket * bucket
+            agg = out.setdefault(
+                (t, s, k),
+                {
+                    "t": t,
+                    "series": s,
+                    "key": k,
+                    "count": 0,
+                    "errors": 0,
+                    "sum_ms": 0,
+                    "max_ms": 0,
+                    "buckets": [0] * METRIC_BUCKETS,
+                },
+            )
+            agg["count"] += int(row["count"])
+            agg["errors"] += int(row["errors"])
+            agg["sum_ms"] += int(row["sum_ms"])
+            agg["max_ms"] = max(agg["max_ms"], int(row["max_ms"]))
+            for i, v in enumerate(row["buckets"][:METRIC_BUCKETS]):
+                agg["buckets"][i] += int(v)
+        return [out[key] for key in sorted(out)]
+
+    async def vllm_series(self, start, end, bucket_s):
+        self._check()
+        bucket = max(60, int(bucket_s))
+        cells: dict[tuple[str, int], dict[str, list[float]]] = {}
+        for row in self.probe_rows:
+            if row["dependency"] not in VLLM_DEPENDENCIES or not (
+                start <= row["ts"] < end
+            ):
+                continue
+            detail = row.get("detail") or {}
+            values = {
+                k: float(detail[k])
+                for k in ("running", "waiting", "kv_cache_pct")
+                if isinstance(detail.get(k), (int, float))
+                and not isinstance(detail.get(k), bool)
+            }
+            if not values:
+                continue
+            t = int(row["ts"].timestamp()) // bucket * bucket
+            cell = cells.setdefault(
+                (row["dependency"], t),
+                {"running": [], "waiting": [], "kv_cache_pct": []},
+            )
+            for k, v in values.items():
+                cell[k].append(v)
+        return [
+            {
+                "dependency": dep,
+                "t": t,
+                "running": sum(c["running"]) / len(c["running"])
+                if c["running"]
+                else None,
+                "waiting": max(c["waiting"], default=None),
+                "kv_cache_pct": max(c["kv_cache_pct"], default=None),
+            }
+            for (dep, t), c in sorted(cells.items())
+        ]
+
+    async def llm_queue_series(self, start, end, bucket_s):
+        self._check()
+        bucket = max(60, int(bucket_s))
+        lo, hi = start.timestamp(), end.timestamp()
+        per_worker: dict[tuple[int, str], dict[str, Optional[int]]] = {}
+        for (wid, minute), row in self.sample_rows.items():
+            if not lo <= minute < hi:
+                continue
+            if row.get("llm_running") is None and row.get("llm_queued") is None:
+                continue
+            cell = per_worker.setdefault(
+                (minute // bucket * bucket, wid),
+                {"running": None, "in_flight": None, "queued": None},
+            )
+            for name in ("running", "in_flight", "queued"):
+                value = row.get(f"llm_{name}")
+                if value is not None:
+                    cell[name] = max(cell[name] or 0, int(value))
+        totals: dict[int, dict[str, Optional[int]]] = {}
+        for (t, _), cell in per_worker.items():
+            target = totals.setdefault(
+                t, {"running": None, "in_flight": None, "queued": None}
+            )
+            for name, value in cell.items():
+                if value is not None:
+                    target[name] = (target[name] or 0) + value
+        return [{"t": t, **totals[t]} for t in sorted(totals)]
+
+    async def throughput(self, start, end, bucket_s):
+        self._check()
+        bucket = max(60, int(bucket_s))
+
+        def slot(moment: datetime) -> int:
+            return int(moment.timestamp()) // bucket * bucket
+
+        processed: dict[int, int] = defaultdict(int)
+        batches: dict[int, list[int]] = {}
+        for r in self.run_rows.values():
+            finished = r.get("finished_at")
+            if r["kind"] == "process" and finished and start <= finished < end:
+                processed[slot(finished)] += int(r["docs_done"])
+            if r["kind"] == "email_batch" and start <= r["started_at"] < end:
+                entry = batches.setdefault(slot(r["started_at"]), [0, 0])
+                entry[0] += 1
+                entry[1] += r["status"] in ("failed", "orphaned")
+        failed: dict[int, int] = defaultdict(int)
+        for r in self.failure_rows:
+            if start <= r["ts"] < end and r["error_kind"] not in NOT_REAL_FAILURE_KINDS:
+                failed[slot(r["ts"])] += 1
+        return _throughput_rows(
+            [{"t": t, "processed": v} for t, v in sorted(processed.items())],
+            [{"t": t, "failed": v} for t, v in sorted(failed.items())],
+            [
+                {"t": t, "batches": v[0], "failed": v[1]}
+                for t, v in sorted(batches.items())
+            ],
+        )
+
+    async def top_workspaces(self, metric, start, end, limit):
+        self._check()
+        if metric not in TOP_WORKSPACE_METRICS:
+            raise ValueError(f"Unknown metric: {metric}")
+        values: dict[str, float] = defaultdict(float)
+        if metric == "failures":
+            for r in self.failure_rows:
+                if (
+                    start <= r["ts"] < end
+                    and r["error_kind"] not in NOT_REAL_FAILURE_KINDS
+                ):
+                    values[r["workspace"]] += 1
+        else:
+            now = self._aware_now()
+            for r in self.run_rows.values():
+                if metric == "runs":
+                    if start <= r["started_at"] < end:
+                        values[r["workspace"]] += 1
+                    continue
+                finished = r.get("finished_at")
+                if r["kind"] != "process" or r["started_at"] >= end:
+                    continue
+                if finished is not None and finished < start:
+                    continue
+                stop = min(finished or now, end)
+                begin = max(r["started_at"], start)
+                values[r["workspace"]] += max(0.0, (stop - begin).total_seconds()) / 60
+        ranked = sorted(values.items(), key=lambda kv: (-kv[1], kv[0]))[: int(limit)]
+        return [{"workspace": ws, "value": round(v, 2)} for ws, v in ranked]

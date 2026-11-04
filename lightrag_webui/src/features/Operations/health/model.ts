@@ -360,6 +360,7 @@ const DEP_ORDER = [
   'smtp',
   'idp',
   'tls',
+  'signin',
   'manager',
   'recorder',
   'log_sink',
@@ -737,6 +738,10 @@ export function detailParts(d: DepHealth): [string, Record<string, unknown>][] {
   if (rtt !== null) out.push(['operations.health.detail.rtt', { rtt: fmtLatency(rtt) }])
   const reason = str(x.reason)
   if (reason && UNPROBED_REASONS.has(reason)) out.push([`operations.health.detail.reason.${reason}`, {}])
+  if (d.id === 'signin' && (n('sso_errors') !== null || n('lockouts') !== null)) {
+    // The last 15 minutes of the auth counters (counts only, never who).
+    out.push(['operations.health.detail.signin', { sso: n('sso_errors') ?? 0, token401: n('token_401') ?? 0, lockouts: n('lockouts') ?? 0 }])
+  }
   if (d.id === 'recorder' && n('buffer') !== null) {
     out.push(['operations.health.detail.recorder', { buffer: n('buffer'), lost: n('lost_5m') ?? 0, dropped: n('dropped_5m') ?? 0 }])
   }

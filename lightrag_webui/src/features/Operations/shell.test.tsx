@@ -12,7 +12,8 @@ Object.defineProperty(globalThis, 'localStorage', {
   },
   configurable: true
 })
-const { OpsShellContext } = await import('./context')
+const { OpsNavContext, OpsShellContext } = await import('./context')
+const { DEFAULT_OPS_HASH } = await import('./hashState')
 const { default: OverviewTab } = await import('./OverviewTab')
 const { default: PerformanceTab } = await import('./PerformanceTab')
 const { default: ProcessChip } = await import('./components/ProcessChip')
@@ -70,11 +71,47 @@ describe('OverviewTab outside the shell', () => {
   })
 })
 
-describe('PerformanceTab', () => {
-  test('links to Token Insights only when it records', () => {
-    expect(withShell(<PerformanceTab />, status())).toContain('operations.openInsights')
-    const off = status({ features: { ...status().features, insights: false } })
-    expect(withShell(<PerformanceTab />, off)).not.toContain('operations.openInsights')
+describe('PerformanceTab (§2.7)', () => {
+  const nav = (sub: string | null) => ({
+    view: { ...DEFAULT_OPS_HASH, tab: 'performance' as const, sub },
+    stack: [],
+    move: 'none' as const,
+    go: () => {},
+    setSub: () => {},
+    openDrawer: () => {},
+    backDrawer: () => {},
+    closeDrawer: () => {},
+    setView: () => {}
+  })
+  const render = (sub: string | null, s: OpsStatus | null = status()) =>
+    withShell(<OpsNavContext.Provider value={nav(sub)}>{<PerformanceTab />}</OpsNavContext.Provider>, s)
+
+  test('the window and section controls; LLM is the default section, first paint is a skeleton', () => {
+    const html = render(null)
+    for (const w of ['15m', '1h', '24h', '7d']) expect(html).toContain(`operations.perf.windows.${w}`)
+    for (const s of ['llm', 'deps', 'http', 'throughput', 'concurrency', 'top']) expect(html).toContain(`operations.perf.section.${s}`)
+    expect(html).toContain('operations.perf.llm.title')
+    expect(html).toContain('ops-skeleton')
+    // The default window (1 h) refreshes by itself.
+    expect(html).toContain('operations.perf.autoNote')
+  })
+
+  test('the section comes from the URL (osub); an unknown one falls back to LLM', () => {
+    expect(render('concurrency')).toContain('operations.perf.concurrency.title')
+    expect(render('concurrency')).toContain('operations.perf.nowNote')
+    expect(render('http')).toContain('operations.perf.http.title')
+    expect(render('bogus')).toContain('operations.perf.llm.title')
+  })
+
+  test('a remembered long window is manual', () => {
+    memory.set('LIGHTRAG-OPS-PERF-WINDOW', '7d')
+    try {
+      const html = render('top')
+      expect(html).toContain('operations.perf.manualNote')
+      expect(html).toContain('operations.perf.top.title')
+    } finally {
+      memory.delete('LIGHTRAG-OPS-PERF-WINDOW')
+    }
   })
 })
 

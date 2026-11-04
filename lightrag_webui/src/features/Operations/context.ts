@@ -1,4 +1,5 @@
 import { createContext, useContext } from 'react'
+import type { InsightsTarget } from '@/features/TokenInsights/hash'
 import { OpsOverview, OpsStatus } from './api'
 import { DEFAULT_OPS_HASH, Drawer, OpsHash, OpsTab } from './hashState'
 import { OpsPoll } from './poll'
@@ -6,8 +7,11 @@ import { OpsPoll } from './poll'
 export type OpsShell = {
   /** Last /admin/ops/status answer (null before the first one). */
   status: OpsStatus | null
-  /** Switches the app to Token Insights (the owner of cost and token questions), optionally for one workspace. */
-  openInsights: (workspace?: string) => void
+  /**
+   * Switches the app to Token Insights (the owner of cost and token
+   * questions), optionally on a workspace, a purpose or one document's calls.
+   */
+  openInsights: (target?: InsightsTarget) => void
 }
 
 export const OpsShellContext = createContext<OpsShell>({ status: null, openInsights: () => {} })

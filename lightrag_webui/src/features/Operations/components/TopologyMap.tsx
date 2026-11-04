@@ -1,11 +1,14 @@
-import { CSSProperties, KeyboardEvent, memo, useId, useMemo, useState } from 'react'
+import { CSSProperties, KeyboardEvent, memo, useId, useMemo, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { Seg } from '@/features/TokenInsights/ui'
 import { cn } from '@/lib/utils'
 import type { DepHealth } from '../api'
 import { useOpsNav } from '../context'
+import { EdgeFlow, RATE_LABEL_AT, edgeFlow, flowAllowed, flowClasses, flowStillReason } from '../flow'
 import { fmtClock, fmtCount, fmtLatency, utcTitle } from '../format'
-import { useRing, useRingToken } from '../motion'
+import { useInView } from '../hooks'
+import { useOpsMotion, useRing, useRingToken } from '../motion'
+import { FlowRates, FlowSource, fmtPerMin } from '../performance/model'
 import { lookOf } from '../severity'
 import {
   CONTAINER,
@@ -88,12 +91,13 @@ function NodeBox({ n, selected, onSelect }: { n: TopoNode; selected: boolean; on
   )
 }
 
-function Edge({ e, markers }: { e: TopoEdge; markers: string }) {
-  const marker = e.down ? 'crit' : e.cls === 'monitor' || e.cls === 'probe' ? 'mon' : 'base'
+function Edge({ e, markers, flow }: { e: TopoEdge; markers: string; flow: EdgeFlow | null }) {
+  const marker = e.down ? 'crit' : e.cls === 'monitor' || e.cls === 'probe' ? 'mon' : flow && flow.bucket !== 'idle' ? 'flow' : 'base'
   return (
     <>
       <polyline
-        className={cn('ops-te', `ops-te-${e.cls}`, e.down && 'is-down', e.monitor && 'is-mon')}
+        className={cn('ops-te', `ops-te-${e.cls}`, e.down && 'is-down', e.monitor && 'is-mon', ...flowClasses(flow))}
+        data-flow={flow ? flow.bucket : undefined}
         points={pointsAttr(e.points)}
         markerEnd={e.cls === 'unprobed' || e.cls === 'probe' ? undefined : `url(#${markers}-${marker})`}
       />
@@ -103,6 +107,17 @@ function Edge({ e, markers }: { e: TopoEdge; markers: string }) {
         </text>
       ) : null}
     </>
+  )
+}
+
+/** The edge's rate as text ("75/min"): the same information as the dash speed, without motion. */
+function RateLabel({ e, flow }: { e: TopoEdge; flow: EdgeFlow | null }) {
+  const place = RATE_LABEL_AT[e.id]
+  if (!place || !flow || e.down) return null
+  return (
+    <text className="ops-te-lab ops-te-rate" x={place.at[0]} y={place.at[1]} textAnchor={place.anchor} aria-hidden="true">
+      {fmtPerMin(flow.perMin)}
+    </text>
   )
 }
 
@@ -188,6 +203,37 @@ function InfoPanel({ node }: { node: TopoNode }) {
   )
 }
 
+/** Sources in the order the flow list names them. */
+const FLOW_ORDER: FlowSource[] = ['http', 'embed', 'rerank', 'llm']
+
+/**
+ * "Live traffic, last minute" under the map: every source with its rate and
+ * speed bucket in text, and why the dashes are still when they are. This is
+ * the text alternative to the moving dashes (§2.12 rule 6).
+ */
+function FlowList({ flows, reason }: { flows: Partial<Record<FlowSource, EdgeFlow>>; reason: string | null }) {
+  const { t } = useTranslation()
+  const rows = FLOW_ORDER.filter((s) => flows[s])
+  if (!rows.length) return null
+  return (
+    <div className="flex flex-col gap-1 border-t px-4 py-3 text-xs">
+      <span className="font-medium">{t('operations.topology.flow.title')}</span>
+      <ul className="m-0 flex list-none flex-wrap gap-x-5 gap-y-1 p-0">
+        {rows.map((s) => {
+          const f = flows[s]!
+          return (
+            <li key={s} data-flow-source={s}>
+              {t(`operations.topology.flow.source.${s}`)}: <span className="font-mono">{fmtPerMin(f.perMin)}</span>
+              <span className="text-muted-foreground"> · {t(`operations.topology.flow.bucket.${f.bucket}`)}</span>
+            </li>
+          )
+        })}
+      </ul>
+      <span className="text-muted-foreground">{reason ? t(`operations.topology.flow.still.${reason}`) : t('operations.topology.flow.moving')}</span>
+    </div>
+  )
+}
+
 function LegendLine({ cls, children }: { cls: string; children: React.ReactNode }) {
   return (
     <li className="flex items-center gap-2">
@@ -200,17 +246,41 @@ function LegendLine({ cls, children }: { cls: string; children: React.ReactNode 
 }
 
 /**
- * The system topology at the top of the Health tab (§2.13), static in this
- * release: every edge is a still line until the per-minute rate series exist.
- * Node status follows the latest probe cycle (icon and outline, never colour
- * alone); a target that is down turns its edges into dashed critical lines
- * with ✖ at the midpoint; services nothing probes are dashed grey. A node
- * that has just failed gets one ring when the page's attention slot grants it.
+ * The system topology at the top of the Health tab (§2.13). Node status
+ * follows the latest probe cycle (icon and outline, never colour alone); a
+ * target that is down turns its edges into dashed critical lines with ✖ at
+ * the midpoint; services nothing probes are dashed grey. A node that has
+ * just failed gets one ring when the page's attention slot grants it.
+ *
+ * Up to five edges carry live traffic (`flows`, from the per-minute rate
+ * series): dashes flow at a speed bucketed against the edge's own 24 h
+ * p50/p90, with the rate as a label and the bucket as line thickness. The
+ * dashes stop under reduced motion, "⏸ auto", a hidden tab, a stale panel
+ * or while the map is less than half on screen; only stroke-dashoffset
+ * moves (paint only, no layout).
+ *
  * Nodes are keyboard-focusable buttons that open the info panel; the
  * Monitoring layer shows what the ops collectors write and probe.
  */
-function TopologyMap({ deps, processLabel }: { deps: DepHealth[]; processLabel?: string | null }) {
+function TopologyMap({
+  deps,
+  processLabel,
+  flows,
+  stale = false
+}: {
+  deps: DepHealth[]
+  processLabel?: string | null
+  /** Per-source rates for the flowing edges; null or missing keeps every edge still. */
+  flows?: FlowRates | null
+  /** The health or rate data is stale: nothing can vouch the traffic is still flowing. */
+  stale?: boolean
+}) {
   const { t } = useTranslation()
+  const { reduced, paused, hidden } = useOpsMotion()
+  const box = useRef<HTMLDivElement | null>(null)
+  const inView = useInView(box, 0.5)
+  const ctx = { reduced, paused, hidden, stale, inView }
+  const allowed = flowAllowed(ctx)
   const markers = `ops-topo-${useId().replace(/[^a-zA-Z0-9_-]/g, '')}`
   const topo = useMemo(() => buildTopology(deps), [deps])
   const [layer, setLayer] = useState<Layer>('traffic')
@@ -221,6 +291,11 @@ function TopologyMap({ deps, processLabel }: { deps: DepHealth[]; processLabel?:
   const names = topo.nodes.filter((n) => n.dep).map((n) => n.dep!.name ?? t(`operations.dep.${n.dep!.id}`, { defaultValue: n.dep!.id }))
   const data = topo.edges.filter((e) => !e.monitor)
   const mon = topo.edges.filter((e) => e.monitor)
+  const edgeFlows = new Map<string, EdgeFlow | null>(data.map((e) => [e.id, edgeFlow(e.id, e.down, flows, allowed)]))
+  const bySource: Partial<Record<FlowSource, EdgeFlow>> = {}
+  for (const f of edgeFlows.values()) if (f && !bySource[f.source]) bySource[f.source] = f
+  const hasFlows = Object.keys(bySource).length > 0
+  const anyMoving = [...edgeFlows.values()].some((f) => f?.moving)
   return (
     <div className="bg-card min-w-0 overflow-hidden rounded-[10px] border">
       <div className="bg-muted/40 flex flex-wrap items-center gap-x-4 gap-y-2 border-b px-4 py-2.5">
@@ -234,10 +309,10 @@ function TopologyMap({ deps, processLabel }: { deps: DepHealth[]; processLabel?:
             { value: 'monitor', label: t('operations.topology.monitoring') }
           ]}
         />
-        <span className="text-muted-foreground text-xs">{t('operations.topology.staticNote')}</span>
+        <span className="text-muted-foreground text-xs">{hasFlows ? t('operations.topology.flowNote') : t('operations.topology.staticNote')}</span>
       </div>
-      <div className="overflow-x-auto">
-        <div className={cn('ops-topo', layer === 'monitor' && 'is-mon')}>
+      <div className="overflow-x-auto" ref={box}>
+        <div className={cn('ops-topo', layer === 'monitor' && 'is-mon')} data-flowing={anyMoving ? '' : undefined}>
           <svg
             className="ops-dim"
             viewBox={`0 0 ${TOPO_WIDTH} ${TOPO_HEIGHT}`}
@@ -248,6 +323,7 @@ function TopologyMap({ deps, processLabel }: { deps: DepHealth[]; processLabel?:
               <Marker id={`${markers}-base`} color="var(--muted-foreground)" />
               <Marker id={`${markers}-mon`} color="var(--ops-info)" />
               <Marker id={`${markers}-crit`} color="var(--ops-crit)" />
+              <Marker id={`${markers}-flow`} color="var(--ops-s1)" />
             </defs>
             <rect className="ops-grp" x={CONTAINER.x} y={CONTAINER.y} width={CONTAINER.w} height={CONTAINER.h} rx={10} />
             <text className="ops-grp-lab" x={CONTAINER.x + 14} y={CONTAINER.y + 20}>
@@ -265,13 +341,16 @@ function TopologyMap({ deps, processLabel }: { deps: DepHealth[]; processLabel?:
               {t('operations.topology.group.external')}
             </text>
             {data.map((e) => (
-              <Edge key={e.id} e={e} markers={markers} />
+              <Edge key={e.id} e={e} markers={markers} flow={edgeFlows.get(e.id) ?? null} />
             ))}
             {mon.map((e) => (
-              <Edge key={e.id} e={e} markers={markers} />
+              <Edge key={e.id} e={e} markers={markers} flow={null} />
             ))}
             {topo.edges.map((e) => (
               <EdgeLabel key={e.id} e={e} />
+            ))}
+            {data.map((e) => (
+              <RateLabel key={`rate-${e.id}`} e={e} flow={edgeFlows.get(e.id) ?? null} />
             ))}
             {topo.nodes.map((n) => (
               <NodeBox key={n.id} n={n} selected={n.id === selected} onSelect={setPicked} />
@@ -283,15 +362,17 @@ function TopologyMap({ deps, processLabel }: { deps: DepHealth[]; processLabel?:
         {node ? <InfoPanel node={node} /> : <div />}
         <ul className="text-muted-foreground m-0 flex list-none flex-col gap-1.5 border-t p-4 text-xs md:border-t-0 md:border-l">
           <LegendLine cls="ops-te-data">{t('operations.topology.legend.connection')}</LegendLine>
+          {hasFlows ? <LegendLine cls="ops-te-data ops-te-rate-medium ops-te-legend-flow">{t('operations.topology.legend.traffic')}</LegendLine> : null}
           <LegendLine cls="ops-te-unprobed">{t('operations.topology.legend.unprobed')}</LegendLine>
           <LegendLine cls="ops-te-data is-down">{t('operations.topology.legend.down')}</LegendLine>
           <LegendLine cls="ops-te-bypass">{t('operations.topology.legend.bypass')}</LegendLine>
           <LegendLine cls="ops-te-probe">{t('operations.topology.legend.probe')}</LegendLine>
         </ul>
       </div>
+      <FlowList flows={bySource} reason={flowStillReason(ctx)} />
     </div>
   )
 }
 
-/** Re-renders only when the dependencies or the process label change, not on the page's clock ticks. */
+/** Re-renders only when the dependencies, the rates or the process label change, not on the page's clock ticks. */
 export default memo(TopologyMap)

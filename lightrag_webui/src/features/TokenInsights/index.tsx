@@ -9,6 +9,7 @@ import { useDebounce } from '@/hooks/useDebounce'
 import AnomaliesTab from './AnomaliesTab'
 import { Params, insightsApi } from './api'
 import { Ctx, Drill, Scope, useData } from './context'
+import { INSIGHTS_TABS, parseInsightsHash, writeInsightsHash } from './hash'
 import ExploreTab from './ExploreTab'
 import ForecastTab from './ForecastTab'
 import { ICON_CHECK, ICON_CLOCK, PURPOSES, Purpose, SEVERITY } from './meta'
@@ -20,45 +21,15 @@ import WorkspacesTab from './WorkspacesTab'
 import WorkTab from './WorkTab'
 import './insights.css'
 
-const TABS = ['overview', 'workspaces', 'explore', 'anomalies', 'work', 'forecast']
+const TABS = INSIGHTS_TABS
 const SEARCH_DEBOUNCE_MS = 250
 const ALL_OPTION = '__all__'
 const DEFAULT: Scope = { tab: 'overview', purpose: '', workspace: '', range: 30, start: '', end: '', unit: 'tokens', day: null }
 
-/** The URL holds the view, so an alert email or a colleague can open it directly. */
-const readHash = (): Partial<Scope> => {
-  const query = window.location.hash.split('?')[1]
-  if (!query) return {}
-  const q = new URLSearchParams(query)
-  if (q.get('insights') !== '1') return {}
-  const out: Partial<Scope> = {}
-  const tab = q.get('itab')
-  if (tab && TABS.includes(tab)) out.tab = tab
-  const purpose = q.get('ipurpose')
-  if (purpose && (PURPOSES as readonly string[]).includes(purpose)) out.purpose = purpose as Purpose
-  if (q.get('iws')) out.workspace = q.get('iws') as string
-  if (q.get('iday')) out.day = q.get('iday')
-  const range = q.get('irange')
-  if (range === 'custom' && q.get('istart') && q.get('iend')) {
-    out.range = 'custom'
-    out.start = q.get('istart') as string
-    out.end = q.get('iend') as string
-  } else if (range && !Number.isNaN(Number(range))) {
-    out.range = Number(range)
-  }
-  return out
-}
-
-const writeHash = (scope: Scope) => {
-  const q = new URLSearchParams({ insights: '1', itab: scope.tab, irange: String(scope.range) })
-  if (scope.purpose) q.set('ipurpose', scope.purpose)
-  if (scope.workspace) q.set('iws', scope.workspace)
-  if (scope.day) q.set('iday', scope.day)
-  if (scope.range === 'custom') {
-    q.set('istart', scope.start)
-    q.set('iend', scope.end)
-  }
-  window.history.replaceState(null, '', `#/?${q.toString()}`)
+/** The document whose calls Explore shows, from the breadcrumb (client calls are not documents). */
+const docOfDrill = (drill: Drill[]) => {
+  const call = drill.find((c) => c.dim === 'call')
+  return call && !call.key.startsWith('client:') ? call.key : null
 }
 
 /** Thousands of workspaces: nothing loads until the list opens, and the server searches. */
@@ -164,8 +135,15 @@ export default function TokenInsights() {
 
 function InsightsPage() {
   const { t } = useTranslation()
-  const [scope, setScope] = useState<Scope>(() => ({ ...DEFAULT, ...readHash() }))
-  const [explore, setExploreState] = useState<{ group: string; drill: Drill[] }>({ group: 'purpose', drill: [] })
+  // The URL holds the view, so an alert email or a colleague can open it directly.
+  const [initial] = useState(() => parseInsightsHash(window.location.hash))
+  const [scope, setScope] = useState<Scope>(() => ({ ...DEFAULT, ...initial.scope }))
+  // `idoc` (from the Operations Document drawer) opens Explore on that document's calls.
+  const [explore, setExploreState] = useState<{ group: string; drill: Drill[] }>(() =>
+    initial.doc
+      ? { group: 'document', drill: [{ dim: 'call', key: initial.doc, label: t('insights.explore.docCalls', { id: initial.doc.length > 13 ? `${initial.doc.slice(0, 12)}…` : initial.doc }) }] }
+      : { group: 'purpose', drill: [] }
+  )
   const [settingsOpen, setSettingsOpen] = useState(false)
   const set = useCallback((patch: Partial<Scope>) => setScope((s) => ({ ...s, ...patch })), [])
   const setExplore = useCallback((patch: { group?: string; drill?: Drill[] }) => setExploreState((e) => ({ ...e, ...patch })), [])
@@ -173,7 +151,8 @@ function InsightsPage() {
     setExploreState({ group, drill })
     setScope((s) => ({ ...s, tab: 'explore', ...patch }))
   }, [])
-  useEffect(() => writeHash(scope), [scope])
+  const doc = docOfDrill(explore.drill)
+  useEffect(() => window.history.replaceState(null, '', writeInsightsHash(scope, doc)), [scope, doc])
   // Leaving the tab drops the view from the URL, so a reload stays where the user went.
   useEffect(() => () => window.history.replaceState(null, '', '#/'), [])
 

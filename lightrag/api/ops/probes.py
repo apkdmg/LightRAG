@@ -46,6 +46,13 @@ from urllib.parse import urlsplit
 from uuid import uuid4
 
 from lightrag.api.ops.leases import being_cancelled as _being_cancelled
+from lightrag.api.ops.perf import (
+    BASELINE_KEY,
+    METRIC_THRESHOLDS,
+    baseline_for,
+    llm_p95_severity,
+    merge_thresholds,
+)
 from lightrag.api.ops.redact import strip_userinfo
 
 logger = logging.getLogger("lightrag.api.ops")
@@ -160,6 +167,8 @@ DETAIL_KEYS = frozenset(
         "errors",
         "error_rate",
         "p95_ms",
+        "baseline_p95_ms",
+        "p95_ratio",
         "window",
         "low_volume",
         "model",
@@ -926,12 +935,50 @@ class PostgresProbe:
 
 
 class PassiveLlm:
-    """LLM provider health from real calls (Insights), never a paid probe."""
+    """LLM provider health from real calls (Insights), never a paid probe.
 
-    def __init__(self, app_state: Any, binding: Optional[str], host: Optional[str]):
+    The 15-minute p95 is compared with the 7-day same-hour baseline the
+    hourly baseline job stores (``llm_p95_baseline``): more than twice the
+    usual latency warns, as does any p95 over 60 s.
+    """
+
+    BASELINE_TTL_S = 300.0
+
+    def __init__(
+        self,
+        app_state: Any,
+        binding: Optional[str],
+        host: Optional[str],
+        store: Any = None,
+    ):
         self.app_state = app_state
         self.binding = binding
         self.host = host
+        self.store = store
+        self._baseline: Any = None
+        self._baseline_at = 0.0
+        # The llm_p95 thresholds with the KV overrides, read with the baseline.
+        self.thresholds: dict[str, Any] = dict(METRIC_THRESHOLDS)
+
+    async def _baseline_ms(self, timeout: float) -> Optional[float]:
+        if self.store is None:
+            return None
+        now = time.time()
+        if now - self._baseline_at >= self.BASELINE_TTL_S:
+            try:
+                self._baseline = await asyncio.wait_for(
+                    self.store.kv_get(BASELINE_KEY, None), timeout
+                )
+                stored = await asyncio.wait_for(
+                    self.store.kv_get("thresholds", None), timeout
+                )
+                self.thresholds = merge_thresholds(METRIC_THRESHOLDS, stored)
+                self._baseline_at = now
+            except Exception as e:
+                logger.debug("LLM p95 baseline unreadable (%s)", type(e).__name__)
+                return None
+        entry = baseline_for(self._baseline, now)
+        return entry["p95_ms"] if entry else None
 
     async def __call__(self, timeout: float) -> ProbeResult:
         detail: dict[str, Any] = {
@@ -965,9 +1012,16 @@ class PassiveLlm:
             return ProbeResult("ok", None, None, detail)
         if rate > LLM_DOWN_RATE:
             return ProbeResult("down", None, "error_rate", detail)
-        if rate > LLM_WARN_RATE or (
-            isinstance(p95, (int, float)) and p95 > LLM_SLOW_P95_MS
-        ):
+        baseline = await self._baseline_ms(timeout)
+        if baseline is not None:
+            detail["baseline_p95_ms"] = baseline
+            if isinstance(p95, (int, float)):
+                detail["p95_ratio"] = round(p95 / baseline, 2)
+        slow = isinstance(p95, (int, float)) and (
+            p95 > LLM_SLOW_P95_MS
+            or llm_p95_severity(p95, baseline, self.thresholds) is not None
+        )
+        if rate > LLM_WARN_RATE or slow:
             return ProbeResult("warn", None, None, detail)
         return ProbeResult("ok", None, None, detail)
 
@@ -1228,7 +1282,9 @@ def build_specs(
             "LLM provider",
             "llm",
             target=display_target(llm_host) if isinstance(llm_host, str) else None,
-            arun=PassiveLlm(app_state, getattr(args, "llm_binding", None), llm_host),
+            arun=PassiveLlm(
+                app_state, getattr(args, "llm_binding", None), llm_host, store=store
+            ),
             passive=True,
         )
     )

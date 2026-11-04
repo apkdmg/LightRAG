@@ -67,6 +67,7 @@ from lightrag.api.ops.context import (
     RequestIdMiddleware,
     ServerErrorBoundary,
 )
+from lightrag.api.ops import metrics as ops_metrics
 from lightrag.api.ops.redact import sanitize_config, text_ref
 from lightrag.api.routers.ops_routes import configure_ops
 from lightrag.api.routers.ops_routes import router as ops_router
@@ -735,6 +736,9 @@ def create_app(args):
         RequestIdMiddleware,
         trusted_proxies=os.getenv("OPS_TRUSTED_PROXIES", ""),
         error_headers=BASELINE_SECURITY_HEADERS,
+        # Route latency, 5xx and 401 counters (a no-op until the ops runtime
+        # installs this worker's metrics; OPS_METRICS_ENABLED).
+        observers=[ops_metrics.http_observer],
     )
 
     # Create combined auth dependency for all endpoints
@@ -1711,6 +1715,8 @@ def create_app(args):
 
             return await selected_rerank_func(**kwargs, extra_body=extra_body)
 
+        # The model is the key of the ops rerank latency metrics.
+        server_rerank_func.model_name = args.rerank_model
         rerank_model_func = server_rerank_func
         logger.info(
             f"Reranking is enabled: {args.rerank_model or 'default model'} using {args.rerank_binding} provider"
@@ -2105,6 +2111,7 @@ def create_app(args):
         retry_after = login_throttle.retry_after(username)
         if retry_after:
             logger.warning(f"Login throttled for user '{username}'")
+            ops_metrics.auth_event("login_throttled")
             raise HTTPException(
                 status_code=status.HTTP_429_TOO_MANY_REQUESTS,
                 detail="Too many failed login attempts. Try again later.",
@@ -2112,8 +2119,13 @@ def create_app(args):
             )
         if not auth_handler.verify_password(username, form_data.password):
             login_throttle.record_failure(username)
+            ops_metrics.auth_event("login_failed")
+            # This failure reached the limit: the account is now locked out.
+            if login_throttle.retry_after(username):
+                ops_metrics.auth_event("lockout")
             raise HTTPException(status_code=401, detail="Incorrect credentials")
         login_throttle.reset(username)
+        ops_metrics.auth_event("login_ok")
 
         # Determine the user role based on ADMIN_ACCOUNTS configuration.
         # Uses the shared, case-insensitive matcher so admin status is
@@ -2208,6 +2220,19 @@ def create_app(args):
         return response
 
     async def _process_oauth2_callback(
+        code: str, state: str, request: Request = None
+    ) -> dict:
+        """Process an OAuth2 callback and count its outcome (ops sign-in
+        health: ``sso_ok`` / ``sso_error``, never who signed in)."""
+        try:
+            token_data = await _exchange_oauth2_callback(code, state, request)
+        except Exception:
+            ops_metrics.auth_event("sso_error")
+            raise
+        ops_metrics.auth_event("sso_ok")
+        return token_data
+
+    async def _exchange_oauth2_callback(
         code: str, state: str, request: Request = None
     ) -> dict:
         """

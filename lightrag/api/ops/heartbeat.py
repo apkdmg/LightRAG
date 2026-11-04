@@ -41,6 +41,7 @@ from collections import deque
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Iterable, Optional
 
+from lightrag.api.ops import metrics as ops_metrics
 from lightrag.kg import shared_storage
 
 logger = logging.getLogger("lightrag.api.ops")
@@ -421,6 +422,9 @@ class Heartbeat:
             role: dict.fromkeys(_QUEUE_KEYS, 0) for role in ("llm", "embed", "rerank")
         }
         seen_role = dict.fromkeys(sums, False)
+        # LLM queues per role (role names are the usage purposes), for the
+        # Performance tab's per-purpose "queued" column.
+        llm_roles: dict[str, dict[str, int]] = {}
         top: list[dict[str, Any]] = []
         instances = self._instances()
         primary: dict[str, Any] = {}
@@ -442,6 +446,15 @@ class Heartbeat:
                     "embedding_queue_status": _status_view(embed),
                     "rerank_queue_status": _status_view(rerank),
                 }
+            for role_name, stats in (llm or {}).items():
+                counts = _queue_counts(stats)
+                if counts is None:
+                    continue
+                target = llm_roles.setdefault(
+                    str(role_name), dict.fromkeys(_QUEUE_KEYS, 0)
+                )
+                for key in _QUEUE_KEYS:
+                    target[key] += counts[key]
             parts = [("llm", s) for s in (llm or {}).values()]
             parts += [("embed", embed), ("rerank", rerank)]
             for role, stats in parts:
@@ -461,6 +474,7 @@ class Heartbeat:
         return {
             "instances": len(instances),
             "queues": {role: sums[role] if seen_role[role] else None for role in sums},
+            "llm_roles": llm_roles,
             "top_instances": top[:TOP_INSTANCES],
             **primary,
         }
@@ -571,6 +585,11 @@ class Heartbeat:
         except Exception:
             snapshot["run_tracking"] = None
         try:
+            bins = ops_metrics.current()
+            snapshot["metrics"] = bins.stats() if bins is not None else None
+        except Exception:
+            snapshot["metrics"] = None
+        try:
             snapshot["drainers"] = self._drainers()
         except Exception:
             snapshot["drainers"] = []
@@ -617,11 +636,18 @@ class Heartbeat:
             return True
         sample = None
         if now - self._last_sample_at >= SAMPLE_INTERVAL_S:
+            # This worker's LLM queue sums at the sample (None while no loaded
+            # instance has an LLM queue), for Performance > LLM over time.
+            llm_queue = (snapshot.get("queues") or {}).get("llm")
+            llm_queue = llm_queue if isinstance(llm_queue, dict) else {}
             sample = {
                 "cpu_pct": snapshot.get("cpu_pct"),
                 "rss": snapshot.get("rss"),
                 "loop_lag_ms": _int(snapshot.get("loop_lag_max_ms")),
                 "pool_wait_ms": _int(self._window_pool_wait),
+                "llm_running": _int(llm_queue.get("running")),
+                "llm_in_flight": _int(llm_queue.get("in_flight")),
+                "llm_queued": _int(llm_queue.get("queued")),
             }
         try:
             await asyncio.wait_for(

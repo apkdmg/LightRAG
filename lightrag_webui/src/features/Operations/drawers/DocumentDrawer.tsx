@@ -178,7 +178,7 @@ export default function DocumentDrawer({ workspace, docId }: { workspace: string
             title={t('operations.document.calls')}
             aside={
               status?.features?.insights ? (
-                <button type="button" className="text-xs underline underline-offset-2" onClick={() => openInsights(workspace)}>
+                <button type="button" className="text-xs underline underline-offset-2" onClick={() => openInsights({ workspace, docId })}>
                   {t('operations.document.explore')}
                 </button>
               ) : null

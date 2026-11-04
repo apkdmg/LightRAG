@@ -35,6 +35,7 @@ from typing import Any, Awaitable, Callable, Iterable, Iterator, Optional
 from lightrag.usage import current_usage_scope
 
 REQUEST_ID_HEADER = "X-Request-ID"
+CLIENT_CLOSED_STATUS = 499
 _REQUEST_ID_HEADER_BYTES = b"x-request-id"
 _VALID_REQUEST_ID = re.compile(r"^[A-Za-z0-9._-]{8,64}$")
 _LEADING_WORKSPACE = re.compile(r"^\[([A-Za-z0-9_-]{1,128})\]")
@@ -328,7 +329,10 @@ class RequestIdMiddleware:
         cid_token = _client_request_id.set(client_request_id)
         header_value = request_id.encode("latin-1")
         started = time.perf_counter()
-        status_holder = {"status": 500, "started": False}
+        # Until a response starts, a request that ends (cancelled, client
+        # gone) is reported as 499, nginx's "client closed request": it is
+        # not a server error. Exceptions set 500 below.
+        status_holder = {"status": CLIENT_CLOSED_STATUS, "started": False}
 
         async def send_with_id(message: dict) -> None:
             if message["type"] == "http.response.start":
@@ -348,6 +352,8 @@ class RequestIdMiddleware:
         except Exception:
             if status_holder["started"]:
                 # Too late for a clean response; let the server abort it.
+                # Observers still count the request as a server error.
+                status_holder["status"] = 500
                 raise
             _log_unhandled(scope, request_id)
             status_holder["status"] = 500

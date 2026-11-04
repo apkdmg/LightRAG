@@ -413,7 +413,7 @@ export default function WorkspaceDrawer({ workspace }: { workspace: string }) {
           {t('operations.workspace.copyId')}
         </button>
         {status?.features?.insights ? (
-          <button type="button" className="hover:bg-muted min-h-8 rounded-lg border px-3 text-[13px]" onClick={() => openInsights(workspace)}>
+          <button type="button" className="hover:bg-muted min-h-8 rounded-lg border px-3 text-[13px]" onClick={() => openInsights({ workspace })}>
             {t('operations.workspace.openInsights')}
           </button>
         ) : null}
