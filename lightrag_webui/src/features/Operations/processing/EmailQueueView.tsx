@@ -1,10 +1,12 @@
 import { useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { cn } from '@/lib/utils'
+import { actionsEnabled } from '../actions'
 import OpsLink from '../components/OpsLink'
 import { Pager, Panel } from '../components/Panel'
 import { StatusChip } from '../components/StatusChip'
-import { useOpsNav } from '../context'
+import { WorkspaceActionBar } from '../components/WorkspaceActions'
+import { useOpsNav, useOpsShell } from '../context'
 import { EmailQueueItem, opsApi } from '../api'
 import { ageSeconds, fmtAge, fmtClock, fmtCount, shortId, utcTitle } from '../format'
 import { useOpsPoll } from '../poll'
@@ -57,11 +59,14 @@ function DrainsText({ drains }: { drains: EmailQueueItem['drains_1h'] }) {
  * deadline), attempts, the drains of the last hour (ok / failed / slot busy)
  * and the last result, including `slot_busy` when the pipeline held the
  * workspace. Contents are never returned; the scanner
- * counts files without opening them.
+ * counts files without opening them. When actions are on, each row offers
+ * "Drain email…" (at most once a minute per workspace).
  */
 export default function EmailQueueView() {
   const { t } = useTranslation()
   const nav = useOpsNav()
+  const { status } = useOpsShell()
+  const showActions = actionsEnabled(status)
   const [page, setPage] = useState(1)
   const poll = useOpsPoll((signal) => opsApi.emailQueue({ page }, signal), [page], EMAIL_SECONDS)
   const d = poll.data
@@ -100,6 +105,11 @@ export default function EmailQueueView() {
                     <th className="p-2 text-left font-medium">{col('drains')}</th>
                     <th className="p-2 text-left font-medium">{col('last')}</th>
                     <th className="p-2 text-left font-medium">{col('lastOk')}</th>
+                    {showActions ? (
+                      <th className="p-2 text-right font-medium">
+                        <span className="sr-only">{col('actions')}</span>
+                      </th>
+                    ) : null}
                   </tr>
                 </thead>
                 <tbody>
@@ -149,6 +159,17 @@ export default function EmailQueueView() {
                         <td className="p-2 font-mono text-xs whitespace-nowrap" data-label={col('lastOk')} title={utcTitle(r.last_ok_at)}>
                           {fmtClock(r.last_ok_at ?? null)}
                         </td>
+                        {showActions ? (
+                          <td className="p-2 text-right" data-label={col('actions')}>
+                            <WorkspaceActionBar
+                              workspace={r.workspace}
+                              kinds={['drain_email']}
+                              ctx={{ busy: null, emailPending: r.pending }}
+                              facts={{ emailPending: r.pending }}
+                              onChanged={poll.reload}
+                            />
+                          </td>
+                        ) : null}
                       </tr>
                     )
                   })}

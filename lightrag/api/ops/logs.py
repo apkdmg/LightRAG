@@ -336,7 +336,8 @@ def csv_cell(value: Any) -> str:
     if isinstance(value, bool):
         return "true" if value else "false"
     text = str(value)
-    if text.startswith(_FORMULA_START):
+    # Spreadsheets also evaluate a formula after leading blanks.
+    if text.startswith(_FORMULA_START) or text.lstrip(" ").startswith(_FORMULA_START):
         return "'" + text
     return text
 

@@ -5,13 +5,16 @@ import { CopyIcon, PlayIcon } from 'lucide-react'
 import { Kv, Seg } from '@/features/TokenInsights/ui'
 import { useSettingsStore } from '@/stores/settings'
 import { Feed, WorkspaceDetail, opsApi } from '../api'
+import { OWNER_SUSPECT_STATES } from '../actions'
 import ErrorPanel from '../components/ErrorPanel'
 import LogSection from '../components/LogSection'
+import MaskedValue from '../components/MaskedValue'
 import OpsLink from '../components/OpsLink'
 import { ApproxChip, Pager, StaleChip } from '../components/Panel'
 import { RunStateLabel } from '../components/RunState'
 import Skeleton from '../components/Skeleton'
 import { StatusChip } from '../components/StatusChip'
+import { WorkspaceActionBar } from '../components/WorkspaceActions'
 import { useOpsNav, useOpsShell } from '../context'
 import { ageSeconds, fmtAge, fmtClock, fmtCount, fmtStamp, shortId, utcTitle } from '../format'
 import { viewForTarget } from '../hashState'
@@ -68,7 +71,11 @@ function LiveState({ data, now, stale }: { data: WorkspaceDetail; now: number | 
     <div className="flex flex-col items-start gap-1">
       <span className="flex flex-wrap items-center gap-2">
         <RunStateLabel state={paused ? 'paused' : heldState} stale={stale} />
-        {live.job_name ? <span className="text-[13px] break-all">{live.job_name}</span> : null}
+        {live.job_name ? (
+          <MaskedValue kind="job_name" workspace={data.workspace} id={live.run_id ?? null}>
+            <span className="text-[13px] break-all">{live.job_name}</span>
+          </MaskedValue>
+        ) : null}
       </span>
       {notes.length ? <p className="text-muted-foreground m-0 text-xs">{notes.join(' · ')}</p> : null}
       {paused ? (
@@ -98,6 +105,26 @@ function LiveState({ data, now, stale }: { data: WorkspaceDetail; now: number | 
       {live.latest_message ? <p className="text-muted-foreground m-0 font-mono text-xs break-words">{live.latest_message}</p> : null}
     </div>
   )
+}
+
+/**
+ * What the action row needs from the drawer's answer: the live flags, and
+ * whether the owner of `busy` looks gone (its run is orphaned or
+ * unresponsive, the OS confirmed the process exited, or busy has no run).
+ */
+function actionContext(d: WorkspaceDetail) {
+  const live = d.live
+  if (d.live_status === 'unresponsive') return { busy: null, emailPending: d.email_queue?.pending ?? 0 }
+  const runs = d.recent_runs ?? []
+  const current = (live?.run_id ? runs.find((r) => r.run_id === live.run_id) : undefined) ?? runs.find((r) => r.status === 'running' || r.status === 'orphaned')
+  const ownerSuspect = !!live?.busy && (!current || OWNER_SUSPECT_STATES.has(current.state) || current.worker_alive === false)
+  return {
+    busy: live ? !!live.busy : false,
+    destructiveBusy: live?.destructive_busy ?? null,
+    cancellationRequested: live?.cancellation_requested ?? null,
+    ownerSuspect,
+    emailPending: d.email_queue?.pending ?? 0
+  }
 }
 
 /** The workspace's `history_messages`, redacted on the server; appends every 3 s and replaces itself on a reset. */
@@ -230,9 +257,11 @@ function Documents({ workspace }: { workspace: string }) {
 }
 
 /**
- * The Workspace drawer (§2.9, US-4), read-only. Opening it never loads the
- * workspace on the server: counts, recent runs and failures by kind come
- * from SQL and live state from a read-only snapshot. "Idle (not loaded in
+ * The Workspace drawer (§2.9, US-4). Opening it never loads the workspace on
+ * the server: counts, recent runs and failures by kind come from SQL and
+ * live state from a read-only snapshot. When actions are on, the action row
+ * offers Cancel, Release busy (multi-worker), Run pipeline now and Drain
+ * email, each behind a confirm dialog with a reason. "Idle (not loaded in
  * memory)" when no process has it. Runs open the Run drawer on the
  * breadcrumb.
  */
@@ -281,6 +310,12 @@ export default function WorkspaceDrawer({ workspace }: { workspace: string }) {
               })}
             </p>
           ) : null}
+          <WorkspaceActionBar
+            workspace={workspace}
+            ctx={actionContext(d)}
+            facts={{ emailPending: d.email_queue?.pending ?? 0, paused: !!d.live?.paused || pauses.length > 0 }}
+            onChanged={poll.reload}
+          />
           {c ? (
             <Section title={t('operations.workspace.counts')}>
               <div className="grid grid-cols-1 gap-x-6 gap-y-1 sm:grid-cols-2">

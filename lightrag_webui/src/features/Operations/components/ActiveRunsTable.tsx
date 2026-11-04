@@ -2,7 +2,8 @@ import { AnimatePresence, motion } from 'motion/react'
 import { useTranslation } from 'react-i18next'
 import { cn } from '@/lib/utils'
 import { ActiveRun } from '../api'
-import { useOpsNav } from '../context'
+import { OWNER_SUSPECT_STATES, actionsEnabled } from '../actions'
+import { useOpsNav, useOpsShell } from '../context'
 import { ageSeconds, fmtAge, fmtClock, shortId, utcTitle } from '../format'
 import { TWEEN, useOpsMotion } from '../motion'
 import { runDrawerOf } from '../processing/runs'
@@ -10,6 +11,7 @@ import { runLookOf } from '../severity'
 import OpsLink from './OpsLink'
 import ProgressBar from './ProgressBar'
 import { RunStateLabel } from './RunState'
+import { RowActions } from './WorkspaceActions'
 
 const barTone = (state: string): 'serious' | 'crit' | 'paused' | undefined => {
   const look = runLookOf(state)
@@ -47,8 +49,9 @@ function RunNote({ run }: { run: ActiveRun }) {
  * running dot breathes only next to "Running" text. Elapsed time is measured
  * against when the data was confirmed (`now`), so it never drifts between
  * polls. A row opens its Run drawer (the workspace drawer for interim rows
- * without a run id); the workspace cell opens the workspace. There are no
- * action buttons.
+ * without a run id); the workspace cell opens the workspace. When actions
+ * are on, the full table ends with a "⋯" menu per row: Cancel…, Release
+ * busy… (multi-worker, owner gone) and Open workspace.
  */
 export default function ActiveRunsTable({
   runs,
@@ -67,6 +70,8 @@ export default function ActiveRunsTable({
 }) {
   const { t } = useTranslation()
   const nav = useOpsNav()
+  const { status } = useOpsShell()
+  const showActions = !compact && actionsEnabled(status)
   const { reduced, hidden } = useOpsMotion()
   const instant = !!baseline || reduced || hidden
   const col = (key: string) => t(`operations.active.col.${key}`)
@@ -85,6 +90,11 @@ export default function ActiveRunsTable({
             <th className="p-2 text-right font-medium">{col('elapsed')}</th>
             <th className="p-2 text-left font-medium">{col('progress')}</th>
             {multiWorker && !compact ? <th className="p-2 text-left font-medium">{col('worker')}</th> : null}
+            {showActions ? (
+              <th className="p-2 text-right font-medium">
+                <span className="sr-only">{col('actions')}</span>
+              </th>
+            ) : null}
           </tr>
         </thead>
         <tbody>
@@ -173,6 +183,20 @@ export default function ActiveRunsTable({
                     <td className="p-2 font-mono text-xs" data-label={col('worker')}>
                       {typeof run.pid === 'number' ? run.pid : shortId(run.worker_id ?? null)}
                       {run.worker_alive === false ? <span className="text-[color:var(--ops-crit)]"> · {t('operations.active.workerGone')}</span> : null}
+                    </td>
+                  ) : null}
+                  {showActions ? (
+                    <td className="p-2 text-right" data-label={col('actions')}>
+                      <RowActions
+                        workspace={run.workspace}
+                        kinds={['cancel', 'release_busy']}
+                        ctx={{
+                          busy: run.live?.busy ?? null,
+                          cancellationRequested: run.live?.cancellation_requested ?? null,
+                          ownerSuspect: OWNER_SUSPECT_STATES.has(run.state) || run.worker_alive === false
+                        }}
+                        onOpenWorkspace={openWorkspace}
+                      />
                     </td>
                   ) : null}
                 </motion.tr>

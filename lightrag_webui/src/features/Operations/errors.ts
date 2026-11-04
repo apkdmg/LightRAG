@@ -36,7 +36,22 @@ export const REFUSALS = [
   'feature_disabled',
   'probes_disabled',
   'not_checkable',
-  'probe_failed'
+  'probe_failed',
+  // Admin actions (PR-7): the guards every POST passes before it acts (§3.9 step 1 and 3).
+  'audit_unavailable',
+  'admin_not_current',
+  'impersonation_not_allowed',
+  'client_header_required',
+  'origin_not_allowed',
+  'invalid_reason',
+  'owner_unknown',
+  'confirm_mismatch',
+  'invalid_kind',
+  'invalid_id',
+  'invalid_workspace',
+  'workspace_not_served',
+  'queue_unavailable',
+  'invalid_range'
 ] as const
 export type Refusal = (typeof REFUSALS)[number]
 

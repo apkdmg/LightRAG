@@ -125,6 +125,18 @@ async def resolve_user_from_request(request: Request) -> UserInfo:
     return await _resolve_user(token, request)
 
 
+async def _audit_admin_document_write(
+    request: Request, user: UserInfo, workspace: str
+) -> None:
+    """Audit an admin's /documents mutation on another workspace (on-behalf
+    header or impersonated session): the intent row now, the result row when
+    the route answers (Operations console, FR-75). Best effort, never raises,
+    and a no-op for every other request."""
+    from .ops.audit import note_document_mutation
+
+    await note_document_mutation(request, user, workspace)
+
+
 async def resolve_workspace_from_request(request: Request) -> str:
     """
     Resolve the workspace ID from a request without using FastAPI's DI.
@@ -194,6 +206,7 @@ async def resolve_workspace_from_request(request: Request) -> str:
         logger.info(
             f"Admin '{user.username}' operating on behalf of workspace: {sanitized_target}"
         )
+        await _audit_admin_document_write(request, user, sanitized_target)
         return sanitized_target
 
     # Service accounts MUST provide X-Target-Workspace
@@ -204,6 +217,7 @@ async def resolve_workspace_from_request(request: Request) -> str:
         )
 
     # Normal operation - use own workspace
+    await _audit_admin_document_write(request, user, user.workspace_id)
     return user.workspace_id
 
 
@@ -450,6 +464,7 @@ async def get_current_workspace(
         logger.info(
             f"Admin '{user.username}' operating on behalf of workspace: {sanitized_target}"
         )
+        await _audit_admin_document_write(request, user, sanitized_target)
         return sanitized_target
 
     # Service accounts MUST provide X-Target-Workspace for workspace endpoints
@@ -460,6 +475,7 @@ async def get_current_workspace(
         )
 
     # Normal operation - use own workspace
+    await _audit_admin_document_write(request, user, user.workspace_id)
     return user.workspace_id
 
 

@@ -6,11 +6,13 @@ import { cn } from '@/lib/utils'
 import { useSettingsStore } from '@/stores/settings'
 import { InsightsTarget, insightsLink } from '@/features/TokenInsights/hash'
 import { Card, ViewBoundary } from '@/features/TokenInsights/ui'
+import { actionsEnabled } from './actions'
 import ActivityTab from './ActivityTab'
 import { OpsOverview, OpsStatus, opsApi } from './api'
 import DrawerStack from './components/DrawerStack'
 import ErrorPanel from './components/ErrorPanel'
 import ProcessChip from './components/ProcessChip'
+import { HostedActionDialogs } from './components/WorkspaceActions'
 import RefreshHairline from './components/RefreshHairline'
 import Skeleton from './components/Skeleton'
 import { OverallStateChip } from './components/StatusChip'
@@ -420,6 +422,7 @@ function StatusShell({
             <ViewBoundary resetKey={view.drawer ? writeOpsHash({ ...DEFAULT_OPS_HASH, drawer: view.drawer }) : 'none'}>
               <DrawerStack animateOpen={animateDrawer} render={renderDrawer} />
             </ViewBoundary>
+            {actionsEnabled(status) ? <HostedActionDialogs /> : null}
           </div>
         </AttentionSlotContext.Provider>
       </OpsOverviewContext.Provider>

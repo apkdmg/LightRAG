@@ -591,3 +591,21 @@ def test_pipeline_text_masks_a_known_path_anywhere():
     assert "someone@unimas.my" not in out
     assert redact_pipeline(None) == ""
     assert len(redact_pipeline("Merging stage 1/2: " + "x" * 5000, 100)) <= 100
+
+
+def test_reveal_keeps_file_names_but_every_other_rule():
+    """mask_paths=False (the audited reveal only) lifts the file-name masking;
+    secrets, emails, IC and phone numbers stay masked."""
+    from lightrag.api.ops.redact import redact
+
+    text = (
+        "Senate minutes 900101-13-5678.pdf for someone.private@unimas.my "
+        "key sk-test-SECRET1234567890abcdef call 012-345 6789"
+    )
+    masked = redact(text)
+    revealed = redact(text, mask_paths=False)
+    assert ".pdf" not in masked
+    assert revealed.startswith("Senate minutes <ic>.pdf")
+    for secret in ("900101", "someone.private", "SECRET1234", "345 6789"):
+        assert secret not in revealed
+    assert redact("report_2024.pdf", mask_paths=False) == "report_2024.pdf"

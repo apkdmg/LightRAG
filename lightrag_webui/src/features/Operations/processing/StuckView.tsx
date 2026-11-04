@@ -50,7 +50,7 @@ export default function StuckView() {
         return (
           <div className="flex flex-col gap-3">
             {rows.length ? (
-              <StuckTable rows={rows} />
+              <StuckTable rows={rows} onChanged={poll.reload} />
             ) : (
               <p className="text-muted-foreground m-0 text-sm">
                 {typeof data.checked?.workspaces === 'number' && typeof data.checked?.runs === 'number'

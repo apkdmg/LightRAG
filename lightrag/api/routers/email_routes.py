@@ -48,6 +48,7 @@ from pydantic import BaseModel, Field
 
 from lightrag.api.dependencies import resolve_workspace_from_request
 from lightrag.api.ops import runs as ops_runs
+from lightrag.api.ops.audit import AuditedDocumentsRoute
 from lightrag.api.ops.context import bind_log_workspace
 from lightrag.api.ops.redact import mask_path, text_ref
 from lightrag.api.provider_alerts import is_own_alert_email
@@ -91,7 +92,11 @@ _parsing_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="email_
 # down on interpreter exit so reloads/tests don't leak worker threads.
 atexit.register(_parsing_executor.shutdown, wait=False)
 
-router = APIRouter(prefix="/documents", tags=["email"])
+# Same route class as the /documents router: an admin's cross-workspace
+# email ingest gets its result audit row like every other /documents write.
+router = APIRouter(
+    prefix="/documents", tags=["email"], route_class=AuditedDocumentsRoute
+)
 
 
 # ============================================================================

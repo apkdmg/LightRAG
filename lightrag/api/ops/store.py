@@ -149,6 +149,16 @@ CANCELLED_PREFIX = "User cancelled"
 DUP_PREFIX = "dup-"
 
 # Workspace-scoped KV keys: removed when the workspace is deleted.
+# Audit actions that only read (searches, exports, reveals): kept in the
+# Audit section, never shown as timeline markers.
+AUDIT_READ_ACTIONS = (
+    "log_search",
+    "log_groups",
+    "correlate",
+    "log_export",
+    "audit_export",
+    "reveal",
+)
 WORKSPACE_KV_KEYS = ("resync:{ws}", "kick:{ws}", "action:{ws}")
 WORKSPACE_KV_PREFIXES = ("pause:{ws}:",)
 # KV summaries holding a per-workspace ``items`` list.
@@ -328,6 +338,21 @@ class LogFilter:
     fingerprint: Optional[str] = None
     worker_id: Optional[str] = None
     q: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class AuditFilter:
+    """One ``LIGHTRAG_OPS_AUDIT`` query: a time window plus exact-match filters.
+
+    ``phase`` is ``intent``, ``result`` or None (both).
+    """
+
+    start: datetime
+    end: datetime
+    actor: Optional[str] = None
+    action: Optional[str] = None
+    workspace: Optional[str] = None
+    phase: Optional[str] = None
 
 
 class OpsStore(ABC):
@@ -646,6 +671,40 @@ class OpsStore(ABC):
     async def audit_write(self, row: dict[str, Any]) -> int:
         """Insert one ``LIGHTRAG_OPS_AUDIT`` row; returns its id."""
 
+    @abstractmethod
+    async def audit_page(
+        self, f: "AuditFilter", before: Optional[tuple[datetime, int]], limit: int
+    ) -> list[dict[str, Any]]:
+        """Audit rows matching ``f``, newest first, on the ``(ts, id)`` keyset
+        (strictly older than ``before``)."""
+
+    # -- admin actions -----------------------------------------------------------
+    @abstractmethod
+    async def claim_action(
+        self, key: str, holder: str, ttl_s: float, info: dict[str, Any]
+    ) -> tuple[bool, Optional[dict[str, Any]]]:
+        """Take the action lease ``key`` (``{holder, exp, **info}``) when it is
+        free, expired or already ``holder``'s. Returns ``(taken, current)``;
+        ``current`` is the holder's value when it was not taken."""
+
+    @abstractmethod
+    async def release_action(self, key: str, holder: str) -> None:
+        """Drop the action lease ``key`` if ``holder`` still holds it."""
+
+    @abstractmethod
+    async def rate_hit(
+        self, key: str, limit: int, window_s: float, now: float
+    ) -> tuple[bool, float]:
+        """Count one hit in ``key``'s fixed window. Returns ``(allowed,
+        retry_after_s)``; refused hits count too."""
+
+    @abstractmethod
+    async def kv_put_if_older(
+        self, key: str, value: dict[str, Any], older_than: float
+    ) -> bool:
+        """Write ``value`` (which carries ``at``) unless the stored value's
+        ``at`` is newer than ``older_than``. True when written."""
+
     # -- logs (writes come from the buffered log sink) -----------------------------
     @abstractmethod
     async def logs_write(self, rows: list[dict[str, Any]]) -> None:
@@ -826,6 +885,11 @@ class PostgresOpsStore(OpsStore):
             )""",
             f"CREATE INDEX IF NOT EXISTS idx_ops_audit_ts ON {TABLE_AUDIT} (ts DESC)",
             f"CREATE INDEX IF NOT EXISTS idx_ops_audit_actor ON {TABLE_AUDIT} (actor, ts DESC)",
+            # The Audit section's action and workspace filters (a rare action
+            # or one of 3000 workspaces over 400 days must not walk the ts
+            # index row by row).
+            f"CREATE INDEX IF NOT EXISTS idx_ops_audit_action ON {TABLE_AUDIT} (action, ts DESC)",
+            f"CREATE INDEX IF NOT EXISTS idx_ops_audit_workspace ON {TABLE_AUDIT} (workspace, ts DESC)",
             f"""CREATE TABLE IF NOT EXISTS {TABLE_WORKERS} (
                 worker_id UUID PRIMARY KEY,
                 host VARCHAR(255) NOT NULL,
@@ -1599,6 +1663,7 @@ class PostgresOpsStore(OpsStore):
         return await self._read(
             f"""SELECT id, ts, actor, action, workspace, outcome FROM {TABLE_AUDIT}
             WHERE ts >= $1 AND ts < $2 AND phase = 'result'
+                AND action NOT IN {sql_in(AUDIT_READ_ACTIONS)}
             ORDER BY ts DESC LIMIT $3""",
             start,
             end,
@@ -2408,6 +2473,100 @@ class PostgresOpsStore(OpsStore):
             *_audit_values(row),
         )
         return int(rows[0]["id"])
+
+    async def audit_page(self, f, before, limit):
+        # Served by idx_ops_audit_ts (ts DESC), or by idx_ops_audit_actor,
+        # idx_ops_audit_action or idx_ops_audit_workspace ((col, ts DESC))
+        # when that column is filtered; ties on ts by id.
+        args: list[Any] = [f.start, f.end]
+        conditions = ["ts >= $1", "ts < $2"]
+        for column in ("actor", "action", "workspace", "phase"):
+            value = getattr(f, column)
+            if value is not None:
+                args.append(value)
+                conditions.append(f"{column} = ${len(args)}")
+        if before is not None:
+            args.extend(before)
+            conditions.append(f"(ts, id) < (${len(args) - 1}, ${len(args)})")
+        args.append(int(limit))
+        rows = await self._read(
+            f"""SELECT id, ts, actor, auth_kind, impersonated_by, action, workspace,
+                target, params, reason, phase, outcome, request_id
+            FROM {TABLE_AUDIT} WHERE {" AND ".join(conditions)}
+            ORDER BY ts DESC, id DESC LIMIT ${len(args)}""",
+            *args,
+        )
+        for row in rows:
+            row["params"] = self._decode(row.get("params")) or {}
+        return rows
+
+    # -- admin actions --------------------------------------------------------------
+    async def claim_action(self, key, holder, ttl_s, info):
+        value = json.dumps({**info, "holder": holder}, default=str)
+        # The database clock decides expiry, like the loop leases.
+        rows = await self._write(
+            f"""INSERT INTO {TABLE_KV} (key, value, updated_at)
+                VALUES ($1, $2::jsonb || jsonb_build_object(
+                    'exp', extract(epoch FROM clock_timestamp()) + $3::float8), now())
+                ON CONFLICT (key) DO UPDATE
+                SET value = EXCLUDED.value, updated_at = now()
+                WHERE COALESCE(({TABLE_KV}.value->>'exp')::float8, 0)
+                        < extract(epoch FROM clock_timestamp())
+                   OR {TABLE_KV}.value->>'holder' = $4::text
+                RETURNING key""",
+            key,
+            value,
+            float(ttl_s),
+            holder,
+        )
+        if rows:
+            return True, None
+        current = await self.kv_get(key, None)
+        return False, current if isinstance(current, dict) else None
+
+    async def release_action(self, key, holder):
+        await self._write(
+            f"DELETE FROM {TABLE_KV} WHERE key = $1 AND value->>'holder' = $2::text",
+            key,
+            holder,
+        )
+
+    async def rate_hit(self, key, limit, window_s, now):
+        rows = await self._write(
+            f"""INSERT INTO {TABLE_KV} (key, value, updated_at)
+                VALUES ($1, jsonb_build_object('start', $2::float8, 'n', 1), now())
+                ON CONFLICT (key) DO UPDATE
+                SET value = CASE
+                        WHEN COALESCE(({TABLE_KV}.value->>'start')::float8, 0)
+                             <= $2::float8 - $3::float8
+                        THEN jsonb_build_object('start', $2::float8, 'n', 1)
+                        ELSE jsonb_build_object(
+                            'start', ({TABLE_KV}.value->>'start')::float8,
+                            'n', COALESCE(({TABLE_KV}.value->>'n')::int, 0) + 1)
+                    END,
+                    updated_at = now()
+                RETURNING (value->>'n')::int AS n, (value->>'start')::float8 AS start""",
+            key,
+            float(now),
+            float(window_s),
+        )
+        n, start = int(rows[0]["n"]), float(rows[0]["start"])
+        return n <= limit, max(0.0, start + window_s - now)
+
+    async def kv_put_if_older(self, key, value, older_than):
+        rows = await self._write(
+            f"""INSERT INTO {TABLE_KV} (key, value, updated_at)
+                VALUES ($1, $2::jsonb, now())
+                ON CONFLICT (key) DO UPDATE
+                SET value = EXCLUDED.value, updated_at = now()
+                WHERE jsonb_typeof({TABLE_KV}.value) <> 'object'
+                   OR COALESCE(({TABLE_KV}.value->>'at')::float8, 0) <= $3::float8
+                RETURNING key""",
+            key,
+            json.dumps(value, default=str),
+            float(older_than),
+        )
+        return bool(rows)
 
     # -- logs ----------------------------------------------------------------------------
     async def logs_write(self, rows):
@@ -3663,7 +3822,9 @@ class MemoryOpsStore(OpsStore):
         rows = [
             dict(a)
             for a in self.audit_rows
-            if start <= a["ts"] < end and a.get("phase") == "result"
+            if start <= a["ts"] < end
+            and a.get("phase") == "result"
+            and a.get("action") not in AUDIT_READ_ACTIONS
         ]
         rows.sort(key=lambda a: a["ts"], reverse=True)
         return rows[:limit]
@@ -4311,6 +4472,65 @@ class MemoryOpsStore(OpsStore):
         )
         self.audit_rows[-1]["params"] = json.loads(self.audit_rows[-1]["params"])
         return audit_id
+
+    async def audit_page(self, f, before, limit):
+        self._check()
+        rows = []
+        for row in self.audit_rows:
+            ts = row["ts"]
+            if not (f.start <= ts < f.end):
+                continue
+            if any(
+                getattr(f, c) is not None and row.get(c) != getattr(f, c)
+                for c in ("actor", "action", "workspace", "phase")
+            ):
+                continue
+            if before is not None and (ts, int(row["id"])) >= before:
+                continue
+            rows.append(copy.deepcopy(row))
+        rows.sort(key=lambda r: (r["ts"], int(r["id"])), reverse=True)
+        return rows[:limit]
+
+    # -- admin actions ------------------------------------------------------------
+    async def claim_action(self, key, holder, ttl_s, info):
+        await self._write_gate()
+        now = self.clock()
+        current = self.kv.get(key)
+        if (
+            isinstance(current, dict)
+            and float(current.get("exp") or 0) >= now
+            and current.get("holder") != holder
+        ):
+            return False, copy.deepcopy(current)
+        self.kv[key] = json.loads(
+            json.dumps(
+                {**info, "holder": holder, "exp": now + float(ttl_s)}, default=str
+            )
+        )
+        return True, None
+
+    async def release_action(self, key, holder):
+        if (self.kv.get(key) or {}).get("holder") == holder:
+            self.kv.pop(key, None)
+
+    async def rate_hit(self, key, limit, window_s, now):
+        await self._write_gate()
+        current = self.kv.get(key)
+        if not isinstance(current, dict) or float(current.get("start") or 0) <= (
+            now - window_s
+        ):
+            current = {"start": float(now), "n": 0}
+        current = {"start": current["start"], "n": int(current.get("n") or 0) + 1}
+        self.kv[key] = current
+        return current["n"] <= limit, max(0.0, current["start"] + window_s - now)
+
+    async def kv_put_if_older(self, key, value, older_than):
+        await self._write_gate()
+        current = self.kv.get(key)
+        if isinstance(current, dict) and float(current.get("at") or 0) > older_than:
+            return False
+        self.kv[key] = json.loads(json.dumps(value, default=str))
+        return True
 
     # -- logs ----------------------------------------------------------------------------
     async def logs_write(self, rows):

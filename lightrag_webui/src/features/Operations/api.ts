@@ -1,6 +1,7 @@
 import { axiosInstance, toApiError } from '@/api/lightrag'
 import {
   normalizeActive,
+  normalizeAuditPage,
   normalizeDocument,
   normalizeDocuments,
   normalizeEmailQueue,
@@ -73,6 +74,8 @@ export type OpsFeatures = {
   gpu: boolean
   /** HTTP, embed/rerank and sign-in counters are recorded (OPS_METRICS_ENABLED). */
   metrics: boolean
+  /** Admin actions (cancel, run now, drain, release, reveal) are turned on (OPS_ACTIONS_ENABLED). */
+  actions: boolean
 }
 
 export type OpsStatus = {
@@ -894,6 +897,69 @@ async function postDownload(path: string, body: unknown, fallbackName: string): 
   return { filename, rows: Number.isFinite(rows) && rows >= 0 ? rows : null, auditId: headerOf(response.headers, 'x-ops-audit-id') }
 }
 
+// ---------- actions and audit (PR-7) ----------
+
+/** Who holds the workspace's action lease (`action:<ws>`, 60 s). */
+export type InProgressBy = { actor: string | null; action: string | null; since: string | null }
+
+/**
+ * What an action answered (§3.7). `result` is the outcome code
+ * (cancellation_requested, started, kicked, …); release-busy answers
+ * `released` with a `reason` when it refused. A dry run of "run" answers
+ * `would_process` without a result.
+ */
+export type ActionResponse = {
+  result?: string | null
+  released?: boolean | null
+  reason?: string | null
+  audit_id?: string | number | null
+  would_process?: WouldProcess | null
+  in_progress_by?: InProgressBy | string | null
+  /** release-busy: a "process again" request was queued before the release and is kept; offer Run now. */
+  run_now_offered?: boolean | null
+  /** The dry run's live flags: what a run now would meet. */
+  live?: { busy?: boolean | null; destructive_busy?: boolean | null; paused?: boolean | null; pause_retry_at?: string | null } | null
+  generated_at?: string
+}
+
+/**
+ * Q2 for one workspace: what a run would pick up. `failed` includes the user
+ * cancellations (a run retries both) and `cancelled` says how many those are;
+ * `in_flight` are docs an interrupted run left mid-pipeline.
+ */
+export type WouldProcess = { pending?: Num; failed?: Num; cancelled?: Num; in_flight?: Num }
+
+export type RevealKind = 'doc_file_path' | 'doc_error' | 'job_name'
+export type RevealResponse = { value: string | null; audit_id?: string | number | null }
+
+/** One LIGHTRAG_OPS_AUDIT row: an intent row before an action, a result row after it. */
+export type AuditRow = {
+  id: string
+  ts: string | null
+  actor: string | null
+  auth_kind?: string | null
+  impersonated_by?: string | null
+  action: string
+  workspace?: string | null
+  target?: string | null
+  reason?: string | null
+  /** intent | result */
+  phase?: string | null
+  outcome?: string | null
+  request_id?: string | null
+}
+
+/** A page of audit rows, newest first; offset pages (page/total) or keyset (`next_before`). */
+export type AuditPage = Generated & {
+  items: AuditRow[]
+  page: number | null
+  page_size: number | null
+  total: number | null
+  next_before: string | null
+}
+
+export type AuditFilters = { actor?: string; action?: string; from?: string; to?: string }
+
 // ---------- the client ----------
 
 const enc = encodeURIComponent
@@ -959,7 +1025,36 @@ export const opsApi = {
   perfTopWorkspaces: async (metric: TopMetric, window: PerfWindow, signal?: AbortSignal) =>
     normalizeTopWorkspaces(await get('/performance/top-workspaces', { metric, window }, signal), metric),
   /** Sign-in health: SSO callback errors, 401s and lockouts, outcomes only (FR-35). */
-  signin: async (window: '15m' | '24h', signal?: AbortSignal) => normalizeSignin(await get('/signin', { window }, signal), window)
+  signin: async (window: '15m' | '24h', signal?: AbortSignal) => normalizeSignin(await get('/signin', { window }, signal), window),
+  /**
+   * Admin actions (§3.9): each needs a reason, writes an intent audit row
+   * before acting and a result row after, and answers a result code. A
+   * refusal the server raises as an HTTP error (rate limit, not operator,
+   * audit unavailable) is thrown like any other error.
+   */
+  cancel: (ws: string, reason: string) => post<ActionResponse>(`/workspaces/${enc(ws)}/actions/cancel`, { reason }),
+  /** Starts a run in the background (it retries every pending and failed document). */
+  runNow: (ws: string, body: { reason: string; override_pause: boolean }) =>
+    post<ActionResponse>(`/workspaces/${enc(ws)}/actions/run`, { ...body, dry_run: false }),
+  /** The dry run: counts what a run would process (Q2 for this workspace) and the live flags; nothing starts, no reason needed. */
+  runPreview: (ws: string, signal?: AbortSignal) => post<ActionResponse>(`/workspaces/${enc(ws)}/actions/run`, { dry_run: true, override_pause: false }, signal),
+  drainEmail: (ws: string, reason: string) => post<ActionResponse>(`/workspaces/${enc(ws)}/actions/drain-email`, { reason }),
+  /** Gunicorn only, operator only; `confirm` is the workspace name as typed, the expected values are compared under the lock. */
+  releaseBusy: (ws: string, body: { reason: string; expected_run_id: string | null; expected_job_start: string | null; confirm: string }) =>
+    post<ActionResponse>(`/workspaces/${enc(ws)}/actions/release-busy`, body),
+  /**
+   * One field in clear (still secret- and email-redacted), audited, operator
+   * only. `id` is the document for doc fields; for the job name it is the run
+   * the page showed (the server refuses if the job changed since), or omitted.
+   */
+  reveal: async (body: { kind: RevealKind; workspace: string; id?: string | null; reason: string }): Promise<RevealResponse> => {
+    const data = (await post<Partial<RevealResponse>>('/reveal', body)) ?? {}
+    return { value: typeof data.value === 'string' ? data.value : null, audit_id: data.audit_id ?? null }
+  },
+  audit: async (params: Params, signal?: AbortSignal) => normalizeAuditPage(await get('/audit', params, signal)),
+  /** The audit rows for the filters as CSV (cells that start a formula are escaped on the server); audited itself. */
+  exportAudit: (body: { filters: AuditFilters; reason: string }) =>
+    postDownload('/audit/export', body, `ops-audit-${new Date().toISOString().slice(0, 10)}.csv`)
 }
 
 /** Pause counts as flat rows, whichever of the two server shapes arrives. */

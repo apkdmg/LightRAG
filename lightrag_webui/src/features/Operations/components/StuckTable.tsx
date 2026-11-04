@@ -1,10 +1,12 @@
 import { useTranslation } from 'react-i18next'
-import { useOpsNav } from '../context'
+import { OWNER_SUSPECT_STATES, actionsEnabled, stuckActionKinds } from '../actions'
+import { useOpsNav, useOpsShell } from '../context'
 import { fmtAge, fmtClock, shortId, utcTitle } from '../format'
 import { StuckRow, needsRestart, stuckWhy } from '../processing/stuck'
 import { runLookOf } from '../severity'
 import OpsLink from './OpsLink'
 import { StateIcon } from './StatusChip'
+import { RowActions } from './WorkspaceActions'
 
 /** The age a row's reason talks about: the owner's last beat, or the last progress. */
 const reasonAge = (row: StuckRow) => {
@@ -33,10 +35,13 @@ function Why({ row }: { row: StuckRow }) {
  * age and why. Rows link to the run, document or workspace drawer. Classes
  * that only a container restart clears today carry that guidance under the
  * reason. In single-process mode the multi-worker classes never appear.
+ * When actions are on, each row ends with a "⋯" menu (stuckActionKinds).
  */
-export default function StuckTable({ rows }: { rows: StuckRow[] }) {
+export default function StuckTable({ rows, onChanged }: { rows: StuckRow[]; onChanged?: () => void }) {
   const { t } = useTranslation()
   const nav = useOpsNav()
+  const { status } = useOpsShell()
+  const showActions = actionsEnabled(status)
   const col = (key: string) => t(`operations.stuck.col.${key}`)
   return (
     <div className="overflow-x-auto">
@@ -48,6 +53,11 @@ export default function StuckTable({ rows }: { rows: StuckRow[] }) {
             <th className="p-2 text-left font-medium">{col('what')}</th>
             <th className="p-2 text-right font-medium">{col('age')}</th>
             <th className="p-2 text-left font-medium">{col('why')}</th>
+            {showActions ? (
+              <th className="p-2 text-right font-medium">
+                <span className="sr-only">{col('actions')}</span>
+              </th>
+            ) : null}
           </tr>
         </thead>
         <tbody>
@@ -95,6 +105,17 @@ export default function StuckTable({ rows }: { rows: StuckRow[] }) {
                   <Why row={row} />
                   {needsRestart(row.cls) ? <div className="text-foreground mt-0.5 text-xs">{t('operations.stuck.restart')}</div> : null}
                 </td>
+                {showActions ? (
+                  <td className="p-2 text-right" data-label={col('actions')}>
+                    <RowActions
+                      workspace={row.workspace}
+                      kinds={stuckActionKinds(row)}
+                      ctx={{ busy: null, ownerSuspect: OWNER_SUSPECT_STATES.has(row.cls) }}
+                      onChanged={onChanged}
+                      onOpenWorkspace={() => nav.openDrawer({ kind: 'workspace', id: row.workspace })}
+                    />
+                  </td>
+                ) : null}
               </tr>
             )
           })}

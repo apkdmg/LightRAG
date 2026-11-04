@@ -406,7 +406,7 @@ def _may_assign_secret(lowered: str) -> bool:
     return False
 
 
-def _apply_rules(text: str) -> str:
+def _apply_rules(text: str, mask_paths: bool = True) -> str:
     lowered = text.lower()
     if ";base64," in lowered:
         text = _DATA_URI.sub("data:<redacted>", text)
@@ -436,7 +436,7 @@ def _apply_rules(text: str) -> str:
             text = _IC_NUMBER.sub("<ic>", text)
             text = _DIGIT_RUN.sub("<num>", text)
         text = _PHONE.sub("<phone>", text)
-    if _PATH_HINT.search(text):
+    if mask_paths and _PATH_HINT.search(text):
         if "'" in text or '"' in text or "`" in text:
             text = _QUOTED_FILE.sub(_mask_quoted_file, text)
         text = _mask_path_tokens(text)
@@ -451,8 +451,13 @@ def _cap_head(text: str, max_len: int) -> str:
     return text[:keep] + marker
 
 
-def redact(text: Any, max_len: int = MSG_MAX_CHARS) -> str:
-    """Redact one message and cap it at ``max_len`` characters (head kept)."""
+def redact(text: Any, max_len: int = MSG_MAX_CHARS, *, mask_paths: bool = True) -> str:
+    """Redact one message and cap it at ``max_len`` characters (head kept).
+
+    ``mask_paths=False`` keeps file names readable while every other rule
+    (secrets, emails, IC and phone numbers) still applies: only an audited
+    reveal of a document field uses it.
+    """
     if text is None:
         return ""
     if not isinstance(text, str):
@@ -463,7 +468,7 @@ def redact(text: Any, max_len: int = MSG_MAX_CHARS) -> str:
         text = text[: max_len * _PRECUT_FACTOR]
     if "\r" in text:
         text = _NEWLINES.sub("\n", text)
-    return _cap_head(_apply_rules(text), max_len)
+    return _cap_head(_apply_rules(text, mask_paths), max_len)
 
 
 def redact_traceback(text: Any, max_len: int = EXC_MAX_CHARS) -> str:

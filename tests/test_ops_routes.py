@@ -123,7 +123,9 @@ def test_status_payload_shape(monkeypatch):
         "heartbeats": False,
         "alerts": False,
         "insights": True,
+        "actions": False,
         "release_busy": False,
+        "audit": False,
         "gpu": False,
         "metrics": False,
     }

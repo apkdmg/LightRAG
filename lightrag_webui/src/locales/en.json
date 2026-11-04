@@ -1448,7 +1448,21 @@
       "feature_disabled": "This action is turned off on this server.",
       "probes_disabled": "Dependency probes are turned off on this server.",
       "not_checkable": "This dependency has no probe to run (it is read from real traffic, or not probed).",
-      "probe_failed": "The check could not be run. Try again; if it keeps failing, see the server log."
+      "probe_failed": "The check could not be run. Try again; if it keeps failing, see the server log.",
+      "audit_unavailable": "The audit log could not be written, so nothing was done. Try again; if it keeps failing, check Postgres.",
+      "admin_not_current": "Your admin rights are no longer current. Sign in again.",
+      "impersonation_not_allowed": "Actions are not allowed while you act as another user.",
+      "client_header_required": "The request did not come from the web app.",
+      "origin_not_allowed": "The request came from an origin the server does not trust.",
+      "invalid_reason": "Give a reason of 3 to 512 characters.",
+      "owner_unknown": "Refused: the server could not confirm that the owning worker is gone. Restart the container if the workspace stays stuck.",
+      "confirm_mismatch": "The typed name does not match the workspace.",
+      "invalid_kind": "The server does not accept this kind.",
+      "invalid_id": "The document ID is not valid.",
+      "invalid_workspace": "The workspace name is not valid.",
+      "workspace_not_served": "This server does not serve that workspace.",
+      "queue_unavailable": "The email queue could not be read on this server.",
+      "invalid_range": "The date range is not valid: the end must be after the start, and the range not too long."
     },
     "system": {
       "title": "This server",
@@ -1485,8 +1499,8 @@
     "later": {
       "note": "This section arrives in a later release.",
       "activity": {
-        "title": "Activity",
-        "body": "Alerts, the audit log of admin actions, system events and incident export will appear here."
+        "title": "Alerts and system events",
+        "body": "Alerts, system events and the incident export will appear here."
       }
     },
     "unavailableShort": "Not available: this view needs PostgreSQL KV storage (LIGHTRAG_KV_STORAGE=PGKVStorage).",
@@ -1789,7 +1803,8 @@
         "started": "Started",
         "elapsed": "Elapsed",
         "progress": "Progress",
-        "worker": "Worker"
+        "worker": "Worker",
+        "actions": "Actions"
       },
       "durableNote": "Runs in progress from run tracking, with their stage and owner process.",
       "noneDurable": "Nothing is running. Checked the run table at {{time}}.",
@@ -1832,7 +1847,8 @@
         "workspace": "Workspace",
         "what": "What",
         "age": "Age",
-        "why": "Why"
+        "why": "Why",
+        "actions": "Actions"
       },
       "noneClasses": "Nothing stuck. Checked {{list}} at {{time}}.",
       "noneCounted": "Nothing stuck. Checked doc status for {{workspaces}} workspaces and {{runs}} running runs ({{list}}) at {{time}}.",
@@ -2016,7 +2032,8 @@
         "attempts": "Attempts",
         "last": "Last result",
         "lastOk": "Last success",
-        "drains": "Last hour"
+        "drains": "Last hour",
+        "actions": "Actions"
       },
       "worker": "worker {{id}}",
       "backoffLeft": "backoff {{age}}",
@@ -3106,6 +3123,169 @@
         "share": "Relative to the first",
         "none": "No activity in this window."
       }
+    },
+    "actions": {
+      "groupLabel": "Actions for {{workspace}}",
+      "menuLabel": "Actions for {{workspace}}",
+      "openWorkspace": "Open workspace",
+      "button": {
+        "cancel": "Cancel…",
+        "release_busy": "Release busy…",
+        "run": "Run pipeline now…",
+        "drain_email": "Drain email…"
+      },
+      "hint": {
+        "notBusy": "The pipeline is not busy.",
+        "cancelling": "Cancellation was already requested.",
+        "destructive": "A deletion or clear is running in this workspace.",
+        "busy": "The pipeline is busy. It picks up new work when the current run ends.",
+        "noEmail": "Nothing is waiting in the email queue.",
+        "operatorOnly": "Only operators can release busy.",
+        "ownerAlive": "The worker that owns the run still reports in. Cancel the run, or restart the container if the worker is frozen."
+      },
+      "reason": "Reason",
+      "reasonPlaceholder": "Ticket number or why you are doing this",
+      "reasonHint": "3 to 512 characters. Recorded in the audit log with your name.",
+      "reasonShort": "Give at least 3 characters.",
+      "reasonLong": "Keep it to 512 characters.",
+      "typeToConfirm": "Type {{name}} to confirm",
+      "close": "Close",
+      "working": "Working…",
+      "auditRef": "audit {{id}}",
+      "runNowButton": "Run now…",
+      "inProgressBy": "{{actor}} is already acting on this workspace. Try again in a minute.",
+      "inProgressByAction": "{{actor}} is already acting on this workspace ({{action}}). Try again in a minute.",
+      "result": {
+        "cancellation_requested": "Cancellation requested. Documents already in parse or analyze finish that step; cancelled documents are retried by the next run.",
+        "started": "Run started.",
+        "request_pending": "A run is already going. It processes these documents when it ends.",
+        "kicked": "The drainer was asked to retry now.",
+        "started_local": "A drainer was started for this workspace.",
+        "released": "Busy released. New work can start.",
+        "releasedRunPending": "Busy released. A queued \"process again\" request was kept: run the pipeline now to pick it up.",
+        "revealed": "Revealed for 60 seconds.",
+        "not_busy": "Nothing to cancel: the pipeline is not busy.",
+        "nothing_pending": "Nothing is waiting in the email queue.",
+        "nothing_to_reveal": "This field is empty: there is nothing to reveal.",
+        "unknown": "Done (the server answered \"{{code}}\").",
+        "nothing_to_process": "Nothing to process: no pending or failed documents.",
+        "notBusyRelease": "The pipeline is not busy: there is nothing to release."
+      },
+      "cancel": {
+        "title": "Cancel processing in {{workspace}}",
+        "body": "Soft cancel. Documents already queued for parse or analyze still go through those steps. Cancelled documents become FAILED (\"User cancelled…\") and are retried automatically by the next run, including the email re-sync about every 70 minutes.",
+        "confirm": "Cancel processing",
+        "keep": "Keep running"
+      },
+      "run": {
+        "title": "Run pipeline now in {{workspace}}",
+        "body": "Retries every pending and failed document in {{workspace}}, user-cancelled ones included. It is refused while a provider pause is active, unless you tick \"override pause\".",
+        "confirm": "Run now",
+        "notNow": "Not now",
+        "previewTitle": "Dry run",
+        "preview": "Will process {{pending}} pending + {{failed}} failed (including {{cancelled}} user-cancelled) docs in {{workspace}}.",
+        "previewInterrupted_one": "Plus {{count}} document left mid-pipeline by an interrupted run.",
+        "previewInterrupted_other": "Plus {{count}} documents left mid-pipeline by an interrupted run.",
+        "previewNothing": "Nothing is waiting in {{workspace}}: a run would find no documents.",
+        "override": "Override pause",
+        "overrideHint": "Only after the provider limit was raised. Otherwise the run stops again at the first call.",
+        "overridePaused": "A provider pause is active. Without this the run is refused.",
+        "previewLoading": "Counting what a run would process…",
+        "previewFailed": "The dry run did not answer.",
+        "meets": {
+          "busy": "The pipeline is busy right now, so a run would be refused until it ends.",
+          "destructive": "A deletion or clear is running, so a run would be refused until it ends.",
+          "paused": "A provider pause is active: tick \"override pause\" to run anyway."
+        }
+      },
+      "drain": {
+        "title": "Drain the email queue for {{workspace}}",
+        "body_one": "Asks the drainer for {{count}} queued record to retry now. If the pipeline is busy it keeps retrying with backoff.",
+        "body_other": "Asks the drainer for {{count}} queued records to retry now. If the pipeline is busy it keeps retrying with backoff.",
+        "bodyUnknown": "Asks the drainer to retry this workspace's queued records now. If the pipeline is busy it keeps retrying with backoff.",
+        "limits": "At most once a minute per workspace. Unreadable (.bad) files are never touched.",
+        "confirm": "Drain now"
+      },
+      "release": {
+        "title": "Release busy in {{workspace}}",
+        "onlyGone": "Only for a worker that is gone.",
+        "ownerStopped": "Worker {{worker}} (pid {{pid}}) stopped reporting {{age}} ago.",
+        "ownerNoBeat": "Worker {{worker}} (pid {{pid}}) has no recorded heartbeat.",
+        "noOwner": "No owner is recorded for this busy flag, so the server cannot confirm its worker is gone and will refuse the release. Restart the container if the workspace stays stuck.",
+        "processGone": "Its process no longer exists.",
+        "body": "Releasing lets new work start; partial docs are retried; queued \"process again\" requests are kept.",
+        "frozen": "If the worker is alive but frozen, restart the container instead.",
+        "loading": "Reading the workspace's live state…",
+        "liveFailed": "The live state could not be read, so busy cannot be released safely. Close this and try again.",
+        "notBusy": "The pipeline is no longer busy: there is nothing to release.",
+        "confirm": "Release busy"
+      }
+    },
+    "reveal": {
+      "button": "Reveal…",
+      "title": {
+        "doc_file_path": "Reveal the file name",
+        "doc_error": "Reveal the error",
+        "job_name": "Reveal the job name"
+      },
+      "body": {
+        "doc_file_path": "Shows the real file name for this document. Secrets and emails stay masked. Recorded in the audit log.",
+        "doc_error": "Shows the full error for this document. Secrets and emails stay masked. Recorded in the audit log.",
+        "job_name": "Shows the real job name of the run in this workspace. Secrets and emails stay masked. Recorded in the audit log."
+      },
+      "hideNote": "Hidden again after {{seconds}} seconds unless you choose Keep visible.",
+      "confirm": "Reveal",
+      "hidesIn": "Hides in {{seconds}} s",
+      "kept": "Kept visible until you hide it or leave",
+      "keep": "Keep visible",
+      "hide": "Hide",
+      "notFound": "The value is gone: the document or the job changed since the page was drawn. Refresh and try again."
+    },
+    "audit": {
+      "title": "Audit",
+      "scope": "Console actions, reveals, exports and log searches, plus admin changes: impersonation, workspace deletion, owners, server providers and cross-workspace document changes.",
+      "filtersLabel": "Audit filters",
+      "filter": {
+        "actor": "Actor",
+        "action": "Action",
+        "from": "From",
+        "to": "To"
+      },
+      "actorPlaceholder": "Account name",
+      "actionPlaceholder": "Action name",
+      "apply": "Apply",
+      "clear": "Clear",
+      "rangeInvalid": "\"To\" is before \"From\".",
+      "allRows": "All rows",
+      "exportButton": "Export CSV…",
+      "empty": "No audit rows yet.",
+      "emptyFiltered": "No audit rows match these filters.",
+      "note": "Each action writes an intent row before it acts and a result row after. Without dates the last 30 days are shown (at most 400). Deleted workspaces show as a hash.",
+      "newest": "Newest",
+      "older": "Older",
+      "intent": "intent",
+      "col": {
+        "time": "Time",
+        "actor": "Actor",
+        "action": "Action",
+        "target": "Target",
+        "reason": "Reason",
+        "outcome": "Outcome",
+        "ref": "Ref"
+      },
+      "auth": {
+        "password": "password",
+        "sso": "SSO",
+        "api_key": "API key",
+        "token": "token",
+        "guest": "guest"
+      },
+      "export": {
+        "title": "Export the audit log",
+        "body": "Downloads the rows that match the current filters as CSV. Cells that would start a spreadsheet formula are escaped. The export and its reason are recorded in the audit log.",
+        "submit": "Export CSV"
+      },
+      "newer": "Newer"
     }
   }
 }

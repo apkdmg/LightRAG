@@ -16,6 +16,7 @@ from lightrag.api.dependencies import (
     require_admin,
     UserInfo,
 )
+from lightrag.api.ops.audit import admin_audit
 from lightrag.api.workspace_deletion import (
     WorkspaceBusyError,
     persisted_workspaces,
@@ -137,6 +138,7 @@ def create_admin_routes():
     async def create_workspace(
         request: CreateWorkspaceRequest,
         http_request: Request,
+        admin_user: UserInfo = Depends(require_admin),
         workspace_manager: WorkspaceManager = Depends(get_workspace_manager),
     ):
         """
@@ -151,9 +153,25 @@ def create_admin_routes():
         Returns:
             WorkspaceResponse: Information about the created workspace.
         """
-        try:
-            workspace_id = sanitize_workspace_id(request.username)
+        workspace_id = sanitize_workspace_id(request.username)
+        async with admin_audit(
+            http_request,
+            admin_user,
+            "workspace_create",
+            workspace=workspace_id,
+            target=workspace_id,
+        ):
+            return await _create_workspace(
+                request, http_request, workspace_id, workspace_manager
+            )
 
+    async def _create_workspace(
+        request: CreateWorkspaceRequest,
+        http_request: Request,
+        workspace_id: str,
+        workspace_manager: WorkspaceManager,
+    ) -> WorkspaceResponse:
+        try:
             # Check if workspace already exists
             persisted = await persisted_workspaces(http_request.app)
             existing = workspace_manager.get_workspace_info(
@@ -230,18 +248,31 @@ def create_admin_routes():
         logger.warning(
             f"Admin '{admin_user.username}' is deleting workspace '{sanitized_id}'"
         )
-        try:
-            result = await purge_app_workspace(request.app, sanitized_id)
-        except WorkspaceBusyError as e:
-            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
-        except ValueError as e:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
-        if not result.ok:
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail=f"Deleting workspace '{sanitized_id}' did not finish: "
-                + "; ".join(result.errors),
-            )
+        # The audit rows keep the workspace hashed once the purge has removed
+        # it (the ops deletion hook rewrites them), so the result row is
+        # written with the hash already.
+        async with admin_audit(
+            request,
+            admin_user,
+            "workspace_delete",
+            workspace=sanitized_id,
+            target=sanitized_id,
+        ) as audit:
+            try:
+                result = await purge_app_workspace(request.app, sanitized_id)
+            except WorkspaceBusyError as e:
+                raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
+            except ValueError as e:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)
+                )
+            if not result.ok:
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail=f"Deleting workspace '{sanitized_id}' did not finish: "
+                    + "; ".join(result.errors),
+                )
+            audit.forget_workspace()
 
         return DeleteWorkspaceResponse(
             status="success",
@@ -359,6 +390,7 @@ def create_admin_routes():
     )
     async def impersonate_user(
         workspace_id: str,
+        request: Request,
         admin_user: UserInfo = Depends(require_admin),
         workspace_manager: WorkspaceManager = Depends(get_workspace_manager),
     ):
@@ -376,9 +408,26 @@ def create_admin_routes():
         Returns:
             ImpersonationTokenResponse: Token for impersonation.
         """
-        try:
-            sanitized_id = sanitize_workspace_id(workspace_id)
+        sanitized_id = sanitize_workspace_id(workspace_id)
+        async with admin_audit(
+            request,
+            admin_user,
+            "impersonate",
+            workspace=sanitized_id,
+            target=sanitized_id,
+            params={"expires_in_hours": 1},
+        ):
+            return await _impersonate(
+                admin_user, workspace_id, sanitized_id, workspace_manager
+            )
 
+    async def _impersonate(
+        admin_user: UserInfo,
+        workspace_id: str,
+        sanitized_id: str,
+        workspace_manager: WorkspaceManager,
+    ) -> ImpersonationTokenResponse:
+        try:
             # Check if workspace exists
             workspace_info = workspace_manager.get_workspace_info(sanitized_id)
             if not workspace_info:
@@ -451,13 +500,22 @@ def create_admin_routes():
         """
         registry = _get_registry(request)
         sanitized_id = sanitize_workspace_id(workspace_id)
-        await registry.set_owner(sanitized_id, body.identity, body.email)
-        logger.warning(
-            f"Admin '{admin_user.username}' bound workspace '{sanitized_id}' "
-            f"to {body.identity}"
-        )
-        owner = await registry.get_by_workspace(sanitized_id)
-        return WorkspaceOwnerResponse(**vars(owner))
+        async with admin_audit(
+            request,
+            admin_user,
+            "owner_set",
+            workspace=sanitized_id,
+            target=sanitized_id,
+            # The identity kind only: never the subject or the email.
+            params={"identity_kind": body.identity.split(":", 1)[0]},
+        ):
+            await registry.set_owner(sanitized_id, body.identity, body.email)
+            logger.warning(
+                f"Admin '{admin_user.username}' bound workspace '{sanitized_id}' "
+                f"to {body.identity}"
+            )
+            owner = await registry.get_by_workspace(sanitized_id)
+            return WorkspaceOwnerResponse(**vars(owner))
 
     @router.delete("/workspaces/{workspace_id}/owner")
     async def release_workspace_owner(
@@ -469,15 +527,22 @@ def create_admin_routes():
         maps to this workspace ID will claim it, so use with care."""
         registry = _get_registry(request)
         sanitized_id = sanitize_workspace_id(workspace_id)
-        if not await registry.release(sanitized_id):
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"No owner recorded for workspace: {sanitized_id}",
+        async with admin_audit(
+            request,
+            admin_user,
+            "owner_release",
+            workspace=sanitized_id,
+            target=sanitized_id,
+        ):
+            if not await registry.release(sanitized_id):
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail=f"No owner recorded for workspace: {sanitized_id}",
+                )
+            logger.warning(
+                f"Admin '{admin_user.username}' released ownership of '{sanitized_id}'"
             )
-        logger.warning(
-            f"Admin '{admin_user.username}' released ownership of '{sanitized_id}'"
-        )
-        return {"status": "success", "workspace_id": sanitized_id}
+            return {"status": "success", "workspace_id": sanitized_id}
 
     @router.get(
         "/status",

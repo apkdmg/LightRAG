@@ -45,6 +45,7 @@ from lightrag.utils import (
     move_file_to_parsed_dir,
 )
 from lightrag.api.ops import runs as ops_runs
+from lightrag.api.ops.audit import AuditedDocumentsRoute
 from lightrag.api.ops.context import bind_log_workspace
 from lightrag.api.ops.redact import mask_path, mask_pipeline_paths
 from lightrag.api.utils_api import get_combined_auth_dependency
@@ -2327,7 +2328,7 @@ async def _run_scanning_process(
                 ):
                     # File is already PROCESSED, skip it with warning and archive it.
                     processed_files.append(filename)
-                    warning = f"Skipping already processed file: " f"{filename}"
+                    warning = f"Skipping already processed file: {filename}"
                     await record_scan_warning(rag, warning)
                     try:
                         await move_file_to_parsed_dir(file_path)
@@ -2712,6 +2713,9 @@ def create_document_routes(
     router = APIRouter(
         prefix="/documents",
         tags=["documents"],
+        # Writes the result audit row of an admin's cross-workspace mutation
+        # (the intent row is written where the workspace is resolved).
+        route_class=AuditedDocumentsRoute,
     )
 
     # Create combined auth dependency for document routes

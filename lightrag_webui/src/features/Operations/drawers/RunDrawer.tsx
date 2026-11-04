@@ -2,6 +2,7 @@ import { useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { Kv } from '@/features/TokenInsights/ui'
 import { DocFailure, OpsRun, opsApi } from '../api'
+import { OWNER_SUSPECT_STATES } from '../actions'
 import ErrorPanel from '../components/ErrorPanel'
 import LogSection from '../components/LogSection'
 import { StaleChip } from '../components/Panel'
@@ -9,6 +10,7 @@ import ProgressBar from '../components/ProgressBar'
 import { RunStateLabel } from '../components/RunState'
 import Skeleton from '../components/Skeleton'
 import { ToneChip } from '../components/StatusChip'
+import { WorkspaceActionBar } from '../components/WorkspaceActions'
 import { useOpsNav, useOpsShell } from '../context'
 import { fmtAge, fmtClock, fmtCount, shortId, utcTitle } from '../format'
 import { useStale } from '../hooks'
@@ -198,10 +200,11 @@ export function RunFailures({ failures, workspace }: { failures: DocFailure[]; w
 }
 
 /**
- * The Run drawer (§2.9, flows 1 to 3), read-only: the run's state with its
+ * The Run drawer (§2.9, flows 1 to 3): the run's state with its
  * plain-language explanation, where and what it is, its owner process (a
  * link to the Worker drawer), progress, outcome, "what to do" for a hung,
- * unresponsive, orphaned or paused run, and the documents that failed in it.
+ * unresponsive, orphaned or paused run, Cancel and Release busy while it
+ * holds its workspace, and the documents that failed in it.
  * URL-addressable as `orun=<run_id>`; drilling to a workspace, worker or
  * document pushes onto the breadcrumb.
  */
@@ -227,6 +230,15 @@ export default function RunDrawer({ runId }: { runId: string }) {
       {run ? (
         <div className={stale ? 'ops-stale flex flex-col gap-4' : 'flex flex-col gap-4'}>
           <RunSummary run={run} now={poll.updatedAt} stale={stale} multiWorker={isMultiWorker(status?.process.mode)} />
+          {run.status === 'running' || run.status === 'orphaned' ? (
+            // A run that still holds its workspace: cancel it, or release busy when its owner is gone (flow 2).
+            <WorkspaceActionBar
+              workspace={run.workspace}
+              kinds={['cancel', 'release_busy']}
+              ctx={{ busy: null, ownerSuspect: OWNER_SUSPECT_STATES.has(run.state) || run.worker_alive === false }}
+              onChanged={poll.reload}
+            />
+          ) : null}
           <RunFailures failures={poll.data?.failures ?? []} workspace={run.workspace} />
           <LogSection
             title={typeof poll.data?.log_count === 'number' ? t('operations.runDrawer.logs', { count: poll.data.log_count }) : t('operations.runDrawer.logsTitle')}

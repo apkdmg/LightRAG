@@ -1891,3 +1891,252 @@ def snapshot_namespace(
         else:
             out[key] = _snapshot_value(value)
     return out
+
+
+# ---------------------------------------------------------------------------
+# Bounded namespace lock (admin Operations console actions)
+#
+# ``get_namespace_lock`` waits forever, and under Gunicorn it blocks the event
+# loop on the Manager lock. A lock held by a dead worker therefore hangs every
+# request that touches it. Admin actions use ``try_acquire_namespace_lock``
+# instead: it gives up after ``timeout`` seconds and never blocks the event
+# loop on the Manager. It is the same lock as ``get_namespace_lock`` (same
+# per-process async gate, same Manager lock), so it serialises with the
+# pipeline exactly like ``async with get_namespace_lock(...)`` does.
+#
+# Hold it for the shortest possible time and never across awaited I/O.
+# ---------------------------------------------------------------------------
+
+_TRY_LOCK_KEY = "default_key"
+# Manager round trips that take longer than the timeout itself: the attempt
+# is abandoned, and a lock acquired after that is released by a callback.
+_TRY_LOCK_GRACE_S = 1.0
+_try_lock_executor = None
+_try_lock_executor_pid: Optional[int] = None
+
+
+def _try_lock_pool():
+    """Threads for blocking Manager lock calls (never the default executor)."""
+    global _try_lock_executor, _try_lock_executor_pid
+    from concurrent.futures import ThreadPoolExecutor
+
+    pid = os.getpid()
+    if _try_lock_executor is None or _try_lock_executor_pid != pid:
+        # A forked child must not reuse its parent's (threadless) executor.
+        _try_lock_executor = ThreadPoolExecutor(
+            max_workers=2, thread_name_prefix="ns-lock-try"
+        )
+        _try_lock_executor_pid = pid
+    return _try_lock_executor
+
+
+async def _acquire_async_within(lock: asyncio.Lock, timeout: float) -> bool:
+    """Acquire an asyncio lock within ``timeout`` seconds; never leaks it.
+
+    ``asyncio.wait_for(lock.acquire(), ...)`` can, on some Python versions,
+    lose an acquisition that completes while the timeout fires. Here the
+    acquire runs as its own task: after a timeout it is cancelled, and if it
+    won the race anyway the lock is released again.
+    """
+    if timeout <= 0:
+        if lock.locked():
+            return False
+        timeout = 0.001
+    task = asyncio.ensure_future(lock.acquire())
+    try:
+        done, _ = await asyncio.wait({task}, timeout=timeout)
+    except BaseException:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        if task.done() and not task.cancelled() and task.exception() is None:
+            lock.release()
+        raise
+    if done:
+        return bool(task.result())
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+    if not task.cancelled() and task.exception() is None:
+        lock.release()
+    return False
+
+
+class NamespaceLockAttempt:
+    """Result of :func:`try_acquire_namespace_lock`; an async context manager.
+
+    ``acquired`` (also the object's truth value) says whether the lock is
+    held inside the ``async with`` block. When it is False nothing is held
+    and the block must not touch the namespace. ``waited_s`` is how long the
+    attempt took.
+    """
+
+    def __init__(self, namespace: str, workspace: str | None, timeout: float):
+        self._namespace = namespace
+        self._workspace = workspace
+        self._timeout = max(0.0, float(timeout))
+        self._final_namespace: Optional[str] = None
+        self._async_lock: Optional[asyncio.Lock] = None
+        self._raw = None
+        self._gate_held = False
+        self._raw_held = False
+        self._ref_taken = False
+        self.acquired = False
+        self.waited_s = 0.0
+
+    def __bool__(self) -> bool:
+        return self.acquired
+
+    async def __aenter__(self) -> "NamespaceLockAttempt":
+        if self._final_namespace is not None:
+            raise RuntimeError("NamespaceLockAttempt is not reusable")
+        if _storage_keyed_lock is None:
+            raise RuntimeError("Shared-Data is not initialized")
+        self._final_namespace = get_final_namespace(self._namespace, self._workspace)
+        started = time.monotonic()
+        try:
+            await self._acquire(started)
+        except BaseException:
+            await self._release()
+            raise
+        finally:
+            self.waited_s = time.monotonic() - started
+        if not self.acquired:
+            await self._release()
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        if self.acquired:
+            await self._release()
+
+    async def _acquire(self, started: float) -> None:
+        parent = _storage_keyed_lock
+        combined_key = _get_combined_key(self._final_namespace, _TRY_LOCK_KEY)
+        # The per-process gate (the whole lock in single-process mode).
+        self._async_lock = parent._get_or_create_async_lock(combined_key)
+        self._ref_taken = True
+        if not await _acquire_async_within(self._async_lock, self._timeout):
+            return
+        self._gate_held = True
+        if not _is_multiprocess:
+            self.acquired = True
+            inc_debug_n_locks_acquired()
+            return
+        remaining = self._timeout - (time.monotonic() - started)
+        if remaining <= 0:
+            return
+        namespace = self._final_namespace
+
+        def acquire_raw():
+            # Both calls are Manager round trips: off the event loop.
+            raw = _get_or_create_shared_raw_mp_lock(namespace, _TRY_LOCK_KEY)
+            try:
+                got = bool(raw.acquire(timeout=remaining))
+            except BaseException:
+                _release_shared_raw_mp_lock(namespace, _TRY_LOCK_KEY)
+                raise
+            return raw, got
+
+        loop = asyncio.get_running_loop()
+        future = _try_lock_pool().submit(acquire_raw)
+        try:
+            raw, got = await asyncio.wait_for(
+                asyncio.wrap_future(future, loop=loop),
+                timeout=remaining + _TRY_LOCK_GRACE_S,
+            )
+        except (asyncio.TimeoutError, asyncio.CancelledError) as e:
+            # The Manager did not answer in time: clean up whatever the thread
+            # ends up holding once it returns.
+            future.add_done_callback(_abandoned_raw_attempt(namespace))
+            if isinstance(e, asyncio.CancelledError):
+                raise
+            return
+        self._raw = raw
+        if not got:
+            _release_shared_raw_mp_lock(namespace, _TRY_LOCK_KEY)
+            return
+        self._raw_held = True
+        self.acquired = True
+        inc_debug_n_locks_acquired()
+
+    async def _release(self) -> None:
+        namespace = self._final_namespace
+        if self._raw_held:
+            self._raw_held = False
+            try:
+                self._raw.release()
+            finally:
+                try:
+                    _release_shared_raw_mp_lock(namespace, _TRY_LOCK_KEY)
+                except Exception as e:
+                    direct_log(
+                        f"Bounded lock reference release failed for {namespace}: {e}",
+                        level="ERROR",
+                    )
+        if self._gate_held:
+            self._gate_held = False
+            self._async_lock.release()
+        if self.acquired:
+            self.acquired = False
+            dec_debug_n_locks_acquired()
+        if self._ref_taken:
+            self._ref_taken = False
+            _storage_keyed_lock._release_async_lock(
+                _get_combined_key(namespace, _TRY_LOCK_KEY)
+            )
+
+
+def _abandoned_raw_attempt(namespace: str):
+    def cleanup(future) -> None:
+        try:
+            raw, got = future.result()
+        except BaseException:
+            return  # the thread already dropped its reference
+        try:
+            if got:
+                raw.release()
+        except Exception as e:
+            direct_log(
+                f"Releasing an abandoned bounded lock on {namespace} failed: {e}",
+                level="ERROR",
+            )
+        finally:
+            try:
+                _release_shared_raw_mp_lock(namespace, _TRY_LOCK_KEY)
+            except Exception:
+                pass
+
+    return cleanup
+
+
+def try_acquire_namespace_lock(
+    namespace: str, workspace: str | None = None, timeout: float = 2.0
+) -> NamespaceLockAttempt:
+    """The namespace lock, or nothing, within ``timeout`` seconds.
+
+    Usage::
+
+        async with try_acquire_namespace_lock("pipeline_status", ws) as lock:
+            if not lock.acquired:
+                ...  # report "lock unavailable"; nothing is held
+            else:
+                ...  # short critical section, no awaited I/O
+
+    Never waits longer than ``timeout`` (plus one second of grace for a slow
+    Manager under Gunicorn), never blocks the event loop on the Manager, and
+    works in single-process (asyncio lock) and multi-process (Manager lock)
+    mode. A cancelled or failed attempt holds nothing afterwards.
+    """
+    return NamespaceLockAttempt(namespace, workspace, timeout)
+
+
+def existing_namespace_data(
+    namespace: str, workspace: str | None = None
+) -> Optional[Dict[str, Any]]:
+    """The live data of an existing namespace, or None; never creates one.
+
+    Unlike :func:`get_namespace_data` it takes no internal lock. Mutate the
+    result only while holding the namespace lock (for example from
+    :func:`try_acquire_namespace_lock`).
+    """
+    if _shared_dicts is None:
+        return None
+    return _shared_dicts.get(get_final_namespace(namespace, workspace))

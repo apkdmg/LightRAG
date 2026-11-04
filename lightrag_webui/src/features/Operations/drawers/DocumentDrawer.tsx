@@ -3,6 +3,7 @@ import { Kv } from '@/features/TokenInsights/ui'
 import { LogEntry, opsApi } from '../api'
 import ErrorPanel from '../components/ErrorPanel'
 import LogSection from '../components/LogSection'
+import MaskedValue from '../components/MaskedValue'
 import { StaleChip } from '../components/Panel'
 import Skeleton from '../components/Skeleton'
 import StageTimeline from '../components/StageTimeline'
@@ -35,8 +36,8 @@ const DETAIL_SECONDS = 15
  * to 50 LLM calls for this doc, and its WARNING+ log lines (from the
  * drawer's own answer when the server includes them, else one doc_id
  * query). Runs open the Run drawer on the breadcrumb.
- * The file name stays masked; revealing it is an audited action of a later
- * release.
+ * The file name and error stay masked; an operator may reveal one of them
+ * for 60 s with a reason (audited, still secret- and email-redacted).
  */
 export default function DocumentDrawer({ workspace, docId }: { workspace: string; docId: string }) {
   const { t } = useTranslation()
@@ -55,7 +56,13 @@ export default function DocumentDrawer({ workspace, docId }: { workspace: string
   return (
     <>
       <div className="flex flex-col gap-1">
-        <p className="m-0 font-mono text-sm break-all">{doc?.file_path_masked || shortId(docId, 24)}</p>
+        {doc?.file_path_masked ? (
+          <MaskedValue kind="doc_file_path" workspace={workspace} id={docId}>
+            <span className="font-mono text-sm break-all">{doc.file_path_masked}</span>
+          </MaskedValue>
+        ) : (
+          <p className="m-0 font-mono text-sm break-all">{shortId(docId, 24)}</p>
+        )}
         <p className="text-muted-foreground m-0 text-xs break-all">
           {t('operations.document.path', { workspace, id: shortId(docId, 16) })}
           {!inStack ? (
@@ -140,7 +147,9 @@ export default function DocumentDrawer({ workspace, docId }: { workspace: string
           </Section>
           {doc.error_redacted ? (
             <Section title={t('operations.document.error')}>
-              <p className="bg-muted/40 m-0 rounded-lg border px-2.5 py-2 font-mono text-xs break-words whitespace-pre-wrap">{doc.error_redacted}</p>
+              <MaskedValue kind="doc_error" workspace={workspace} id={docId} block>
+                <p className="bg-muted/40 m-0 w-full rounded-lg border px-2.5 py-2 font-mono text-xs break-words whitespace-pre-wrap">{doc.error_redacted}</p>
+              </MaskedValue>
             </Section>
           ) : null}
           <Section title={t('operations.document.failures')}>

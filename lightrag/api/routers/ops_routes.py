@@ -36,7 +36,14 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from lightrag.api.dependencies import UserInfo, require_admin
 from lightrag.api.ops import log_sink as ops_log_sink
 from lightrag.api.ops import logs as ops_logs
-from lightrag.api.ops.audit import SearchAudit, filters_digest, write_audit
+from lightrag.api.ops import actions as ops_actions
+from lightrag.api.ops.audit import (
+    SearchAudit,
+    audit_csv,
+    audit_view,
+    filters_digest,
+    write_audit,
+)
 from lightrag.api.ops.auth import (
     is_operator,
     require_live_admin,
@@ -65,7 +72,7 @@ from lightrag.api.ops.perf import PerfBadRequest
 from lightrag.api.ops.probes import SMTP_TEST_INTERVAL_S, recheck_limit
 from lightrag.api.ops.redact import redact, sanitize_config
 from lightrag.api.ops.snapshot import NamespaceReader
-from lightrag.api.ops.store import BACKLOG_STATUSES, Page
+from lightrag.api.ops.store import BACKLOG_STATUSES, AuditFilter, Page
 from lightrag.kg import shared_storage
 
 logger = logging.getLogger("lightrag.api.ops")
@@ -379,6 +386,7 @@ async def status(
     heartbeat_live = await service.live_workers()
     if heartbeat_live is not None:
         workers_live = heartbeat_live
+    actions_on = ops_actions.actions_enabled()
     payload: dict[str, Any] = {
         "generated_at": _generated_at(),
         "available": available,
@@ -392,7 +400,13 @@ async def status(
             "heartbeats": service.heartbeat is not None,
             "alerts": False,
             "insights": getattr(request.app.state, "insights", None) is not None,
-            "release_busy": False,
+            # Admin actions and the audited reveal (OPS_ACTIONS_ENABLED);
+            # releasing a stale busy slot only exists under Gunicorn, and
+            # needs run tracking: without owner keys no owner can be
+            # confirmed dead.
+            "actions": actions_on,
+            "release_busy": actions_on and mode == "gunicorn" and service.durable_runs,
+            "audit": service.available,
             "gpu": False,
             # HTTP, embed/rerank and sign-in metrics recorded in this worker.
             "metrics": getattr(getattr(request.app.state, "ops", None), "metrics", None)
@@ -890,6 +904,24 @@ class LogExportRequest(BaseModel):
     limit: int = Field(ops_logs.EXPORT_MAX, ge=1, le=ops_logs.EXPORT_MAX)
 
 
+async def _export_retry_after(service: OpsService, actor: str) -> Optional[float]:
+    """None when this export may go ahead, else seconds to wait.
+
+    Counted host-wide in the ops KV (like the actions' limit), so N Gunicorn
+    workers still allow 5 exports a minute per actor; the in-process count
+    is the fallback when the store cannot be reached.
+    """
+    key = (actor or "-").strip().lower()
+    try:
+        allowed, retry_after = await service.store.rate_hit(
+            f"ratelimit:export:{key}", _EXPORTS_PER_MINUTE, 60.0, time.time()
+        )
+    except Exception as e:
+        logger.warning("Ops export rate limit unavailable (%s)", type(e).__name__)
+        return None if _export_allowed(key) else 60.0
+    return None if allowed else max(1.0, retry_after)
+
+
 def _export_allowed(actor: str) -> bool:
     now = time.monotonic()
     with _export_lock:
@@ -924,8 +956,9 @@ async def log_export(
     service = _service(request)
     if not service.available:
         return _err(503, "data_unavailable")
-    if not _export_allowed(user.username):
-        return _rate_limited(60)
+    retry_after = await _export_retry_after(service, user.username)
+    if retry_after is not None:
+        return _rate_limited(retry_after)
     try:
         f = ops_logs.parse_filter(
             {str(k): None if v is None else str(v) for k, v in body.filters.items()}
@@ -1307,5 +1340,389 @@ async def signin(
             "lockouts": 0,
             "last_15m": None,
             "series": [],
+        },
+    )
+
+
+# -- Admin actions and the audited reveal (OPS_ACTIONS_ENABLED) ----------------------
+
+
+async def require_actions_enabled() -> None:
+    """Without ``OPS_ACTIONS_ENABLED`` the action routes do not exist (404)."""
+    if not ops_actions.actions_enabled():
+        raise StarletteHTTPException(404, "not_found")
+
+
+# Flag first (a disabled feature is not found for anyone), then the POST guards.
+_ACTION_GUARDS = [Depends(require_actions_enabled), *_POST_GUARDS]
+
+
+class ActionRequest(BaseModel):
+    reason: str = Field(..., min_length=3, max_length=512)
+
+
+class RunRequest(BaseModel):
+    # Optional for the dry run (a preview changes nothing); required to run.
+    reason: Optional[str] = Field(None, max_length=512)
+    dry_run: bool = False
+    override_pause: bool = False
+
+
+class ReleaseBusyRequest(ActionRequest):
+    expected_run_id: Optional[str] = Field(None, max_length=64)
+    expected_job_start: Optional[str] = Field(None, max_length=64)
+    # The workspace name, typed by the operator.
+    confirm: str = Field(..., min_length=1, max_length=255)
+
+
+class RevealRequest(ActionRequest):
+    kind: str = Field(..., max_length=32)
+    workspace: str = Field(..., min_length=1, max_length=255)
+    id: Optional[str] = Field(None, max_length=255)
+
+
+def _actions(request: Request) -> ops_actions.OpsActions:
+    service = _service(request)
+    actions = getattr(service, "actions", None)
+    if not isinstance(actions, ops_actions.OpsActions):
+        actions = service.actions = ops_actions.OpsActions(service)
+    return actions
+
+
+async def _act(call: Callable[[], Any]) -> Any:
+    """Run one action and map its refusals to the ops error shape."""
+    try:
+        body = await call()
+    except ops_actions.ActionRefused as e:
+        if e.status == 429:
+            return _rate_limited(e.retry_after or 60)
+        return _err(e.status, e.code)
+    except OpsBadRequest as e:
+        return _err(400, e.code)
+    except OpsNotFound:
+        return _err(404, "not_found")
+    except OpsDataUnavailable:
+        return _err(503, "data_unavailable")
+    return {"generated_at": _generated_at(), **body}
+
+
+@router.post("/workspaces/{ws}/actions/cancel", dependencies=_ACTION_GUARDS)
+async def action_cancel(
+    request: Request,
+    ws: str,
+    body: ActionRequest = Body(...),
+    user: UserInfo = Depends(require_live_admin),
+) -> Any:
+    """Soft cancel of the running pipeline (no-op when it is not busy)."""
+    actions = _actions(request)
+
+    async def call() -> dict[str, Any]:
+        action = ops_actions.build_call(
+            user=user,
+            request=request,
+            action="cancel",
+            workspace=ws,
+            reason=body.reason,
+        )
+        return await actions.cancel(action)
+
+    return await _act(call)
+
+
+@router.post("/workspaces/{ws}/actions/run", dependencies=_ACTION_GUARDS)
+async def action_run(
+    request: Request,
+    ws: str,
+    body: RunRequest = Body(...),
+    user: UserInfo = Depends(require_live_admin),
+) -> Any:
+    """Run the pipeline now for one workspace; ``dry_run`` returns what it
+    would process (pending, failed incl. user-cancelled) and changes nothing."""
+    actions = _actions(request)
+
+    async def call() -> dict[str, Any]:
+        if body.dry_run:
+            try:
+                validate_workspace(ws)
+            except OpsBadRequest:
+                raise ops_actions.ActionRefused(400, "invalid_workspace")
+            return await actions.run_preview(ws)
+        action = ops_actions.build_call(
+            user=user,
+            request=request,
+            action="run",
+            workspace=ws,
+            reason=body.reason,
+            params={"override_pause": body.override_pause},
+        )
+        return await actions.run(action, body.override_pause)
+
+    return await _act(call)
+
+
+@router.post("/workspaces/{ws}/actions/drain-email", dependencies=_ACTION_GUARDS)
+async def action_drain_email(
+    request: Request,
+    ws: str,
+    body: ActionRequest = Body(...),
+    user: UserInfo = Depends(require_live_admin),
+) -> Any:
+    """Ask the email re-sync drainer to retry now (once a minute per workspace)."""
+    actions = _actions(request)
+
+    async def call() -> dict[str, Any]:
+        action = ops_actions.build_call(
+            user=user,
+            request=request,
+            action="drain_email",
+            workspace=ws,
+            reason=body.reason,
+        )
+        return await actions.drain_email(action)
+
+    return await _act(call)
+
+
+@router.post(
+    "/workspaces/{ws}/actions/release-busy",
+    dependencies=[*_ACTION_GUARDS, Depends(require_operator)],
+)
+async def action_release_busy(
+    request: Request,
+    ws: str,
+    body: ReleaseBusyRequest = Body(...),
+    user: UserInfo = Depends(require_live_admin),
+) -> Any:
+    """Release the busy slot of a dead worker (operator, Gunicorn only, typed
+    workspace name, compare-and-set on the run and its start time)."""
+    actions = _actions(request)
+
+    async def call() -> dict[str, Any]:
+        if body.confirm.strip() != ws:
+            raise ops_actions.ActionRefused(400, "confirm_mismatch")
+        action = ops_actions.build_call(
+            user=user,
+            request=request,
+            action="release_busy",
+            workspace=ws,
+            reason=body.reason,
+            params={
+                "expected_run_id": body.expected_run_id,
+                "expected_job_start": body.expected_job_start,
+            },
+        )
+        return await actions.release_busy(
+            action,
+            mode=process_mode(),
+            expected_run_id=body.expected_run_id,
+            expected_job_start=body.expected_job_start,
+        )
+
+    return await _act(call)
+
+
+@router.post("/reveal", dependencies=[*_ACTION_GUARDS, Depends(require_operator)])
+async def reveal(
+    request: Request,
+    body: RevealRequest = Body(...),
+    user: UserInfo = Depends(require_live_admin),
+) -> Any:
+    """One document field (file name, error) or the live job name, unmasked
+    but still secret-redacted (operator, reason, audited)."""
+    actions = _actions(request)
+
+    async def call() -> dict[str, Any]:
+        if body.kind not in ops_actions.REVEAL_KINDS:
+            raise ops_actions.ActionRefused(400, "invalid_kind")
+        action = ops_actions.build_call(
+            user=user,
+            request=request,
+            action="reveal",
+            workspace=body.workspace,
+            reason=body.reason,
+            params={"kind": body.kind, "id": body.id},
+            target=body.id or body.workspace,
+        )
+        return await actions.reveal(action, body.kind, body.id)
+
+    return await _act(call)
+
+
+# -- Audit (Activity tab) -------------------------------------------------------------
+
+AUDIT_DEFAULT_DAYS = 30
+AUDIT_MAX_DAYS = 400
+AUDIT_PAGE_DEFAULT = 50
+AUDIT_PAGE_MAX = 200
+AUDIT_EXPORT_MAX = 10000
+_AUDIT_PHASES = ("intent", "result")
+
+
+def _audit_filter(values: dict[str, Any]) -> AuditFilter:
+    now = datetime.now(timezone.utc)
+    end = _parse_time(values.get("to"), now)
+    start = _parse_time(values.get("from"), end - timedelta(days=AUDIT_DEFAULT_DAYS))
+    if end <= start or end - start > timedelta(days=AUDIT_MAX_DAYS):
+        raise OpsBadRequest("invalid_range")
+    phase = values.get("phase") or None
+    if phase is not None and phase not in _AUDIT_PHASES:
+        raise OpsBadRequest("invalid_phase")
+    out: dict[str, Any] = {"start": start, "end": end, "phase": phase}
+    for name, limit in (("actor", 255), ("action", 48), ("workspace", 255)):
+        value = values.get(name)
+        if value is None or value == "":
+            continue
+        value = str(value).strip()
+        if not value or len(value) > limit:
+            raise OpsBadRequest(f"invalid_{name}")
+        out[name] = value
+    return AuditFilter(**out)
+
+
+def _audit_cursor(item: dict[str, Any]) -> str:
+    return f"{item['ts']},{item['id']}"
+
+
+@router.get("/audit")
+async def audit(
+    request: Request,
+    actor: Optional[str] = Query(None, max_length=255),
+    action: Optional[str] = Query(None, max_length=48),
+    workspace: Optional[str] = Query(None, max_length=255),
+    phase: Optional[str] = Query(None, max_length=8),
+    from_: Optional[str] = Query(None, alias="from", max_length=40),
+    to: Optional[str] = Query(None, max_length=40),
+    before: Optional[str] = Query(None, max_length=80),
+    limit: int = Query(AUDIT_PAGE_DEFAULT, ge=1, le=AUDIT_PAGE_MAX),
+) -> dict[str, Any]:
+    """Audit rows (console actions, reveals, exports, searches and the
+    existing admin mutations), newest first on the ``(ts, id)`` keyset;
+    ``next_before`` pages back. Default window 30 days, at most 400."""
+    service = _service(request)
+
+    async def call() -> dict[str, Any]:
+        f = _audit_filter(
+            {
+                "actor": actor,
+                "action": action,
+                "workspace": workspace,
+                "phase": phase,
+                "from": from_,
+                "to": to,
+            }
+        )
+        cursor = ops_logs.parse_before(before)
+        rows = await service._q(lambda: service.store.audit_page(f, cursor, limit + 1))
+        items = [audit_view(r) for r in rows[:limit]]
+        return {
+            "items": items,
+            "next_before": _audit_cursor(items[-1]) if len(rows) > limit else None,
+            "limit": limit,
+            "from": f.start.isoformat(),
+            "to": f.end.isoformat(),
+        }
+
+    return await _answer(
+        service,
+        call,
+        {"items": [], "next_before": None, "limit": limit},
+        needs_docs=False,
+    )
+
+
+class AuditExportRequest(BaseModel):
+    filters: dict[str, Any] = Field(default_factory=dict)
+    reason: str = Field(..., min_length=3, max_length=512)
+
+
+@router.post(
+    "/audit/export",
+    dependencies=[*_POST_GUARDS, Depends(require_operator)],
+)
+async def audit_export(
+    request: Request,
+    body: AuditExportRequest = Body(...),
+    user: UserInfo = Depends(require_live_admin),
+) -> Response:
+    """CSV of the audit rows matching ``filters`` (at most 10 000, newest
+    first), formula-escaped. Operator-only; the export is itself audited and
+    refused when its intent row cannot be written."""
+    service = _service(request)
+    if not service.available:
+        return _err(503, "data_unavailable")
+    retry_after = await _export_retry_after(service, user.username)
+    if retry_after is not None:
+        return _rate_limited(retry_after)
+    try:
+        f = _audit_filter(
+            {
+                str(k): None if v is None else str(v)
+                for k, v in body.filters.items()
+                if k in ("actor", "action", "workspace", "phase", "from", "to")
+            }
+        )
+    except OpsBadRequest as e:
+        return _err(400, e.code)
+    try:
+        reason = ops_actions.clean_reason(body.reason)
+    except ops_actions.ActionRefused as e:
+        return _err(e.status, e.code)
+    params = {
+        **filters_digest(
+            {
+                "actor": f.actor,
+                "action": f.action,
+                "workspace": f.workspace,
+                "phase": f.phase,
+            }
+        ),
+        "window_s": int((f.end - f.start).total_seconds()),
+        "format": "csv",
+    }
+    try:
+        audit_id = await write_audit(
+            service.store,
+            user=user,
+            action="audit_export",
+            phase="intent",
+            request=request,
+            params=params,
+            reason=reason,
+        )
+    except Exception as e:
+        logger.warning("Ops audit export refused: audit failed (%s)", type(e).__name__)
+        return _err(503, "audit_unavailable")
+    try:
+        rows = await service._q(
+            lambda: service.store.audit_page(f, None, AUDIT_EXPORT_MAX)
+        )
+        outcome = "ok"
+    except OpsDataUnavailable:
+        rows, outcome = None, "failed"
+    try:
+        await write_audit(
+            service.store,
+            user=user,
+            action="audit_export",
+            phase="result",
+            request=request,
+            params={**params, "intent_id": audit_id, "rows": len(rows or [])},
+            reason=reason,
+            outcome=outcome,
+        )
+    except Exception as e:
+        logger.warning("Ops audit export result audit failed (%s)", type(e).__name__)
+    if rows is None:
+        return _err(503, "data_unavailable")
+    items = [audit_view(r) for r in rows]
+    content = await asyncio.to_thread(audit_csv, items)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    return Response(
+        content=content,
+        media_type="text/csv; charset=utf-8",
+        headers={
+            "Content-Disposition": f'attachment; filename="ops-audit-{stamp}.csv"',
+            "X-Ops-Export-Rows": str(len(items)),
+            "X-Ops-Audit-Id": str(audit_id),
         },
     )
