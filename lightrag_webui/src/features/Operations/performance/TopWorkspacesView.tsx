@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { useTranslation } from 'react-i18next'
-import { Meter, Seg } from '@/features/TokenInsights/ui'
+import { Meter, Seg } from '@/components/admin'
 import { opsApi } from '../api'
 import OpsLink from '../components/OpsLink'
 import { Panel } from '../components/Panel'

@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { DownloadIcon } from 'lucide-react'
-import { Kv } from '@/features/TokenInsights/ui'
+import { Kv } from '@/components/admin'
 import { AlertEmailState, OpsAlert, opsApi } from '../api'
 import { alertActionsEnabled, alertTitle, ruleTitle } from '../activity/alertActions'
 import { alertChannelOf, alertOpenSeconds, alertTarget, emailFromChannel } from '../activity/alerts'

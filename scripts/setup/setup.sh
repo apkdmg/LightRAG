@@ -615,6 +615,13 @@ prepare_compose_runtime_overrides() {
     fi
   done
 
+  # The GPU exporter sidecar: compose-only address (container hostname).
+  # Without the sidecar, a host-install OPS_GPU_EXPORTER_URL in .env (an
+  # exporter the operator runs on the host) gets the loopback rewrite below.
+  if [[ -n "${DOCKER_SERVICE_SET[gpu-exporter]+set}" ]]; then
+    set_compose_override "OPS_GPU_EXPORTER_URL" "http://gpu-exporter:9835"
+  fi
+
   for key in \
     "LLM_BINDING_HOST" \
     "REDIS_URI" \
@@ -622,7 +629,8 @@ prepare_compose_runtime_overrides() {
     "NEO4J_URI" \
     "MILVUS_URI" \
     "QDRANT_URL" \
-    "MEMGRAPH_URI"; do
+    "MEMGRAPH_URI" \
+    "OPS_GPU_EXPORTER_URL"; do
     if [[ -n "${COMPOSE_ENV_OVERRIDES[$key]+set}" ]]; then
       continue
     fi
@@ -727,6 +735,44 @@ restore_vllm_docker_services_from_env() {
 
   if [[ "${ENV_VALUES[LIGHTRAG_SETUP_RERANK_PROVIDER]:-}" == "vllm" ]]; then
     add_docker_service "vllm-rerank"
+  fi
+}
+
+# True when a wizard-managed service of this compose runs on an NVIDIA GPU
+# (the GPU preset): vLLM embed/rerank, Milvus or Qdrant on cuda.
+wizard_gpu_service_selected() {
+  if [[ -n "${DOCKER_SERVICE_SET[vllm-embed]+set}" && \
+        "${ENV_VALUES[VLLM_EMBED_DEVICE]:-cpu}" == "cuda" ]]; then
+    return 0
+  fi
+  if [[ -n "${DOCKER_SERVICE_SET[vllm-rerank]+set}" && \
+        "${ENV_VALUES[VLLM_RERANK_DEVICE]:-cpu}" == "cuda" ]]; then
+    return 0
+  fi
+  if [[ -n "${DOCKER_SERVICE_SET[milvus]+set}" && \
+        "${ENV_VALUES[MILVUS_DEVICE]:-cpu}" == "cuda" ]]; then
+    return 0
+  fi
+  if [[ -n "${DOCKER_SERVICE_SET[qdrant]+set}" && \
+        "${ENV_VALUES[QDRANT_DEVICE]:-cpu}" == "cuda" ]]; then
+    return 0
+  fi
+  return 1
+}
+
+# The Operations console's GPU metrics sidecar (nvidia_gpu_exporter, D5):
+# opt-in with OPS_GPU_EXPORTER=true in .env, and only added next to a
+# GPU service. The lightrag container reaches it by service name through a
+# compose-only OPS_GPU_EXPORTER_URL (never written to .env) and never gets
+# GPU access itself.
+configure_gpu_exporter_service() {
+  if ! env_value_is_true "${ENV_VALUES[OPS_GPU_EXPORTER]:-false}"; then
+    return 0
+  fi
+  if wizard_gpu_service_selected; then
+    add_docker_service "gpu-exporter"
+  else
+    log_warn "OPS_GPU_EXPORTER=true but no wizard-managed service runs on a GPU; the GPU exporter is not added."
   fi
 }
 
@@ -2561,6 +2607,7 @@ finalize_base_setup() {
   compose_file="${REPO_ROOT}/docker-compose.final.yml"
   record_existing_managed_root_services "$existing_compose"
   restore_storage_docker_services_from_env
+  configure_gpu_exporter_service
   configure_mongodb_compose_migration_rewrite "$existing_compose"
 
   configure_base_compose_rewrites
@@ -2707,6 +2754,7 @@ finalize_storage_setup() {
   compose_file="${REPO_ROOT}/docker-compose.final.yml"
   record_existing_managed_root_services "$existing_compose"
   restore_vllm_docker_services_from_env
+  configure_gpu_exporter_service
   configure_storage_compose_rewrites
   configure_mongodb_compose_migration_rewrite "$existing_compose"
   resolve_compose_output_action \
@@ -2829,6 +2877,7 @@ finalize_server_setup() {
   record_existing_managed_root_services "$existing_compose"
   restore_storage_docker_services_from_env
   restore_vllm_docker_services_from_env
+  configure_gpu_exporter_service
   configure_mongodb_compose_migration_rewrite "$existing_compose"
   resolve_compose_output_action \
     "$existing_compose" \

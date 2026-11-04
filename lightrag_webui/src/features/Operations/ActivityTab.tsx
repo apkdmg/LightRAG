@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { DownloadIcon } from 'lucide-react'
-import { Seg } from '@/features/TokenInsights/ui'
+import { Seg } from '@/components/admin'
 import AlertsView from './activity/AlertsView'
 import AuditView from './activity/AuditView'
 import EventsView from './activity/EventsView'

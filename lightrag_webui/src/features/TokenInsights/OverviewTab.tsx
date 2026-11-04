@@ -6,10 +6,8 @@ import { useData, useInsights } from './context'
 import { INGEST, PURPOSES, PURPOSE_COLOR, Purpose, QUESTIONS, isFarFromOthers } from './meta'
 import PurposePage from './PurposePage'
 import WorkspacePage from './WorkspacePage'
-import {
-  Card, Counter, Empty, Kv, Mix, PurposeName, RowButton, Seg, Spark, StatusLabel, Swatch, Tile, Title,
-  fmtChange, fmtCount, fmtDay, fmtMoney, fmtPct, fmtTokens, markIntroPlayed
-} from './ui'
+import { Card, Empty, Kv, RowButton, Seg, Spark, Tile, Title } from '@/components/admin'
+import { Counter, Mix, PurposeName, StatusLabel, Swatch, fmtChange, fmtCount, fmtDay, fmtMoney, fmtPct, fmtTokens, markIntroPlayed } from './ui'
 
 export function buildPoints(chart: any, unit: 'tokens' | 'cost', bucket: 'day' | 'week'): ChartPoint[] {
   if (!chart) return []

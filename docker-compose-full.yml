@@ -65,6 +65,11 @@ services:
       # Base URL only — LightRAG's docling client appends /v1/convert/file/async
       # itself. Passing the full path produces a double-appended broken URL.
       DOCLING_ENDPOINT: "http://docling:5001"
+      # Operations console GPU metrics (opt-in, decision D5): start the
+      # gpu-exporter sidecar below with `--profile gpu-metrics` (or
+      # COMPOSE_PROFILES=gpu-metrics) and uncomment. Container address only;
+      # never put it in .env. lightrag itself gets no GPU access.
+      # OPS_GPU_EXPORTER_URL: "http://gpu-exporter:9835"
     depends_on:
       vllm-embed:
         condition: service_healthy
@@ -297,6 +302,27 @@ services:
       timeout: 3s
       retries: 30
       start_period: 30s
+    restart: unless-stopped
+
+  gpu-exporter:
+    # nvidia_gpu_exporter: per-GPU utilisation, memory, temperature and power
+    # for the Operations console, read by lightrag over the compose network
+    # (OPS_GPU_EXPORTER_URL above). Opt-in through the profile; not
+    # published on the host.
+    image: utkuozdemir/nvidia_gpu_exporter:1.2.1
+    profiles: ["gpu-metrics"]
+    environment:
+      NVIDIA_VISIBLE_DEVICES: ${NVIDIA_VISIBLE_DEVICES:-all}
+      NVIDIA_DRIVER_CAPABILITIES: utility
+    expose:
+      - "9835"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu, utility]
     restart: unless-stopped
 
 volumes:

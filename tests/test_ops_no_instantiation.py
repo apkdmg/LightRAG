@@ -79,7 +79,9 @@ def _concrete(path: str) -> str:
 
 
 @pytest.mark.parametrize("tracking", [False, True], ids=["legacy", "run_tracking"])
-def test_every_get_answers_without_instantiating(guarded, tracking):
+def test_every_get_answers_without_instantiating(guarded, tracking, monkeypatch):
+    # The flag-gated Prometheus route is checked too (it answers 404 when off).
+    monkeypatch.setenv("OPS_PROMETHEUS", "true")
     manager = WorkspaceManager(instance_factory=_forbidden("instance_factory"))
     store = seeded_store()
     app = build_app(
@@ -115,13 +117,18 @@ def test_every_get_answers_without_instantiating(guarded, tracking):
     assert manager.loaded_instances() == []
 
 
-def test_every_get_answers_without_postgres(guarded):
+def test_every_get_answers_without_postgres(guarded, monkeypatch):
+    monkeypatch.setenv("OPS_PROMETHEUS", "true")
     app = build_app(None, kv_storage="JsonKVStorage")
     client = TestClient(app, raise_server_exceptions=True)
     for route in ops_routes.router.routes:
         if "GET" in route.methods:
             response = client.get(_concrete(route.path))
             assert response.status_code == 200, (route.path, response.text)
+            if response.headers["content-type"].startswith("text/plain"):
+                # Prometheus text: only this process's numbers.
+                assert "lightrag_ops_store_available 0" in response.text
+                continue
             assert (
                 response.json().get("available", False) is False
                 or route.path == "/admin/ops/status"

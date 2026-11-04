@@ -16,11 +16,25 @@ pytestmark = pytest.mark.offline
 class FakeConn:
     """Answers the builder's catalog queries from a small model."""
 
-    def __init__(self, *, tables=None, states=None, locked=False, fail_create=()):
+    def __init__(
+        self,
+        *,
+        tables=None,
+        states=None,
+        locked=False,
+        fail_create=(),
+        columns=None,
+        trgm=None,
+    ):
         self.tables = set(
             tables
             or ("lightrag_doc_status", "lightrag_usage_calls", "lightrag_usage_events")
         )
+        self.columns = set(
+            columns if columns is not None else {("lightrag_usage_calls", "request_id")}
+        )
+        # pg_trgm: {"available": bool, "installed": bool}; None = not offered.
+        self.trgm = dict(trgm or {"available": False, "installed": False})
         self.states = dict(states or {})
         self.locked = locked
         self.fail_create = set(fail_create)
@@ -32,9 +46,14 @@ class FakeConn:
             return not self.locked
         if "to_regclass" in sql:
             return 1 if args[0] in self.tables else None
+        if "information_schema.columns" in sql:
+            return 1 if (args[0], args[1]) in self.columns else None
         raise AssertionError(sql)
 
     async def fetchrow(self, sql, name):
+        if "pg_available_extensions" in sql:
+            assert name == indexes.TRGM_EXTENSION
+            return dict(self.trgm)
         return self.states.get(name)
 
     async def execute(self, sql, *args):
@@ -51,6 +70,10 @@ class FakeConn:
             }
         if sql.startswith("DROP INDEX"):
             self.states.pop(sql.split()[-1], None)
+        if sql.startswith("CREATE EXTENSION"):
+            if not self.trgm.get("available"):
+                raise RuntimeError("extension not available")
+            self.trgm["installed"] = True
 
 
 def test_spec_indexes_and_never_the_pagination_ones():
@@ -62,6 +85,7 @@ def test_spec_indexes_and_never_the_pagination_ones():
         "idx_lightrag_usage_calls_doc",
         "idx_lightrag_usage_calls_err",
         "idx_usage_events_kind_ts",
+        "idx_lightrag_usage_calls_req",
     ]
     assert not any("workspace_status" in n for n in names)
     for spec in indexes.OPS_INDEXES:
@@ -77,7 +101,7 @@ async def test_builds_missing_indexes_concurrently_with_a_lock_timeout():
     assert set(outcome.values()) == {"created"}
     assert conn.statements[0] == f"SET lock_timeout = {indexes.LOCK_TIMEOUT_MS}"
     creates = [s for s in conn.statements if s.startswith("CREATE")]
-    assert len(creates) == 6 and all("CONCURRENTLY" in s for s in creates)
+    assert len(creates) == 7 and all("CONCURRENTLY" in s for s in creates)
     assert conn.statements[-1] == "SELECT pg_advisory_unlock($1)"
 
 

@@ -2,7 +2,7 @@ import { useTranslation } from 'react-i18next'
 import { OWNER_SUSPECT_STATES, actionsEnabled, stuckActionKinds } from '../actions'
 import { useOpsNav, useOpsShell } from '../context'
 import { fmtAge, fmtClock, shortId, utcTitle } from '../format'
-import { StuckRow, needsRestart, stuckWhy } from '../processing/stuck'
+import { StuckRow, needsRestart, reservationOf, stuckWhy } from '../processing/stuck'
 import { runLookOf } from '../severity'
 import OpsLink from './OpsLink'
 import { StateIcon } from './StatusChip'
@@ -110,7 +110,8 @@ export default function StuckTable({ rows, onChanged }: { rows: StuckRow[]; onCh
                     <RowActions
                       workspace={row.workspace}
                       kinds={stuckActionKinds(row)}
-                      ctx={{ busy: null, ownerSuspect: OWNER_SUSPECT_STATES.has(row.cls) }}
+                      ctx={{ busy: null, ownerSuspect: OWNER_SUSPECT_STATES.has(row.cls), reservation: reservationOf(row) }}
+                      facts={{ reservation: reservationOf(row) }}
                       onChanged={onChanged}
                       onOpenWorkspace={() => nav.openDrawer({ kind: 'workspace', id: row.workspace })}
                     />

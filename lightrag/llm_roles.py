@@ -276,7 +276,11 @@ class _RoleLLMMixin:
                 kwargs.setdefault("token_tracker", capture)
             started = time.perf_counter()
 
-            def finish(text: str | list[str] | None, status: str) -> None:
+            def finish(
+                text: str | list[str] | None,
+                status: str,
+                error: BaseException | None = None,
+            ) -> None:
                 try:
                     emit_usage(
                         self._usage_record(
@@ -289,6 +293,7 @@ class _RoleLLMMixin:
                             text,
                             status,
                             started,
+                            error=error,
                         )
                     )
                 except Exception as e:
@@ -296,8 +301,8 @@ class _RoleLLMMixin:
 
             try:
                 response = await func(*args, **kwargs)
-            except Exception:
-                finish(None, "error")
+            except Exception as e:
+                finish(None, "error", e)
                 raise
             if hasattr(response, "__aiter__"):
                 return recorded_stream(response, finish)
@@ -317,6 +322,8 @@ class _RoleLLMMixin:
         text: str | list[str] | None,
         status: str,
         started: float,
+        *,
+        error: BaseException | None = None,
     ) -> UsageRecord:
         counts = capture.counts or {}
         if status == "ok" and counts.get("finish_reason") == "length":
@@ -355,6 +362,8 @@ class _RoleLLMMixin:
             measured=measured,
             doc_id=scope.doc_id,
             track_id=scope.track_id,
+            # Classified by the usage recorder (which drops the exception).
+            error=error if status == "error" else None,
         )
 
     def _estimate_usage_tokens(

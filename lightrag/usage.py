@@ -150,6 +150,13 @@ class UsageRecord:
     doc_id: Optional[str] = None
     track_id: Optional[str] = None
     ts: float = field(default_factory=time.time)
+    # Failure class (``lightrag.api.ops.classify``) of an ``error`` call and the
+    # API request it served; filled in by the usage recorder.
+    error_kind: Optional[str] = None
+    request_id: Optional[str] = None
+    # The exception behind an ``error`` call, for the recorder to classify.
+    # Never stored: the recorder drops it before buffering the record.
+    error: Optional[BaseException] = field(default=None, repr=False, compare=False)
 
 
 @dataclass(frozen=True)
@@ -268,11 +275,16 @@ def provider_usage_fields(usage: Any) -> dict[str, Any]:
 
 
 async def recorded_stream(
-    stream: AsyncIterator[Any], finish: Callable[[list[str], str], None]
+    stream: AsyncIterator[Any], finish: Callable[..., None]
 ) -> AsyncIterator[Any]:
-    """Yield ``stream`` and report how it ended once it is finished or abandoned."""
+    """Yield ``stream`` and report how it ended once it is finished or abandoned.
+
+    ``finish(parts, status)`` is called once; a stream that failed also passes
+    the exception as ``error=``.
+    """
     parts: list[str] = []
     status = "abandoned"
+    error: Optional[BaseException] = None
     try:
         async for chunk in stream:
             if isinstance(chunk, str):
@@ -281,8 +293,12 @@ async def recorded_stream(
         status = "ok"
     except GeneratorExit:
         raise
-    except Exception:
+    except Exception as e:
         status = "error"
+        error = e
         raise
     finally:
-        finish(parts, status)
+        if error is not None:
+            finish(parts, status, error=error)
+        else:
+            finish(parts, status)

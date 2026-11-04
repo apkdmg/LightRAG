@@ -4,7 +4,8 @@ import { downloadFile, insightsApi } from './api'
 import { useData, useInsights } from './context'
 import { PURPOSES, Purpose } from './meta'
 import { ChartCard, PurposeCards } from './OverviewTab'
-import { Card, Counter, Empty, Kv, Meter, RowButton, StatusLabel, Swatch, TextButton, Tile, Title, fmtChange, fmtCount, fmtDay, fmtMoney, fmtPct, fmtTokens } from './ui'
+import { Card, Empty, Kv, Meter, RowButton, TextButton, Tile, Title } from '@/components/admin'
+import { Counter, StatusLabel, Swatch, fmtChange, fmtCount, fmtDay, fmtMoney, fmtPct, fmtTokens } from './ui'
 
 const ordinal = (n: number) => n + (n % 100 >= 11 && n % 100 <= 13 ? 'th' : ['th', 'st', 'nd', 'rd', 'th', 'th', 'th', 'th', 'th', 'th'][n % 10])
 

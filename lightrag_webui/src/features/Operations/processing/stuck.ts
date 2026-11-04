@@ -1,3 +1,4 @@
+import type { ReservationFacts } from '../actions'
 import type { Stuck, StuckRun } from '../api'
 import type { Drawer } from '../hashState'
 import type { RunState } from '../severity'
@@ -26,6 +27,8 @@ export type StuckRow = {
   /** Reservations: the flag held without an owner. */
   scanning?: boolean | null
   pendingEnqueues?: number | null
+  /** Reservations: what the row's owner worker holds on the workspace (Release reservations, OQ-12). */
+  reservation?: ReservationFacts | null
   drawer: Drawer
 }
 
@@ -63,6 +66,55 @@ const runRows = (cls: RunState, items: StuckRun[] | null | undefined): StuckRow[
   })
 
 /**
+ * Reservation rows (OQ-12). A pending-enqueue row names each confirmed-dead
+ * worker's share (`dead_owners`) and becomes one row per worker, since a
+ * release frees one worker's holdings. Each row carries what its worker
+ * holds on the workspace: the scan it owns (from the scanning row) and its
+ * share (from the pending row), so a release sends both expected values.
+ */
+function reservationRows(items: StuckRun[] | null | undefined): StuckRow[] {
+  const list = items ?? []
+  const scanOf = (ws: string, worker: string) => list.find((r) => r.workspace === ws && r.scanning && r.owner_worker_id === worker)
+  const shareOf = (ws: string, worker: string) => {
+    for (const r of list) {
+      if (r.workspace !== ws || r.scanning) continue
+      const hit = (r.dead_owners ?? []).find((o) => o.worker_id === worker)
+      if (hit && typeof hit.count === 'number') return hit.count
+    }
+    return 0
+  }
+  const facts = (ws: string, worker: string | null, reasonCode: string | null): ReservationFacts => {
+    const scan = worker ? scanOf(ws, worker) : undefined
+    return {
+      workerId: worker,
+      scanning: !!scan,
+      scanStartedAt: scan ? (scan.scan_started_at ?? scan.since ?? null) : null,
+      share: worker ? shareOf(ws, worker) : 0,
+      reasonCode
+    }
+  }
+  const out: StuckRow[] = []
+  runRows('reservation', list).forEach((row, i) => {
+    const r = list[i]
+    const owners = !r.scanning && Array.isArray(r.dead_owners) ? r.dead_owners.filter((o) => o && typeof o.worker_id === 'string') : []
+    if (owners.length) {
+      for (const o of owners) {
+        out.push({
+          ...row,
+          key: `${row.key}:${o.worker_id}`,
+          pendingEnqueues: typeof o.count === 'number' ? o.count : row.pendingEnqueues,
+          reservation: facts(r.workspace, o.worker_id, r.reason_code ?? null)
+        })
+      }
+      return
+    }
+    // A scanning row names its owner; a counter held with no owner shares names nobody.
+    out.push({ ...row, reservation: facts(r.workspace, r.scanning ? (r.owner_worker_id ?? null) : null, r.reason_code ?? null) })
+  })
+  return out
+}
+
+/**
  * The five stuck classes in one list, worst first (orphaned, busy without a
  * run, reservations, hung, stale docs). Orphaned runs and stranded
  * reservations only exist under Gunicorn, so single-process mode never shows
@@ -73,7 +125,7 @@ export function stuckRows(data: Stuck | null | undefined, multiWorker: boolean):
   const rows: StuckRow[] = [
     ...(multiWorker ? runRows('orphaned', data.orphaned) : []),
     ...runRows('busy_without_run', data.busy_without_run),
-    ...(multiWorker ? runRows('reservation', data.reservations) : []),
+    ...(multiWorker ? reservationRows(data.reservations) : []),
     ...runRows('hung', data.hung)
   ]
   for (const d of data.stale_docs?.items ?? []) {
@@ -130,7 +182,7 @@ export function stuckWhy(row: StuckRow): { key: string; values: Record<string, s
       if (row.scanning) {
         return { key: SCAN_REASONS.has(row.reasonCode ?? '') ? `reservationScan_${row.reasonCode}` : 'reservationScan', values: {} }
       }
-      return { key: 'reservationEnqueue', values: { count: row.pendingEnqueues ?? 0 } }
+      return { key: row.reasonCode === 'owner_dead' ? 'reservationEnqueueDead' : 'reservationEnqueue', values: { count: row.pendingEnqueues ?? 0 } }
     case 'busy_without_run':
       return { key: BUSY_REASONS.has(row.reasonCode ?? '') ? `busy_${row.reasonCode}` : 'busy_without_run', values: {} }
     default:
@@ -141,3 +193,6 @@ export function stuckWhy(row: StuckRow): { key: string; values: Record<string, s
 /** Classes whose only remedy before admin actions ship is a container restart (§2.4 "→ restart the container"). */
 export const needsRestart = (cls: RunState) =>
   cls === 'reservation' || cls === 'busy_without_run' || cls === 'orphaned' || cls === 'unresponsive'
+
+/** The reservation a row is about, for Release reservations (OQ-12); null for every other class. */
+export const reservationOf = (row: StuckRow): ReservationFacts | null => (row.cls === 'reservation' ? (row.reservation ?? null) : null)

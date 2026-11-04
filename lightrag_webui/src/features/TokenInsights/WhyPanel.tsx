@@ -6,7 +6,8 @@ import { insightsApi } from './api'
 import { HoursChart, WhySteps } from './charts'
 import { useData, useInsights } from './context'
 import { PURPOSES } from './meta'
-import { Empty, PurposeName, RowButton, fmtDay, fmtPct, fmtTokens } from './ui'
+import { Empty, RowButton } from '@/components/admin'
+import { PurposeName, fmtDay, fmtPct, fmtTokens } from './ui'
 
 const shift = (day: string, by: number) => {
   const d = new Date(day + 'T12:00:00')

@@ -99,6 +99,9 @@ _DATA_ERROR_SQLSTATES = ("22", "23")
 # Owner keys written into pipeline_status (see AGENTS.md).
 OWNER_KEYS = ("run_id", "owner_worker_id", "owner_pid", "heartbeat_at")
 SCAN_OWNER_KEYS = ("scan_owner_worker_id", "scan_started_at")
+# Per-worker shares of the ``pending_enqueues`` counter (OQ-12): written next
+# to the counter, in the same locked block; the counter stays authoritative.
+PENDING_OWNERS_KEY = "pending_enqueue_owners"
 
 _TRACK_TRIGGERS = {
     "upload": "upload",
@@ -991,6 +994,45 @@ def scan_owner_fields(t: RunTracker) -> dict[str, Any]:
 @_hook(dict)
 def scan_clear_fields(t: RunTracker) -> dict[str, Any]:
     return {key: None for key in SCAN_OWNER_KEYS}
+
+
+def pending_owners(value: Any) -> dict[str, int]:
+    """A ``pending_enqueue_owners`` value as ``{worker_id: count > 0}``."""
+    if not isinstance(value, dict):
+        return {}
+    return {
+        str(worker): int(count)
+        for worker, count in value.items()
+        if isinstance(count, int) and not isinstance(count, bool) and count > 0
+    }
+
+
+@_hook(dict)
+def pending_reserve_fields(t: RunTracker, current: Any) -> dict[str, Any]:
+    """This worker's share of ``pending_enqueues`` plus one, to merge into the
+    update that increments the counter (under the existing lock).
+
+    ``current`` is the map read in the same locked block. The whole value is
+    replaced, never mutated in place (Manager-backed shared state).
+    """
+    owners = pending_owners(current)
+    owners[t.worker_id] = owners.get(t.worker_id, 0) + 1
+    return {PENDING_OWNERS_KEY: owners}
+
+
+@_hook(dict)
+def pending_release_fields(t: RunTracker, current: Any) -> dict[str, Any]:
+    """This worker's share minus one (clamped; the entry goes at zero), to
+    merge into the update that decrements the counter."""
+    owners = pending_owners(current)
+    count = owners.get(t.worker_id, 0)
+    if count <= 0:
+        return {}
+    if count == 1:
+        owners.pop(t.worker_id)
+    else:
+        owners[t.worker_id] = count - 1
+    return {PENDING_OWNERS_KEY: owners}
 
 
 # -- hooks: run lifecycle ------------------------------------------------------------------

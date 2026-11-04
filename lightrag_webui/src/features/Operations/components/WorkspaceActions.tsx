@@ -13,9 +13,11 @@ import {
   DryRunCounts,
   actionOffers,
   dryRunCounts,
+  ReservationFacts,
   outcomeOf,
   outcomeOfError,
-  releaseFacts
+  releaseFacts,
+  releaseReservationsBody
 } from '../actions'
 import { useOpsShell } from '../context'
 import { fmtAge, fmtCount } from '../format'
@@ -28,6 +30,8 @@ export type ActionFacts = {
   emailPending?: number | null
   /** A provider pause is active: the run dialog says so next to "override pause". */
   paused?: boolean | null
+  /** The reservation a Stuck row is about: quoted by Release reservations and sent back as the expected values. */
+  reservation?: ReservationFacts | null
 }
 
 const send = async (action: ActionKind, call: () => Promise<ActionResponse>, hints?: { requestPending?: boolean }): Promise<ActionOutcome> => {
@@ -260,6 +264,56 @@ function ReleaseDialog({ workspace, open, onOpenChange, onOutcome, onRunNow }: D
   )
 }
 
+/**
+ * Release reservations (OQ-12, Gunicorn only, operator only): frees a dead
+ * worker's scanning flag and its share of pending enqueues, and nothing
+ * else — busy, other workers' enqueues and request_pending stay as they are.
+ * The server confirms the owner is gone (heartbeat and process check) and
+ * compares the values the page showed under the lock. The workspace name
+ * must be typed.
+ */
+function ReleaseReservationsDialog({ workspace, open, onOpenChange, onOutcome, facts }: DialogProps) {
+  const { t } = useTranslation()
+  const { status } = useOpsShell()
+  const r = facts?.reservation ?? null
+  const held: string[] = []
+  if (r?.scanning) held.push(t('operations.actions.reservations.scanning'))
+  if (r && r.share > 0) held.push(t('operations.actions.reservations.enqueues', { count: r.share }))
+  return (
+    <ConfirmActionDialog
+      open={open}
+      onOpenChange={onOpenChange}
+      action="release_reservations"
+      destructive
+      title={t('operations.actions.reservations.title', { workspace })}
+      body={
+        <>
+          <p className="m-0 font-medium">{t('operations.actions.reservations.onlyGone')}</p>
+          {r?.workerId && held.length ? (
+            <p className="m-0">{t('operations.actions.reservations.held', { worker: r.workerId.slice(0, 8), what: held.join(' · ') })}</p>
+          ) : null}
+          <p className="m-0">{t('operations.actions.reservations.body')}</p>
+          <p className="m-0">{t('operations.actions.reservations.untouched')}</p>
+        </>
+      }
+      ready={!!r?.workerId && (r.scanning || r.share > 0)}
+      allowed={!!status?.operator}
+      notAllowedText={t('operations.actions.hint.operatorOnly')}
+      typedExpected={workspace}
+      confirmLabel={t('operations.actions.reservations.confirm')}
+      onConfirm={({ reason, typed }) =>
+        send('release_reservations', async () => {
+          const body = releaseReservationsBody(reason, typed, r)
+          // `ready` keeps the button off without a named worker; this only guards a stale click.
+          if (!body) return { released: false, reason: 'owner_unknown' }
+          return opsApi.releaseReservations(workspace, body)
+        })
+      }
+      onOutcome={onOutcome}
+    />
+  )
+}
+
 type DialogProps = {
   workspace: string
   open: boolean
@@ -305,6 +359,7 @@ export function ActionDialogs({
       <RunDialog {...props('run')} />
       <DrainDialog {...props('drain_email')} />
       <ReleaseDialog {...props('release_busy')} />
+      <ReleaseReservationsDialog {...props('release_reservations')} />
     </>
   )
 }
@@ -336,7 +391,7 @@ function OfferButton({ offer, onClick, compact }: { offer: ActionOffer; onClick:
         className={cn(
           'hover:bg-muted rounded-lg border px-3 text-[13px] disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:bg-transparent',
           compact ? 'min-h-7 px-2 text-xs' : 'min-h-8',
-          offer.kind === 'release_busy' && !offer.disabled && 'border-[color:var(--ops-crit)] text-[color:var(--ops-crit)]'
+          (offer.kind === 'release_busy' || offer.kind === 'release_reservations') && !offer.disabled && 'border-[color:var(--ops-crit)] text-[color:var(--ops-crit)]'
         )}
       >
         {t(`operations.actions.button.${offer.kind}`)}

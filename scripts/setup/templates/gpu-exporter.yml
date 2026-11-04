@@ -1,0 +1,19 @@
+  gpu-exporter:
+    # GPU utilisation, memory, temperature and power for the Operations
+    # console (decision D5): the API reads this sidecar's /metrics over the
+    # compose network (OPS_GPU_EXPORTER_URL); the lightrag container itself
+    # never gets GPU access. Not published on the host.
+    image: utkuozdemir/nvidia_gpu_exporter:1.2.1
+    environment:
+      NVIDIA_VISIBLE_DEVICES: ${NVIDIA_VISIBLE_DEVICES:-all}
+      NVIDIA_DRIVER_CAPABILITIES: utility
+    expose:
+      - "9835"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu, utility]
+    restart: unless-stopped

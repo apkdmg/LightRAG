@@ -1,6 +1,8 @@
 import { create } from 'zustand'
 import { createSelectors } from '@/lib/utils'
-import { checkHealth, LightragStatus } from '@/api/lightrag'
+import { checkHealth, getPipelineStatus, LightragStatus } from '@/api/lightrag'
+import { mayAct, useActingStore } from './actingWorkspace'
+import { resolvePipelineActive } from '@/lib/pipelineActivity'
 import { useSettingsStore } from './settings'
 import { healthCheckInterval } from '@/lib/constants'
 import { hasHealthDetail } from '@/lib/healthDetail'
@@ -104,6 +106,11 @@ const useBackendStateStoreBase = create<BackendState>()((set, get) => ({
         }
       }
 
+      // While an admin acts on another workspace (OQ-13), the Documents
+      // tab's activity flag follows that workspace, not this session's.
+      // pipelineBusy stays the session's own (the graph reads it).
+      const acting = mayAct(useActingStore.getState().acting, useAuthStore.getState())
+      const pipelineActive = await resolvePipelineActive(health, acting, getPipelineStatus)
       set({
         health: true,
         message: null,
@@ -111,7 +118,7 @@ const useBackendStateStoreBase = create<BackendState>()((set, get) => ({
         lastCheckTime: Date.now(),
         status: health,
         pipelineBusy: health.pipeline_busy,
-        pipelineActive: health.pipeline_active ?? health.pipeline_busy
+        pipelineActive: pipelineActive ?? get().pipelineActive
       })
       return true
     }

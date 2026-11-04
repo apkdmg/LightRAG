@@ -144,10 +144,37 @@ export function decodeLogFilter(raw: string | null | undefined): LogFilter {
   return normalizeFilter(patch)
 }
 
-/** The window a query really covers: a text search is capped at 24 h. */
-export function effectiveWindow(filter: Pick<LogFilter, 'window' | 'q'>): LogWindow {
-  if (filter.q && WINDOW_SECONDS[filter.window] > WINDOW_SECONDS[TEXT_SEARCH_WINDOW]) return TEXT_SEARCH_WINDOW
-  return filter.window
+/**
+ * How far back a text search may reach on this server: the whole 7-day
+ * window once a valid pg_trgm index backs it (V7, `features.log_trgm`),
+ * else 24 h (FR-20). The server applies the same cap.
+ */
+export function textSearchWindow(features: { log_trgm?: boolean } | null | undefined): LogWindow {
+  return features?.log_trgm === true ? '7d' : TEXT_SEARCH_WINDOW
+}
+
+/** A run of 3 letters or digits: the shortest text a trigram index can narrow. */
+const TRGM_RUN = /[\p{L}\p{N}]{3}/u
+
+/**
+ * Whether the trigram index can serve a search for `q`. pg_trgm splits words
+ * on anything but letters and digits, so 'ab', 'a b' or '1.2' give it nothing
+ * selective and the server keeps the 24 h cap for them (logs.py
+ * `trgm_searchable`, mirrored here so the query is never refused).
+ */
+export function trgmSearchable(q: string | null | undefined): boolean {
+  return !!q && TRGM_RUN.test(q.trim())
+}
+
+/**
+ * The window a query really covers: a text search is capped at `textWindow`
+ * (24 h without pg_trgm), and at 24 h whatever the index when `q` is too
+ * short for it.
+ */
+export function effectiveWindow(filter: Pick<LogFilter, 'window' | 'q'>, textWindow: LogWindow = TEXT_SEARCH_WINDOW): LogWindow {
+  if (!filter.q) return filter.window
+  const cap = trgmSearchable(filter.q) ? textWindow : TEXT_SEARCH_WINDOW
+  return WINDOW_SECONDS[filter.window] > WINDOW_SECONDS[cap] ? cap : filter.window
 }
 
 /** Filters the user set beyond level and window (the "Active:" chips and the "Filters (n)" count). */
@@ -169,8 +196,8 @@ const isoMinus = (at: string | number, ms: number): string | null => {
  * server checks the window again. A minute bucket keeps the query stable
  * across renders, so polling compares like with like.
  */
-export function logsQuery(filter: LogFilter, now: number, limit = LOG_PAGE): Params {
-  const window = effectiveWindow(filter)
+export function logsQuery(filter: LogFilter, now: number, limit = LOG_PAGE, textWindow: LogWindow = TEXT_SEARCH_WINDOW): Params {
+  const window = effectiveWindow(filter, textWindow)
   const minute = Math.floor(now / 60_000) * 60_000
   return {
     level: filter.level,
@@ -189,8 +216,8 @@ export function logsQuery(filter: LogFilter, now: number, limit = LOG_PAGE): Par
 }
 
 /** The filters an export carries (the server applies its own 10k cap). */
-export function exportFilters(filter: LogFilter, now: number): Record<string, string> {
-  const { limit: _limit, ...rest } = logsQuery(filter, now)
+export function exportFilters(filter: LogFilter, now: number, textWindow: LogWindow = TEXT_SEARCH_WINDOW): Record<string, string> {
+  const { limit: _limit, ...rest } = logsQuery(filter, now, LOG_PAGE, textWindow)
   void _limit
   return Object.fromEntries(Object.entries(rest).filter(([, v]) => v !== undefined && v !== null && v !== '')) as Record<string, string>
 }

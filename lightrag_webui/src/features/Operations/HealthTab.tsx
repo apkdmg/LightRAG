@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
-import { Seg } from '@/features/TokenInsights/ui'
+import { Seg } from '@/components/admin'
 import { OpsHealth, opsApi } from './api'
 import { useOpsNav, useOpsShell } from './context'
 import { useHealthChanged } from './health/actions'

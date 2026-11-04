@@ -1922,3 +1922,102 @@ generate_docker_compose "$REPO_ROOT/docker-compose.final.yml"
     assert "./data/rag_storage:/app/data/rag_storage" in generated_compose
     assert "./data/inputs:/app/data/inputs" in generated_compose
     assert "./.env:/app/.env" in generated_compose
+
+
+def _gpu_exporter_compose(
+    tmp_path: Path, *, opt_in: str, device: str, existing: str = "", url: str = ""
+) -> tuple[str, str]:
+    """Run the base flow's service restore + compose generation for vLLM embed
+    on ``device`` with ``OPS_GPU_EXPORTER=<opt_in>``; returns (.env, compose)."""
+    write_text_lines(
+        tmp_path / "env.example",
+        (REPO_ROOT / "env.example").read_text(encoding="utf-8").splitlines(),
+    )
+    write_text_lines(
+        tmp_path / "docker-compose.yml",
+        ["services:", "  lightrag:", "    image: example/lightrag:test"],
+    )
+    if existing:
+        (tmp_path / "docker-compose.final.yml").write_text(existing, encoding="utf-8")
+    url_line = f'ENV_VALUES[OPS_GPU_EXPORTER_URL]="{url}"' if url else ""
+    run_bash(f"""
+set -euo pipefail
+source "{REPO_ROOT}/scripts/setup/setup.sh"
+REPO_ROOT="{tmp_path}"
+reset_state
+
+ENV_VALUES[OPS_GPU_EXPORTER]="{opt_in}"
+{url_line}
+ENV_VALUES[VLLM_EMBED_DEVICE]="{device}"
+ENV_VALUES[LIGHTRAG_SETUP_EMBEDDING_PROVIDER]="vllm"
+restore_vllm_docker_services_from_env
+configure_gpu_exporter_service
+prepare_compose_runtime_overrides
+
+generate_env_file "$REPO_ROOT/env.example" "$REPO_ROOT/.env"
+generate_docker_compose "$REPO_ROOT/docker-compose.final.yml"
+""")
+    return (
+        (tmp_path / ".env").read_text(encoding="utf-8"),
+        (tmp_path / "docker-compose.final.yml").read_text(encoding="utf-8"),
+    )
+
+
+def test_gpu_exporter_is_rendered_only_for_the_gpu_preset_when_opted_in(
+    tmp_path: Path,
+) -> None:
+    env, compose = _gpu_exporter_compose(tmp_path, opt_in="true", device="cuda")
+    assert "  gpu-exporter:" in compose
+    assert "image: utkuozdemir/nvidia_gpu_exporter:" in compose
+    assert 'OPS_GPU_EXPORTER_URL: "http://gpu-exporter:9835"' in compose
+    # The container-only address never reaches .env (CLAUDE.md #9).
+    assert not [
+        line
+        for line in env.splitlines()
+        if line.startswith("OPS_GPU_EXPORTER_URL=") and "gpu-exporter" in line
+    ]
+    assert "OPS_GPU_EXPORTER=true" in env
+    # lightrag never waits for the optional sidecar and never gets the GPU.
+    lightrag = compose.split("  lightrag:", 1)[1].split("\n  vllm-embed:", 1)[0]
+    assert "gpu-exporter" not in lightrag.split("environment:", 1)[0]
+    assert "runtime: nvidia" not in lightrag
+    assert "capabilities: [gpu, utility]" in compose
+
+
+@pytest.mark.parametrize(("opt_in", "device"), [("false", "cuda"), ("true", "cpu")])
+def test_gpu_exporter_is_not_rendered_otherwise(
+    tmp_path: Path, opt_in: str, device: str
+) -> None:
+    _, compose = _gpu_exporter_compose(tmp_path, opt_in=opt_in, device=device)
+    assert "gpu-exporter" not in compose
+    assert "OPS_GPU_EXPORTER_URL" not in compose
+
+
+def test_gpu_exporter_is_removed_when_opted_out_again(tmp_path: Path) -> None:
+    _, first = _gpu_exporter_compose(tmp_path, opt_in="true", device="cuda")
+    assert "  gpu-exporter:" in first
+    _, second = _gpu_exporter_compose(
+        tmp_path, opt_in="false", device="cuda", existing=first
+    )
+    assert "gpu-exporter" not in second
+    assert "OPS_GPU_EXPORTER_URL" not in second
+
+
+def test_host_gpu_exporter_url_is_rewritten_for_the_container(tmp_path: Path) -> None:
+    """A host-install exporter address in .env (no sidecar) must reach the
+    lightrag container through host.docker.internal; .env keeps localhost."""
+    env, compose = _gpu_exporter_compose(
+        tmp_path, opt_in="false", device="cuda", url="http://localhost:9835"
+    )
+    assert "  gpu-exporter:" not in compose
+    assert 'OPS_GPU_EXPORTER_URL: "http://host.docker.internal:9835"' in compose
+    assert "OPS_GPU_EXPORTER_URL=http://localhost:9835" in env
+
+
+def test_sidecar_address_wins_over_a_host_gpu_exporter_url(tmp_path: Path) -> None:
+    env, compose = _gpu_exporter_compose(
+        tmp_path, opt_in="true", device="cuda", url="http://localhost:9835"
+    )
+    assert 'OPS_GPU_EXPORTER_URL: "http://gpu-exporter:9835"' in compose
+    assert "host.docker.internal:9835" not in compose
+    assert "OPS_GPU_EXPORTER_URL=http://localhost:9835" in env

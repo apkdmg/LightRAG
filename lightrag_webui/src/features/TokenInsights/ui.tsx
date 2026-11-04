@@ -1,8 +1,13 @@
-import { Component, ReactNode, useEffect, useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { animate, useReducedMotion } from 'motion/react'
 import { useTranslation } from 'react-i18next'
+import { StatusIcon } from '@/components/admin'
 import { cn } from '@/lib/utils'
 import { ICON_CHECK, ICON_CLOCK, PURPOSES, PURPOSE_COLOR, Purpose, SEVERITY } from './meta'
+
+// Layout, KPI and table primitives (Card, Seg, Kv, Meter, Tile, …) live in
+// '@/components/admin', shared with the Operations console. What stays here
+// knows about purposes, Insights statuses and token/money formatting.
 
 export const fmtTokens = (n: number | null | undefined) => {
   if (n === null || n === undefined) return '–'
@@ -39,77 +44,6 @@ export const fmtDay = (iso: string, long = false) => {
   return d.toLocaleDateString(undefined, long ? { weekday: 'short', day: 'numeric', month: 'short' } : { day: 'numeric', month: 'short' })
 }
 
-function ViewFailed() {
-  const { t } = useTranslation()
-  return <Empty>{t('insights.viewFailed')}</Empty>
-}
-
-/** Keeps one view's failure from blanking the whole app. A new `resetKey` tries again. */
-export class ViewBoundary extends Component<{ resetKey?: string; children: ReactNode }, { failed: boolean }> {
-  state = { failed: false }
-
-  static getDerivedStateFromError() {
-    return { failed: true }
-  }
-
-  componentDidCatch(error: Error) {
-    console.error('Token Insights view failed:', error)
-  }
-
-  componentDidUpdate(previous: { resetKey?: string }) {
-    if (this.state.failed && previous.resetKey !== this.props.resetKey) this.setState({ failed: false })
-  }
-
-  render() {
-    return this.state.failed ? <ViewFailed /> : this.props.children
-  }
-}
-
-export function Card({ className, children }: { className?: string; children: ReactNode }) {
-  return <div className={cn('bg-card rounded-[10px] border p-4', className)}>{children}</div>
-}
-
-export function Title({ children, sub }: { children: ReactNode; sub?: ReactNode }) {
-  return (
-    <div className="mb-2">
-      <h2 className="m-0 text-[15px] font-semibold">{children}</h2>
-      {sub ? <p className="text-muted-foreground mt-0.5 text-[13px]">{sub}</p> : null}
-    </div>
-  )
-}
-
-export function Seg<T extends string | number>({
-  value,
-  options,
-  onChange,
-  label
-}: {
-  value: T
-  options: { value: T; label: ReactNode; disabled?: boolean }[]
-  onChange: (value: T) => void
-  label?: string
-}) {
-  return (
-    <div className="bg-muted inline-flex flex-wrap gap-0.5 rounded-lg p-0.5" role="group" aria-label={label}>
-      {options.map((o) => (
-        <button
-          key={String(o.value)}
-          type="button"
-          disabled={o.disabled}
-          aria-pressed={value === o.value}
-          onClick={() => onChange(o.value)}
-          className={cn(
-            'inline-flex min-h-8 items-center gap-1.5 rounded-md px-2.5 py-1 text-[13px] transition-colors disabled:opacity-40',
-            value === o.value ? 'bg-background font-medium shadow-sm' : 'text-muted-foreground hover:text-foreground'
-          )}
-        >
-          {o.label}
-        </button>
-      ))}
-    </div>
-  )
-}
-
 export const Swatch = ({ purpose, color, size = 11 }: { purpose?: Purpose; color?: string; size?: number }) => (
   <span
     aria-hidden="true"
@@ -125,14 +59,6 @@ export const PurposeName = ({ id }: { id: string }) => {
       <Swatch purpose={id as Purpose} />
       {t(`insights.purpose.${id}`)}
     </span>
-  )
-}
-
-export function StatusIcon({ path, color }: { path: string; color: string }) {
-  return (
-    <svg className="size-4 flex-none" viewBox="0 0 24 24" fill="none" stroke={color} strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-      <path d={path} />
-    </svg>
   )
 }
 
@@ -167,36 +93,12 @@ export function SeverityLabel({ severity }: { severity: keyof typeof SEVERITY })
   )
 }
 
-export const Meter = ({ value, color = 'var(--muted-foreground)' }: { value: number; color?: string }) => (
-  <span className="bg-muted block h-1.5 overflow-hidden rounded-full">
-    <span className="block h-full rounded-full transition-[width] duration-300" style={{ width: `${Math.min(100, value)}%`, background: color }} />
-  </span>
-)
-
 export function Mix({ values, tall }: { values: Record<string, number>; tall?: boolean }) {
   const total = PURPOSES.reduce((a, p) => a + (values[p] || 0), 0) || 1
   return (
     <span className={cn('flex gap-0.5', tall ? 'h-4' : 'h-2.5')}>
       {PURPOSES.filter((p) => values[p]).map((p) => (
         <span key={p} className="rounded-[2px] transition-[flex-grow] duration-300" style={{ flexGrow: values[p] / total, background: PURPOSE_COLOR[p] }} />
-      ))}
-    </span>
-  )
-}
-
-export const Kv = ({ k, children }: { k: ReactNode; children: ReactNode }) => (
-  <div className="flex justify-between gap-3 text-xs">
-    <span className="text-muted-foreground">{k}</span>
-    <span className="text-right font-semibold">{children}</span>
-  </div>
-)
-
-export const Spark = ({ values, color }: { values: number[]; color: string }) => {
-  const max = Math.max(...values, 1)
-  return (
-    <span className="flex h-11 items-end gap-px border-b" aria-hidden="true">
-      {values.map((v, i) => (
-        <span key={i} className="min-w-0 flex-1 rounded-t-[1px] transition-[height] duration-300" style={{ height: `${(v / max) * 100}%`, background: color }} />
       ))}
     </span>
   )
@@ -225,33 +127,3 @@ export function Counter({ value, format }: { value: number; format: (n: number) 
   }, [value, reduced])
   return <>{format(reduced ? value : shown)}</>
 }
-
-export function Tile({ label, value, note, hero }: { label: ReactNode; value: ReactNode; note?: ReactNode; hero?: boolean }) {
-  return (
-    <div className="min-w-[150px] flex-1">
-      <div className="text-muted-foreground text-[13px]">{label}</div>
-      <div className={cn('font-semibold tracking-tight', hero ? 'text-[34px] leading-tight' : 'text-2xl leading-snug')}>{value}</div>
-      {note ? <div className="text-muted-foreground text-xs">{note}</div> : null}
-    </div>
-  )
-}
-
-export const Empty = ({ children }: { children: ReactNode }) => <p className="text-muted-foreground m-0 text-sm">{children}</p>
-
-export const TextButton = ({ onClick, children, className }: { onClick: () => void; children: ReactNode; className?: string }) => (
-  <button type="button" onClick={onClick} className={cn('hover:bg-muted min-h-7 rounded px-1 text-left underline underline-offset-2', className)}>
-    {children}
-  </button>
-)
-
-/** A row that reads like text and acts like a button. */
-export const RowButton = ({ onClick, children, active }: { onClick?: () => void; children: ReactNode; active?: boolean }) => (
-  <button
-    type="button"
-    disabled={!onClick}
-    onClick={onClick}
-    className={cn('block w-full rounded-lg px-2 py-2 text-left transition-colors', onClick && 'hover:bg-muted cursor-pointer', active && 'bg-muted')}
-  >
-    {children}
-  </button>
-)

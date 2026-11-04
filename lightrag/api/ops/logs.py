@@ -2,8 +2,10 @@
 
 - :func:`parse_filter` turns query parameters (or an export's ``filters``)
   into a :class:`~lightrag.api.ops.store.LogFilter`: at most 7 days per
-  query and at most 24 h with a text search (``q``, an ``ILIKE`` until
-  ``pg_trgm`` is available), every ID validated, the level a minimum.
+  query and at most 24 h with a text search (``q``, an ``ILIKE``), every ID
+  validated, the level a minimum. When the ``pg_trgm`` GIN index on
+  ``msg`` is valid (:func:`text_search_window`, V7), a search of at least
+  3 characters may span the full 7 days.
 - :class:`LogsReader` pages rows newest first on the ``(ts, id)`` keyset
   (``before`` = ``"<ts>,<id>"``); follow mode (``after_ts``) returns the
   newest rows at or after a time, so a client polling with its newest
@@ -47,6 +49,11 @@ logger = logging.getLogger("lightrag.api.ops")
 DEFAULT_WINDOW_S = 3600
 MAX_WINDOW_S = 7 * 86400
 TEXT_SEARCH_WINDOW_S = 86400
+# A trigram index serves ILIKE '%q%' selectively only when q holds a run of
+# at least 3 letters or digits: pg_trgm splits words on everything else, so
+# 'a b', '1.2' or '-->' yield no full trigram and would scan the whole window.
+TRGM_MIN_Q = 3
+_TRGM_RUN = re.compile(r"[^\W_]{%d}" % TRGM_MIN_Q)
 # Clients round ``from`` down to the minute; a window that long is accepted.
 WINDOW_SLACK_S = 300
 PAGE_DEFAULT = 100
@@ -187,8 +194,27 @@ def _open_end(now: datetime) -> datetime:
     return floor + timedelta(minutes=2)
 
 
-def parse_filter(params: dict[str, Any], now: Optional[datetime] = None) -> LogFilter:
-    """A validated log filter. Raises :class:`OpsBadRequest` with a code."""
+def trgm_searchable(q: Optional[str]) -> bool:
+    """True when the trigram index can narrow an ILIKE search for ``q``: it
+    holds a run of :data:`TRGM_MIN_Q` letters or digits. The WebUI mirrors
+    this rule (``logs.ts`` ``trgmSearchable``)."""
+    return bool(q) and _TRGM_RUN.search(q) is not None
+
+
+def parse_filter(
+    params: dict[str, Any],
+    now: Optional[datetime] = None,
+    *,
+    text_window_s: int = TEXT_SEARCH_WINDOW_S,
+) -> LogFilter:
+    """A validated log filter. Raises :class:`OpsBadRequest` with a code.
+
+    ``text_window_s`` is the longest window a text search (``q``) may span:
+    :data:`TEXT_SEARCH_WINDOW_S` unless the trigram index is valid (see
+    :func:`text_search_window`); a ``q`` without a run of :data:`TRGM_MIN_Q`
+    letters or digits cannot use that index selectively and keeps the 24 h
+    cap (:func:`trgm_searchable`).
+    """
     unknown = set(params) - set(FILTER_FIELDS)
     if unknown:
         raise OpsBadRequest("invalid_filter")
@@ -208,7 +234,8 @@ def parse_filter(params: dict[str, Any], now: Optional[datetime] = None) -> LogF
     q = str(q).strip() if q is not None else ""
     if len(q) > Q_MAX:
         raise OpsBadRequest("invalid_q")
-    if q and span > TEXT_SEARCH_WINDOW_S + WINDOW_SLACK_S:
+    q_window = text_window_s if trgm_searchable(q) else TEXT_SEARCH_WINDOW_S
+    if q and span > max(q_window, TEXT_SEARCH_WINDOW_S) + WINDOW_SLACK_S:
         raise OpsBadRequest("search_window_too_long")
     workspace = params.get("workspace")
     if workspace not in (None, ""):
@@ -278,6 +305,29 @@ def parse_before(value: Any) -> Optional[tuple[datetime, int]]:
     if moment is None:
         raise OpsBadRequest("invalid_cursor")
     return moment, int(raw_id)
+
+
+async def trgm_state(service: OpsService) -> dict[str, bool]:
+    """pg_trgm detection (V7); all False without the store or on error."""
+    state = {"available": False, "installed": False, "index_valid": False}
+    if not service.available:
+        return state
+    try:
+        found = await service.store.log_trgm_state()
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        logger.debug("Ops pg_trgm state unreadable (%s)", type(e).__name__)
+        return state
+    return {key: bool(found.get(key)) for key in state}
+
+
+async def text_search_window(service: OpsService) -> int:
+    """How far back a text search may reach: 7 days once the trigram index
+    on ``LIGHTRAG_OPS_LOGS(msg)`` is valid, else 24 h (FR-20)."""
+    if (await trgm_state(service))["index_valid"]:
+        return MAX_WINDOW_S
+    return TEXT_SEARCH_WINDOW_S
 
 
 # -- views ----------------------------------------------------------------------------
@@ -738,20 +788,79 @@ async def _resolve(
                     )
                 )
         elif kind == "request":
-            for item in await store.correlate_requests(value, CORRELATE_MAX):
-                add(
-                    _match(
-                        "request",
-                        value,
-                        workspace=item.get("workspace"),
-                        ts=item.get("last_ts"),
-                        count=int(item.get("n") or 0),
-                        link=_logs_link(request_id=value),
-                    )
-                )
+            for match in await _request_matches(store, value):
+                add(match)
         elif kind == "workspace":
             await _workspace_match(service, value, add)
     return matches
+
+
+async def _request_matches(store: Any, request_id: str) -> list[dict[str, Any]]:
+    """One match per workspace for a request ID: its log lines and the LLM
+    calls (``LIGHTRAG_USAGE_CALLS.request_id``) made while serving it."""
+    logs = await store.correlate_requests(request_id, CORRELATE_MAX)
+    try:
+        calls = await store.usage_calls_by_request(request_id, CORRELATE_MAX)
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        # The log lines still answer; the LLM calls are an addition.
+        logger.warning("Ops usage-call lookup failed (%s)", type(e).__name__)
+        calls = []
+    by_ws: dict[Any, dict[str, Any]] = {}
+    for item in logs:
+        by_ws[item.get("workspace")] = {
+            "workspace": item.get("workspace"),
+            "log_lines": int(item.get("n") or 0),
+            "ts": as_utc(item.get("last_ts")),
+            "usage": None,
+        }
+    for item in calls:
+        entry = by_ws.setdefault(
+            item.get("workspace"),
+            {
+                "workspace": item.get("workspace"),
+                "log_lines": 0,
+                "ts": None,
+                "usage": None,
+            },
+        )
+        entry["usage"] = {
+            "calls": int(item.get("n") or 0),
+            "errors": int(item.get("errors") or 0),
+            "error_kinds": list(item.get("error_kinds") or [])[:8],
+            "window_hours": item.get("window_hours"),
+        }
+        entry["ts"] = max(
+            (t for t in (entry["ts"], as_utc(item.get("last_ts"))) if t is not None),
+            default=None,
+        )
+    epoch = datetime.fromtimestamp(0, timezone.utc)
+    out = []
+    for entry in sorted(by_ws.values(), key=lambda e: e["ts"] or epoch, reverse=True):
+        usage = entry["usage"]
+        parts = []
+        if entry["log_lines"]:
+            parts.append(f"{entry['log_lines']} log lines")
+        if usage:
+            text = f"{usage['calls']} LLM calls"
+            if usage["errors"]:
+                kinds = ", ".join(usage["error_kinds"])
+                text += f" ({usage['errors']} failed{': ' + kinds if kinds else ''})"
+            parts.append(text)
+        match = _match(
+            "request",
+            request_id,
+            workspace=entry["workspace"],
+            ts=entry["ts"],
+            count=entry["log_lines"] or (usage["calls"] if usage else None),
+            label=" · ".join(parts) or None,
+            link=_logs_link(request_id=request_id),
+        )
+        match["log_lines"] = entry["log_lines"]
+        match["usage_calls"] = usage
+        out.append(match)
+    return out[:CORRELATE_MAX]
 
 
 def _doc_match(

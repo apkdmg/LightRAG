@@ -1,6 +1,6 @@
 import { useTranslation } from 'react-i18next'
 import StatusCard from '@/components/status/StatusCard'
-import { Kv } from '@/features/TokenInsights/ui'
+import { Kv } from '@/components/admin'
 import { OpsWorker, WorkerSample, opsApi } from '../api'
 import ErrorPanel from '../components/ErrorPanel'
 import LogSection from '../components/LogSection'

@@ -73,7 +73,9 @@ def test_router_wide_admin_dependency_is_present():
     )
 
 
-def test_every_route_needs_admin():
+def test_every_route_needs_admin(monkeypatch):
+    # Flag-gated GETs are switched on, so they are checked like the rest.
+    monkeypatch.setenv("OPS_PROMETHEUS", "true")
     denied = TestClient(_app(admin=False), raise_server_exceptions=False)
     allowed = TestClient(_app(admin=True), raise_server_exceptions=False)
     assert ops_routes.router.routes, "router has no routes"
@@ -90,6 +92,8 @@ def test_every_route_needs_admin():
                 ok = allowed.request(method, path)
                 assert ok.status_code == 200, (method, path, ok.text)
                 assert ok.headers["cache-control"] == "no-store"
+                if ok.headers["content-type"].startswith("text/plain"):
+                    continue  # Prometheus text exposition
                 assert "generated_at" in ok.json()
 
 
@@ -107,6 +111,8 @@ def test_every_post_needs_live_admin():
 def test_status_payload_shape(monkeypatch):
     monkeypatch.setattr(ops_routes, "process_mode", lambda: "uvicorn")
     monkeypatch.delenv("OPS_OPERATOR_ACCOUNTS", raising=False)
+    for flag in ("OPS_GPU_EXPORTER_URL", "OPS_PROMETHEUS"):
+        monkeypatch.delenv(flag, raising=False)
     client = TestClient(_app(insights=True))
     response = client.get("/admin/ops/status")
     assert response.status_code == 200
@@ -128,8 +134,12 @@ def test_status_payload_shape(monkeypatch):
         "insights": True,
         "actions": False,
         "release_busy": False,
+        "release_reservations": False,
         "audit": False,
         "gpu": False,
+        "log_trgm": False,
+        "log_tail": False,
+        "prometheus": False,
         "metrics": False,
     }
     assert body["process"] == {

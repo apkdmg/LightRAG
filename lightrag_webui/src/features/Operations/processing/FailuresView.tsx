@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { cn } from '@/lib/utils'
-import { Seg } from '@/features/TokenInsights/ui'
+import { Seg } from '@/components/admin'
 import { FailureGroup, opsApi } from '../api'
 import ErrorPanel from '../components/ErrorPanel'
 import { Pager, Panel } from '../components/Panel'

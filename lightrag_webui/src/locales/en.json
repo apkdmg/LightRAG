@@ -657,7 +657,6 @@
     "estCost": "Est. cost",
     "loading": "Loading…",
     "empty": "No usage in this period.",
-    "viewFailed": "This view could not be shown. Choose another view or reload the page.",
     "notKnownYet": "Not known yet",
     "needs28": "Needs 28 days of data",
     "notEnoughToCompare": "Not enough history to compare yet",
@@ -1047,7 +1046,8 @@
         "prompt": "Prompt",
         "answer": "Answer",
         "latency": "Latency",
-        "status": "Status"
+        "status": "Status",
+        "request": "Request"
       },
       "status": {
         "ok": "OK",
@@ -1061,7 +1061,8 @@
       "maskNote": "Document names are partly hidden, here and in exports. The # code is the start of the document ID, which the owner can look up on the Documents page.",
       "leafNote": "Click a name to see its individual calls: time, tokens, status and latency. Prompt and answer text is never stored.",
       "note": "Click a name to go one level deeper. Click a chip to step back.",
-      "docCalls": "Calls for {{id}}"
+      "docCalls": "Calls for {{id}}",
+      "requestHint": "Request {{id}}: open its log lines in Operations"
     },
     "operation": {
       "extraction": "Chunk extraction",
@@ -1504,10 +1505,13 @@
       "off": "Off",
       "later": "Not available yet",
       "multiWorkerOnly": "Multi-worker only",
-      "metrics": "Performance metrics"
+      "metrics": "Performance metrics",
+      "log_trgm": "Text search over 7 days",
+      "log_tail": "Live log tail",
+      "prometheus": "Prometheus metrics endpoint"
     },
     "unavailableShort": "Not available: this view needs PostgreSQL KV storage (LIGHTRAG_KV_STORAGE=PGKVStorage).",
-    "maskNote": "File names are masked on the server. Revealing one is an audited action that arrives in a later release.",
+    "maskNote": "File names are masked on the server. An operator can reveal one from its document drawer by giving a reason, and every reveal is audited.",
     "approximate": {
       "label": "Approximate (interim)",
       "hint": "Read from workspaces with documents in progress and a read-only snapshot of their pipeline state, because run tracking is off or not answering. A run can be missing or shown late."
@@ -1843,6 +1847,8 @@
         "reservationScan": "A scan reservation is held with no live scan owner. It blocks email drains and deletes.",
         "reservationEnqueue_one": "{{count}} upload reservation is held with no live owner. It blocks email drains and deletes.",
         "reservationEnqueue_other": "{{count}} upload reservations are held with no live owner. They block email drains and deletes.",
+        "reservationEnqueueDead_one": "{{count}} upload reservation belongs to a worker that has exited. It blocks email drains and deletes.",
+        "reservationEnqueueDead_other": "{{count}} upload reservations belong to a worker that has exited. They block email drains and deletes.",
         "unresponsive": "Worker {{pid}} still exists but stopped sending heartbeats {{age}} ago while holding this workspace.",
         "unresponsiveNoPid": "The owner worker still exists but stopped sending heartbeats {{age}} ago while holding this workspace.",
         "busy_no_run": "Busy is set, but no run or live owner holds it (for example after an upgrade or a crash).",
@@ -2212,7 +2218,11 @@
       "failuresWindow": "Classified failures in the last 7 days.",
       "logs_one": "Errors in logs: {{count}} in the last hour",
       "logs_other": "Errors in logs: {{count}} in the last hour",
-      "logsTitle": "Log lines for this workspace"
+      "logsTitle": "Log lines for this workspace",
+      "openDocuments": "Open in Documents",
+      "openDocumentsActive": "Documents is acting on this workspace",
+      "openDocumentsHint": "Documents will show and change this workspace, under an \"Acting on\" banner, until you exit. Changes are audited.",
+      "openDocumentsRefused": "Only admins can act on another workspace."
     },
     "document": {
       "path": "{{workspace}} › {{id}}",
@@ -2292,7 +2302,8 @@
       "disk": "Disk",
       "etcd": "etcd",
       "minio": "MinIO",
-      "signin": "Sign-in"
+      "signin": "Sign-in",
+      "gpu": "GPU"
     },
     "probe": {
       "ok": "OK",
@@ -2379,6 +2390,13 @@
           "local_storage": "local files on this server",
           "not_configured": "address not readable by the probe",
           "no_probe": "no probe for this backend"
+        },
+        "gpu": "GPU {{index}} {{util}} · {{mem}} · {{temp}}",
+        "gpuMore": "+{{count}} more GPUs",
+        "gpuReason": {
+          "hot": "running hot",
+          "memory_full": "memory nearly full",
+          "no_gpus": "no GPUs listed"
         }
       }
     },
@@ -2697,7 +2715,8 @@
         "delta": "{{commits}} commits · {{rollbacks}} rollbacks · {{deadlocks}} deadlocks · {{temp}} temp files",
         "cacheHit": "cache hit {{pct}}%",
         "sampled": "Postgres numbers read {{time}}"
-      }
+      },
+      "gpuLine": "GPU {{index}}: {{util}} · {{mem}} · {{temp}}"
     },
     "config": {
       "title": "Configuration",
@@ -2897,7 +2916,10 @@
         "last": "Last",
         "workspaces": "Workspaces",
         "show": "Show"
-      }
+      },
+      "tail": "Live tail",
+      "textPlaceholderWeek": "Search the last 7 days",
+      "textWindowShort": "A search beyond the last 24 hours needs at least 3 letters or digits in a row, so the time filter is narrowed to 24 hours."
     },
     "logEntry": {
       "notFound": "This log line no longer exists (lines are kept for 14 days) or the ID is wrong.",
@@ -2997,7 +3019,8 @@
         "http": "HTTP",
         "throughput": "Throughput",
         "concurrency": "Concurrency",
-        "top": "Top workspaces"
+        "top": "Top workspaces",
+        "gpu": "GPU"
       },
       "autoNote": "Refreshes every 60 s.",
       "manualNote": "Long windows refresh only when you press Refresh.",
@@ -3142,7 +3165,8 @@
         "cancel": "Cancel…",
         "release_busy": "Release busy…",
         "run": "Run pipeline now…",
-        "drain_email": "Drain email…"
+        "drain_email": "Drain email…",
+        "release_reservations": "Release reservations…"
       },
       "hint": {
         "notBusy": "The pipeline is not busy.",
@@ -3151,7 +3175,8 @@
         "busy": "The pipeline is busy. It picks up new work when the current run ends.",
         "noEmail": "Nothing is waiting in the email queue.",
         "operatorOnly": "Only operators can release busy.",
-        "ownerAlive": "The worker that owns the run still reports in. Cancel the run, or restart the container if the worker is frozen."
+        "ownerAlive": "The worker that owns the run still reports in. Cancel the run, or restart the container if the worker is frozen.",
+        "ownerUnknown": "The server cannot confirm the owner is gone; restart the container instead."
       },
       "reason": "Reason",
       "reasonPlaceholder": "Ticket number or why you are doing this",
@@ -3193,7 +3218,11 @@
         "not_in_maintenance": "Maintenance mode was not on.",
         "no_capture": "No INFO capture was running.",
         "no_change": "Nothing changed.",
-        "alert_resolved": "This alert has already resolved; nothing to ack."
+        "alert_resolved": "This alert has already resolved; nothing to ack.",
+        "reservations_released": "Released the dead worker's reservations.",
+        "reservationOwnerAlive": "Refused: the worker that holds the reservation is still alive.",
+        "reservationChanged": "The reservation changed since you looked. Refresh and try again.",
+        "not_held": "Nothing to release: that worker no longer holds a reservation here."
       },
       "cancel": {
         "title": "Cancel processing in {{workspace}}",
@@ -3243,6 +3272,17 @@
         "liveFailed": "The live state could not be read, so busy cannot be released safely. Close this and try again.",
         "notBusy": "The pipeline is no longer busy: there is nothing to release.",
         "confirm": "Release busy"
+      },
+      "reservations": {
+        "title": "Release reservations in {{workspace}}?",
+        "onlyGone": "Only for a worker that is gone. The server checks its heartbeat and process first and refuses if it is still alive.",
+        "held": "Worker {{worker}} holds {{what}}.",
+        "scanning": "the scan flag",
+        "enqueues_one": "{{count}} pending enqueue",
+        "enqueues_other": "{{count}} pending enqueues",
+        "body": "This clears the dead worker's scan flag and releases only its own pending enqueues, so new scans and runs can start.",
+        "untouched": "Busy, other workers' enqueues and a queued \"process again\" request are left as they are.",
+        "confirm": "Release reservations"
       }
     },
     "reveal": {
@@ -3604,6 +3644,72 @@
       "operatorOnly": "Only operators can capture INFO lines.",
       "emptyAction": "Capture INFO for 60 min…",
       "sinkOff": "This server does not store log lines (OPS_LOG_SINK is off)."
+    },
+    "tail": {
+      "levelLabel": "Lowest level",
+      "level": {
+        "INFO": "INFO+",
+        "WARNING": "WARNING+",
+        "ERROR": "ERROR+"
+      },
+      "pause": "Pause",
+      "resume": "Resume",
+      "module": "Module: {{module}}",
+      "off": "Live tail reads each process's own log file, and those files are off on this server. An operator turns them on with OPS_JSONL_LOGS=true.",
+      "paused": "Paused",
+      "pausedAt": "Paused · last read {{time}}",
+      "live": "Live · every {{seconds}} s",
+      "files_one": "{{count}} process",
+      "files_other": "{{count}} processes",
+      "listLabel": "Live log lines, newest first",
+      "empty": "No {{level}} lines from the live processes yet.",
+      "truncated": "Some process files were cut short or left out (the read budget); the oldest of their lines may be missing.",
+      "capped": "Showing the newest {{cap}} lines. Older ones are in each process's log file.",
+      "footer": "{{count}} lines · redacted when written and again when read",
+      "note": "Live tail filters by level and module only, and includes INFO. Lines come from the processes running now and from ones that exited in the last few minutes; use Stream for stored WARNING+ lines from any time in the last 7 days."
+    },
+    "gpu": {
+      "title": "GPU {{index}}",
+      "util": "Utilisation",
+      "memory": "Memory",
+      "temp": "Temperature",
+      "power": "Power",
+      "hot": "Running hot",
+      "memoryFull": "Memory nearly full",
+      "noGpus": "The exporter answered but listed no GPUs.",
+      "chart": {
+        "util": "Utilisation",
+        "mem": "Memory in use",
+        "temp": "Temperature",
+        "power": "Power draw"
+      },
+      "noHistory": "No samples in this window yet.",
+      "now": "GPUs now",
+      "sub": "From the GPU exporter, every probe cycle (30 s)",
+      "exporterDown": "The GPU exporter did not answer ({{error}}). The last numbers it gave are below.",
+      "historyTitle": "History",
+      "historySub": "Per GPU, from the probe rows",
+      "note": "Read from the nvidia_gpu_exporter sidecar over the compose network; the API container has no GPU access of its own. vLLM's KV cache and queues stay on the embedding and rerank cards.",
+      "off": "GPU metrics are off on this server. With the GPU preset, an operator enables the exporter sidecar in the setup wizard and sets OPS_GPU_EXPORTER_URL. Until then, vLLM's KV cache on the embedding and rerank cards is the only GPU signal.",
+      "openHistory": "History",
+      "chartSub": {
+        "util": "Average per bucket",
+        "mem": "Peak per bucket",
+        "temp": "Peak per bucket",
+        "power": "Average per bucket"
+      },
+      "noReading": "No reading from the GPU exporter yet. The first one arrives with the next probe cycle.",
+      "checked": "Read {{time}} from the GPU exporter"
+    }
+  },
+  "admin": {
+    "viewFailed": "This view could not be shown. Choose another view or reload the page.",
+    "acting": {
+      "label": "Acting on another workspace",
+      "title": "Acting on workspace {{workspace}}.",
+      "body": "Documents shows and changes this workspace, not your own. Every change you make there is audited.",
+      "openDocuments": "Go to Documents",
+      "exit": "Exit"
     }
   }
 }

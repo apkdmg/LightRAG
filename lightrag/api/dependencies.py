@@ -138,6 +138,40 @@ async def _audit_admin_document_write(
     await note_document_mutation(request, user, workspace)
 
 
+def _require_current_admin(user: UserInfo, target_workspace: str) -> None:
+    """Refuse an interactive on-behalf request unless the user is an admin by
+    the configuration in force now and the session is not impersonated.
+
+    The ``role`` claim is copied forward when a token is renewed, so a user
+    removed from ``ADMIN_ACCOUNTS`` keeps it until the token expires; the
+    Operations console's "act on workspace" mode (OQ-13) and its actions
+    apply the same live check. Service accounts keep their OBO allowlist.
+    """
+    from .ops.auth import is_impersonated, is_live_admin
+
+    if is_impersonated(user):
+        logger.warning(
+            f"Impersonated session '{user.username}' attempted on-behalf "
+            f"operation for workspace '{target_workspace}'"
+        )
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail="impersonation_not_allowed"
+        )
+    try:
+        live = is_live_admin(user)
+    except Exception as e:
+        logger.warning(f"Live admin check failed ({type(e).__name__})")
+        live = False
+    if not live:
+        logger.warning(
+            f"User '{user.username}' with a stale admin claim attempted on-behalf "
+            f"operation for workspace '{target_workspace}'"
+        )
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail="admin_not_current"
+        )
+
+
 async def resolve_workspace_from_request(request: Request) -> str:
     """
     Resolve the workspace ID from a request without using FastAPI's DI.
@@ -180,6 +214,8 @@ async def resolve_workspace_from_request(request: Request) -> str:
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Only admins can perform operations on behalf of other users",
             )
+        if not is_service_account:
+            _require_current_admin(user, target_workspace)
 
         sanitized_target = sanitize_workspace_id(target_workspace)
 
@@ -440,6 +476,8 @@ async def get_current_workspace(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Only admins can perform operations on behalf of other users",
             )
+        if not is_service_account:
+            _require_current_admin(user, target_workspace)
 
         sanitized_target = sanitize_workspace_id(target_workspace)
 

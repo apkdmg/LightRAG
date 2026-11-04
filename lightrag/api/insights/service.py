@@ -1397,8 +1397,11 @@ class InsightsService:
         doc_id: Optional[str] = None,
         client: Optional[str] = None,
         day: Optional[str] = None,
+        request_id: Optional[str] = None,
     ) -> list[dict[str, Any]]:
-        """Individual calls: counts and timing only, never any text."""
+        """Individual calls: counts and timing only, never any text. A failed
+        call carries its ``error_kind``; ``request_id`` is the API request it
+        served (and filters to one)."""
         today = self.today()
         start = today - timedelta(days=min(range_days, 90) - 1)
         end = today
@@ -1410,6 +1413,7 @@ class InsightsService:
             filters={k: v for k, v in filters.items() if k in DIMENSIONS and v} or None,
             doc_id=doc_id,
             client=client,
+            request_id=request_id,
         )
         return [
             {
@@ -1432,6 +1436,8 @@ class InsightsService:
                         "cache_hit",
                         "estimated",
                         "measured",
+                        "error_kind",
+                        "request_id",
                     )
                 },
             }

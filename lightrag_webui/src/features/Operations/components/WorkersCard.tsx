@@ -1,5 +1,5 @@
 import { useTranslation } from 'react-i18next'
-import { Card, Title } from '@/features/TokenInsights/ui'
+import { Card, Title } from '@/components/admin'
 import type { OpsWorker } from '../api'
 import { useOpsNav } from '../context'
 import { fmtAge, fmtBytes, fmtLatency } from '../format'

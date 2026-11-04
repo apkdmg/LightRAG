@@ -16,9 +16,9 @@ export type OpsTab = (typeof OPS_TABS)[number]
 export const OPS_SUBS: Record<OpsTab, readonly string[]> = {
   overview: [],
   processing: ['active', 'stuck', 'backlog', 'failures', 'email', 'pauses', 'runs'],
-  logs: ['stream', 'grouped'],
+  logs: ['stream', 'grouped', 'tail'],
   health: ['deps', 'signin', 'workers', 'host', 'config'],
-  performance: ['llm', 'deps', 'http', 'throughput', 'concurrency', 'top'],
+  performance: ['llm', 'deps', 'http', 'throughput', 'concurrency', 'top', 'gpu'],
   activity: ['alerts', 'audit', 'events', 'export']
 }
 

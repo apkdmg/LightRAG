@@ -4,7 +4,8 @@ import { downloadFile, insightsApi } from './api'
 import { ForecastChart } from './charts'
 import { useData, useInsights } from './context'
 import { PURPOSES } from './meta'
-import { Card, Empty, PurposeName, Title, fmtChange, fmtDay, fmtMoney, fmtPct, fmtTokens } from './ui'
+import { Card, Empty, Title } from '@/components/admin'
+import { PurposeName, fmtChange, fmtDay, fmtMoney, fmtPct, fmtTokens } from './ui'
 
 function Slider({ label, hint, value, min, max, step, shown, onChange }: { label: string; hint: string; value: number; min: number; max: number; step: number; shown: string; onChange: (v: number) => void }) {
   return (

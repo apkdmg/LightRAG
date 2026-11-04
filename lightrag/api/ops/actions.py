@@ -1,7 +1,8 @@
 """Admin actions of the Operations console, and the audited reveal.
 
 Every action (cancel, run now, drain the email queue, release a stale busy
-slot) follows the same sequence (§3.9):
+slot, release a dead worker's reservations) follows the same sequence
+(§3.9):
 
 1. ``require_admin`` at the router, ``require_live_admin`` (and
    ``require_operator`` where marked), a JSON body and the CSRF checks: done
@@ -96,6 +97,16 @@ RELEASE_CAS_KEYS = (
     "heartbeat_at",
     "job_start",
     "job_name",
+)
+# What "release reservations" reads (OQ-12): the scan flag with its owner,
+# and the pending_enqueues counter with its per-worker shares.
+RESERVATION_KEYS = (
+    "scanning",
+    "scanning_exclusive",
+    "scan_owner_worker_id",
+    "scan_started_at",
+    "pending_enqueues",
+    run_hooks.PENDING_OWNERS_KEY,
 )
 RELEASED_BY = "Released by admin {actor}"
 CANCEL_MESSAGE = "Pipeline cancellation requested by an administrator"
@@ -298,7 +309,16 @@ class OpsActions:
             audit_extra = {
                 k: v
                 for k, v in outcome.items()
-                if k in ("would_process", "pending", "released", "how", "owner_state")
+                if k
+                in (
+                    "would_process",
+                    "pending",
+                    "released",
+                    "how",
+                    "owner_state",
+                    "released_scanning",
+                    "released_pending",
+                )
             }
             result_id = await self._result_audit(call, intent_id, code, audit_extra)
             logger.info(
@@ -704,6 +724,148 @@ class OpsActions:
                 how=how,
                 run_now_offered=request_pending,
                 run_marked_orphaned=orphaned,
+            )
+
+        return await self.perform(call, body)
+
+    # -- release a dead worker's reservations (Gunicorn only, OQ-12) -------------------
+    @staticmethod
+    def _held_by(data: Any, worker_id: str) -> tuple[bool, Optional[str], int]:
+        """``(scan_held, scan_started_at, pending_share)`` of one worker."""
+        if not data:
+            return False, None, 0
+        scan = bool(data.get("scanning")) and data.get("scan_owner_worker_id") == (
+            worker_id
+        )
+        started = _job_start_iso(data.get("scan_started_at")) if scan else None
+        share = run_hooks.pending_owners(data.get(run_hooks.PENDING_OWNERS_KEY)).get(
+            worker_id, 0
+        )
+        return scan, started, share
+
+    async def _worker_state(
+        self, worker_id: str, since: Optional[float]
+    ) -> tuple[str, Optional[str]]:
+        """``(state, how)`` of a worker named by its ID, confirmed outside the
+        lock from its heartbeat row and the OS (PID and create time, or the
+        ``child_exit`` marker)."""
+        store = self.store
+        workers = await self.service._q(lambda: store.workers(WORKERS_LIMIT))
+        worker = next((w for w in workers if w.get("worker_id") == worker_id), None)
+        try:
+            markers = self._markers()
+        except Exception:
+            markers = {}
+        return owner_check(
+            worker=worker,
+            pid=(worker or {}).get("pid"),
+            worker_id=worker_id,
+            since=since,
+            my_worker_id=self.service.worker_id,
+            host=self.host,
+            markers=markers,
+            stale_s=OWNER_STALE_S,
+            alive=self.alive,
+            owner_host=(worker or {}).get("host"),
+        )
+
+    async def release_reservations(
+        self,
+        call: ActionCall,
+        *,
+        mode: str,
+        worker_id: str,
+        expected_scan_started_at: Optional[str],
+        expected_pending: int,
+    ) -> dict[str, Any]:
+        """Release what a dead worker reserved: its ``scanning`` flag (when it
+        owns it) and its share of ``pending_enqueues`` (Gunicorn only).
+
+        Nothing of a live (or unconfirmed) worker is ever touched: the owner
+        must be confirmed dead outside the lock, and under the lock the
+        worker must still hold exactly what the operator saw (compare-and-set
+        on ``scan_started_at`` and the share). ``busy``, ``request_pending``
+        and other workers' shares are never touched; the counter goes down
+        by the released share only.
+        """
+        namespace = self.service.namespace_of(call.workspace)
+        actor = actor_of(call.user)["actor"]
+
+        def refused(reason: str, **extra: Any) -> dict[str, Any]:
+            return _result(reason, released=False, reason=reason, **extra)
+
+        expected_start = _job_start_iso(expected_scan_started_at)
+        expected_share = max(0, int(expected_pending or 0))
+
+        async def body() -> dict[str, Any]:
+            if mode != "gunicorn" or not shared_storage.is_multiprocess():
+                return refused("single_process")
+            snap, responsive = await self.service.reader.snapshot(
+                namespace, RESERVATION_KEYS
+            )
+            if not responsive:
+                return refused("lock_unavailable", guidance="restart_container")
+            scan, started, share = self._held_by(snap, worker_id)
+            if not scan and share == 0:
+                return refused("not_held")
+            if started != expected_start or share != expected_share:
+                # What the operator looked at is not what is held now.
+                return refused("cas_mismatch")
+            state, how = await self._worker_state(worker_id, _epoch(started))
+            if state in ("alive", "unresponsive"):
+                return refused("owner_alive", owner_state=state)
+            if state != "dead":
+                return refused("owner_unknown", owner_state=state)
+            async with shared_storage.try_acquire_namespace_lock(
+                PIPELINE_NAMESPACE, namespace, timeout=self.lock_timeout_s
+            ) as lock:
+                if not lock.acquired:
+                    return {
+                        **_lock_unavailable(lock.waited_s),
+                        "released": False,
+                        "reason": "lock_unavailable",
+                    }
+                data = shared_storage.existing_namespace_data(
+                    PIPELINE_NAMESPACE, namespace
+                )
+                if (scan, started, share) != self._held_by(data, worker_id):
+                    return refused("cas_mismatch")
+                update: dict[str, Any] = {}
+                if scan:
+                    update.update(
+                        {
+                            "scanning": False,
+                            "scanning_exclusive": False,
+                            "scan_owner_worker_id": None,
+                            "scan_started_at": None,
+                        }
+                    )
+                if share:
+                    owners = run_hooks.pending_owners(
+                        data.get(run_hooks.PENDING_OWNERS_KEY)
+                    )
+                    owners.pop(worker_id, None)
+                    counter = int(data.get("pending_enqueues", 0) or 0)
+                    # Replace the whole value (Manager-backed shared state).
+                    update[run_hooks.PENDING_OWNERS_KEY] = owners
+                    update["pending_enqueues"] = max(0, counter - share)
+                data.update(update)
+            logger.warning(
+                "Ops: admin %s released the reservations of dead worker %s on %s "
+                "(scanning=%s, pending_enqueues share=%d, owner %s)",
+                actor,
+                worker_id[:8],
+                call.workspace,
+                scan,
+                share,
+                how,
+            )
+            return _result(
+                "released",
+                released=True,
+                how=how,
+                released_scanning=scan,
+                released_pending=share,
             )
 
         return await self.perform(call, body)

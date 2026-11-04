@@ -212,8 +212,8 @@ describe('actionOffer', () => {
     expect(actionOffer('drain_email', ctx({ emailPending: null }))).toMatchObject({ disabled: false })
   })
 
-  test('stuck rows: reservations get guidance only, stale docs Run now, held runs cancel or release', () => {
-    expect(stuckActionKinds({ cls: 'reservation' })).toEqual([])
+  test('stuck rows: reservations release (OQ-12), stale docs Run now, held runs cancel or release', () => {
+    expect(stuckActionKinds({ cls: 'reservation' })).toEqual(['release_reservations'])
     expect(stuckActionKinds({ cls: 'stale_doc' })).toEqual(['run'])
     expect(stuckActionKinds({ cls: 'orphaned' })).toEqual(['cancel', 'release_busy'])
   })

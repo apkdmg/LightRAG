@@ -58,7 +58,8 @@ const DEFAULT_BUCKET_S: Record<PerfWindow, number> = { '15m': 60, '1h': 60, '24h
 
 export const isPerfWindow = (v: unknown): v is PerfWindow => typeof v === 'string' && (PERF_WINDOWS as readonly string[]).includes(v)
 
-export const PERF_SECTIONS = ['llm', 'deps', 'http', 'throughput', 'concurrency', 'top'] as const
+/** `gpu` is offered only while the server reads a GPU exporter (`features.gpu`, D5). */
+export const PERF_SECTIONS = ['llm', 'deps', 'http', 'throughput', 'concurrency', 'top', 'gpu'] as const
 export type PerfSection = (typeof PERF_SECTIONS)[number]
 
 // ---------- time ----------

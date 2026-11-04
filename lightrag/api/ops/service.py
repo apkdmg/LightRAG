@@ -60,7 +60,7 @@ from lightrag.api.ops.perf import (
 from lightrag.api.ops.probes import STRIP_SLOT_S, ProbeSpec
 from lightrag.api.ops.queue_scan import SCAN_INTERVAL_S, SUMMARY_KEY
 from lightrag.api.ops.redact import mask_path, redact, redact_pipeline
-from lightrag.api.ops.runs import job_label
+from lightrag.api.ops.runs import job_label, pending_owners
 from lightrag.api.ops.snapshot import LIVE_KEYS, NamespaceReader
 from lightrag.api.ops.store import (
     ACTIVE_STATUSES,
@@ -1807,6 +1807,14 @@ class OpsService:
                 "heartbeat_at": snap.get("heartbeat_at"),
                 "scan_owner_worker_id": snap.get("scan_owner_worker_id"),
                 "scan_started_at": snap.get("scan_started_at"),
+                # Per-worker shares of pending_enqueues (OQ-12), for a guarded
+                # release of a dead worker's reservations.
+                "pending_enqueue_owners": [
+                    {"worker_id": worker, "count": count}
+                    for worker, count in sorted(
+                        pending_owners(snap.get("pending_enqueue_owners")).items()
+                    )
+                ],
             }
         owner = await self._owner(workspace)
         counts: Optional[dict[str, Any]] = None

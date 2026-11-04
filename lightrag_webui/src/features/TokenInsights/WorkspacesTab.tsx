@@ -4,7 +4,8 @@ import Input from '@/components/ui/Input'
 import { useDebounce } from '@/hooks/useDebounce'
 import { insightsApi } from './api'
 import { useData, useInsights } from './context'
-import { Card, Empty, Mix, Seg, StatusLabel, TextButton, Title, fmtChange, fmtCount, fmtMoney, fmtPct, fmtTokens } from './ui'
+import { Card, Empty, Seg, TextButton, Title } from '@/components/admin'
+import { Mix, StatusLabel, fmtChange, fmtCount, fmtMoney, fmtPct, fmtTokens } from './ui'
 
 type Sort = 'cost' | 'tokens' | 'change' | 'documents' | 'questions'
 

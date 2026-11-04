@@ -11,9 +11,13 @@ import { isMultiWorker } from './severity'
  * already knows will be refused.
  */
 
-export type ActionKind = 'cancel' | 'run' | 'drain_email' | 'release_busy'
+export type ActionKind = 'cancel' | 'run' | 'drain_email' | 'release_busy' | 'release_reservations'
 
-/** The order of the Workspace drawer's buttons (§2.9 wireframe). */
+/**
+ * The order of the Workspace drawer's buttons (§2.9 wireframe). Release
+ * reservations is offered from the Stuck view's reservation rows, where the
+ * reconcile has found a reservation with no live owner.
+ */
 export const ACTION_ORDER: ActionKind[] = ['cancel', 'release_busy', 'run', 'drain_email']
 
 /** FR-56: every action carries a reason of 3 to 512 characters. */
@@ -73,6 +77,52 @@ export const actionsEnabled = (status: OpsStatus | null | undefined) => status?.
 export const releaseOffered = (status: OpsStatus | null | undefined) =>
   actionsEnabled(status) && isMultiWorker(status?.process.mode) && status?.features?.release_busy !== false
 
+/**
+ * Release reservations (OQ-12) exists only in multi-worker mode: a single
+ * process cannot outlive its own reservations. A server that reports
+ * `release_reservations: false` has it off; one that does not report it
+ * (one release behind) does not have the route.
+ */
+export const releaseReservationsOffered = (status: OpsStatus | null | undefined) =>
+  actionsEnabled(status) && isMultiWorker(status?.process.mode) && status?.features?.release_reservations === true
+
+/**
+ * What one worker holds on a workspace (OQ-12): the scanning flag (when it
+ * owns the scan) and its share of pending enqueues. Release works per
+ * worker and sends these back as the expected values.
+ */
+export type ReservationFacts = {
+  /** The owner worker; null when the slot names none (a reservation from before owner tracking). */
+  workerId: string | null
+  scanning: boolean
+  /** The scan's start as held in shared state; null when the worker owns no scan. */
+  scanStartedAt: string | null
+  /** The worker's share of pending_enqueues (0 when it holds none). */
+  share: number
+  /** The reconcile verdict for the stuck row: owner_dead | owner_unknown | no_owner | held. */
+  reasonCode?: string | null
+}
+
+/**
+ * The release-reservations request (OQ-12): the worker, the typed name and
+ * what the page showed that worker holding, which the server compares under
+ * the lock (a scan start it no longer owns, or a different share, is a
+ * cas_mismatch). Null when there is no named worker to release.
+ */
+export function releaseReservationsBody(reason: string, typed: string, r: ReservationFacts | null | undefined) {
+  if (!r?.workerId) return null
+  return {
+    reason,
+    confirm: typed.trim(),
+    worker_id: r.workerId,
+    expected_scan_started_at: r.scanning ? r.scanStartedAt : null,
+    expected_pending: Math.max(0, Math.round(r.share))
+  }
+}
+
+/** Reason codes whose owner the server cannot confirm dead: it would refuse with owner_unknown. */
+const RESERVATION_UNKNOWN = new Set(['owner_unknown', 'no_owner'])
+
 export type ActionContext = {
   status: OpsStatus | null | undefined
   /** The workspace's pipeline holds `busy`; null when not known (no live state). */
@@ -87,6 +137,8 @@ export type ActionContext = {
   ownerSuspect?: boolean
   /** Records waiting in the email queue; null when not known. */
   emailPending?: number | null
+  /** The reservation flags the workspace holds; Release reservations is offered only while one is held. */
+  reservation?: ReservationFacts | null
 }
 
 export type ActionOffer = {
@@ -117,6 +169,14 @@ export function actionOffer(kind: ActionKind, ctx: ActionContext): ActionOffer |
     if (ctx.emailPending === 0) return offer(kind, 'noEmail')
     return offer(kind, null)
   }
+  if (kind === 'release_reservations') {
+    const r = ctx.reservation
+    if (!releaseReservationsOffered(ctx.status) || !r) return null
+    if (!ctx.status?.operator) return offer(kind, 'operatorOnly')
+    // No named owner (a slot from before owner tracking, or a counter nobody claimed): nothing can be confirmed dead.
+    if (!r.workerId || RESERVATION_UNKNOWN.has(r.reasonCode ?? '') || (!r.scanning && r.share <= 0)) return offer(kind, 'ownerUnknown')
+    return offer(kind, null)
+  }
   // release_busy: not rendered in single-process mode; disabled with a hint for non-operators (§2.4).
   if (!releaseOffered(ctx.status)) return null
   if (!ctx.status?.operator) return offer(kind, 'operatorOnly')
@@ -138,11 +198,11 @@ export const OWNER_SUSPECT_STATES = new Set(['orphaned', 'busy_without_run'])
 /**
  * What a stuck row can be acted on with: a run that holds its workspace can
  * be cancelled, or released when its owner is gone; a stale document can be
- * re-driven by Run now. Reservations without an owner have only restart
- * guidance (OQ-12).
+ * re-driven by Run now. A reservation without a live owner can be released
+ * (OQ-12): only the dead worker's share, confirmed on the server.
  */
 export function stuckActionKinds(row: { cls: string }): ActionKind[] {
-  if (row.cls === 'reservation') return []
+  if (row.cls === 'reservation') return ['release_reservations']
   if (row.cls === 'stale_doc') return ['run']
   return ['cancel', 'release_busy']
 }
@@ -252,7 +312,7 @@ export type ActionOutcome = {
 }
 
 /** Codes that did what was asked. */
-const SUCCESS = new Set(['cancellation_requested', 'started', 'kicked', 'started_local', 'released', 'revealed', ...Object.values(ALERT_OK_CODES)])
+const SUCCESS = new Set(['cancellation_requested', 'started', 'kicked', 'started_local', 'released', 'reservations_released', 'revealed', ...Object.values(ALERT_OK_CODES)])
 /** Nothing to do, or it will happen anyway: not an error, not a success. */
 const NO_OP = new Set([
   'not_busy',
@@ -265,7 +325,8 @@ const NO_OP = new Set([
   'not_muted',
   'not_in_maintenance',
   'no_capture',
-  'no_change'
+  'no_change',
+  'not_held'
 ])
 
 const isRefusal = (code: string): code is Refusal => (REFUSALS as readonly string[]).includes(code)
@@ -297,6 +358,8 @@ export function outcomeOf(action: OutcomeAction, resp: ActionResponse | null | u
   // An alert action answers {ok, audit_id}; a named result (already_acked, …) wins.
   else if (isAlertAction(action)) code = alertCode(action, r)
   else if (action === 'release_busy') code = r.released === true ? 'released' : (text(r.reason) ?? text(r.result) ?? 'unknown')
+  // Release reservations answers like release busy; what it freed is quoted from released_scanning / released_enqueues.
+  else if (action === 'release_reservations') code = r.released === true ? 'reservations_released' : (text(r.reason) ?? text(r.result) ?? 'unknown')
   else code = text(r.result) ?? 'unknown'
   const inProgressBy = code === 'in_progress_by' ? inProgressOf(r) : null
   return {
@@ -345,6 +408,10 @@ export function outcomeMessage(o: ActionOutcome): OutcomeMessage {
   }
   if (o.code === 'released' && o.offerRunNow) return { key: 'operations.actions.result.releasedRunPending', values: {} }
   if (o.code === 'not_busy' && o.action === 'release_busy') return { key: 'operations.actions.result.notBusyRelease', values: {} }
+  // Release reservations is about a reservation's owner, not a run's.
+  if (o.action === 'release_reservations' && (o.code === 'owner_alive' || o.code === 'cas_mismatch')) {
+    return { key: o.code === 'owner_alive' ? 'operations.actions.result.reservationOwnerAlive' : 'operations.actions.result.reservationChanged', values: {} }
+  }
   // A reveal of a document or job that changed since the page was drawn.
   if (o.code === 'not_found' && o.action === 'reveal') return { key: 'operations.reveal.notFound', values: {} }
   // An ack of an alert that retention removed (or a wrong id from an old link).
