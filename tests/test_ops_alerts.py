@@ -415,7 +415,8 @@ async def test_repeat_after_the_repeat_window_and_one_resolve_email(email_on):
     await ev.notify(await run(ev))
     # Resolved, but the resolve email waits out the flapping window.
     assert await ev.notify(await run(ev)) == 0
-    clock.advance(ops_alerts.RESOLVE_EMAIL_QUIET_S)
+    # One second past the window: stored times round to the microsecond.
+    clock.advance(ops_alerts.RESOLVE_EMAIL_QUIET_S + 1)
     assert await ev.notify(await run(ev)) == 1
     assert mail.sent[-1][1]["Subject"].endswith("RESOLVED pg_probe")
     # Never twice.
@@ -1693,7 +1694,8 @@ async def test_a_refire_after_a_resolve_email_waits_out_the_cooldown(email_on):
     await run(ev)
     clock.advance(60)
     await ev.notify(await run(ev))  # resolved
-    clock.advance(ops_alerts.RESOLVE_EMAIL_QUIET_S)
+    # One second past the window: stored times round to the microsecond.
+    clock.advance(ops_alerts.RESOLVE_EMAIL_QUIET_S + 1)
     assert await ev.notify(await run(ev)) == 1  # the resolve email
     told = clock.now
     clock.advance(180)
@@ -1701,7 +1703,8 @@ async def test_a_refire_after_a_resolve_email_waits_out_the_cooldown(email_on):
     while clock.now - told < ops_alerts.FLAP_COOLDOWN_S - 60:
         clock.advance(60)
         assert await ev.notify(await run(ev, item("pg_probe"))) == 0
-    clock.advance(60)
+    # One second past the cooldown: stored times round to the microsecond.
+    clock.advance(61)
     assert await ev.notify(await run(ev, item("pg_probe"))) == 1
     assert len(mail.sent) == 3 and "Opened" in mail.sent[2][1].get_content()
 

@@ -1511,7 +1511,7 @@
       "prometheus": "Prometheus metrics endpoint"
     },
     "unavailableShort": "Not available: this view needs PostgreSQL KV storage (LIGHTRAG_KV_STORAGE=PGKVStorage).",
-    "maskNote": "File names are masked on the server. Revealing one is an audited action that arrives in a later release.",
+    "maskNote": "File names are masked on the server. An operator can reveal one from its document drawer by giving a reason, and every reveal is audited.",
     "approximate": {
       "label": "Approximate (interim)",
       "hint": "Read from workspaces with documents in progress and a read-only snapshot of their pipeline state, because run tracking is off or not answering. A run can be missing or shown late."
