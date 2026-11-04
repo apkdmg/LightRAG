@@ -4,8 +4,10 @@ import { DownloadIcon, PauseIcon, PlayIcon } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { Seg } from '@/features/TokenInsights/ui'
 import ExportDialog from './components/ExportDialog'
+import LogCaptureControl from './components/LogCaptureControl'
 import LogFilterBar from './components/LogFilterBar'
 import { useOpsNav, useOpsShell } from './context'
+import { useLogCapture } from './logCapture'
 import { LogFilter, decodeLogFilter, encodeLogFilter } from './logs'
 import GroupedView from './logview/GroupedView'
 import StreamView from './logview/StreamView'
@@ -17,7 +19,7 @@ type Sub = 'stream' | 'grouped'
  * were written. Filters live in the URL (`olq`) so a view can be pasted into
  * chat. Stream follows new rows every 5 s; Grouped counts by call site.
  * Export is audited and operator-only. INFO is stored only during an INFO
- * capture (a later release).
+ * capture: one module, at most 60 minutes, started here by an operator.
  */
 export default function LogsTab() {
   const { t } = useTranslation()
@@ -27,11 +29,16 @@ export default function LogsTab() {
   const sub: Sub = nav.view.sub === 'grouped' ? 'grouped' : 'stream'
   const [follow, setFollow] = useState(true)
   const [exportOpen, setExportOpen] = useState(false)
+  const [captureOpen, setCaptureOpen] = useState(false)
+  const capture = useLogCapture()
   // Only a view the user switched to fades in.
   const [fadeSub, setFadeSub] = useState<Sub | null>(null)
 
   const { setView, view } = nav
   const setFilter = useCallback((next: LogFilter) => setView({ ...view, logQuery: encodeLogFilter(next) }), [setView, view])
+  /** INFO lines of the captured module, over the last hour. */
+  const showCaptured = useCallback((module: string) => setFilter({ ...filter, level: 'INFO', module, window: filter.window === '15m' ? '15m' : '1h' }), [filter, setFilter])
+  const captureOffered = capture.canCapture && !capture.poll.data?.active
   const selectSub = (v: Sub) => {
     setFadeSub(v)
     nav.setSub(v)
@@ -47,6 +54,7 @@ export default function LogsTab() {
           {t('operations.logs.sinkOff')}
         </p>
       ) : null}
+      <LogCaptureControl info={capture} open={captureOpen} onOpenChange={setCaptureOpen} initialModule={filter.module || undefined} onShow={showCaptured} />
       <LogFilterBar filter={filter} onChange={setFilter} />
       <div className="flex flex-wrap items-center gap-2">
         <Seg
@@ -84,7 +92,7 @@ export default function LogsTab() {
         </span>
       </div>
       <div key={sub} className={fadeSub === sub ? 'ops-fade-in' : undefined}>
-        {sub === 'stream' ? <StreamView filter={filter} follow={follow} /> : <GroupedView filter={filter} />}
+        {sub === 'stream' ? <StreamView filter={filter} follow={follow} onCapture={captureOffered ? () => setCaptureOpen(true) : undefined} /> : <GroupedView filter={filter} />}
       </div>
       <p className="text-muted-foreground m-0 text-xs">{t('operations.logs.privacy')}</p>
       <ExportDialog open={exportOpen} onOpenChange={setExportOpen} filter={filter} operator={operator} />

@@ -28,6 +28,7 @@ import type {
   WorkspaceDetail,
   WorkspaceLive
 } from './api'
+import { normalizeMaintenance } from './activity/alerts'
 import { ageSeconds } from './format'
 import { readOpsHash } from './hashState'
 import { depCounts, normalizeDeps, normalizeWorker, sortWorkers } from './health/model'
@@ -88,7 +89,10 @@ export function normalizeAttention(raw: unknown): AttentionItem[] {
       run_id: str(a.run_id) ?? str(obj(a.params).run_id),
       dep: str(a.dep) ?? str(obj(a.params).dep) ?? str(obj(a.params).dependency),
       worker_id: str(a.worker_id) ?? str(obj(a.params).worker_id),
-      target: a.target ? obj(a.target) : targetOfLink(a.link)
+      target: a.target ? obj(a.target) : targetOfLink(a.link),
+      alert_id: idText(a.alert_id),
+      acked_by: str(a.acked_by),
+      muted: a.muted === true || (!!a.muted && typeof a.muted === 'object')
     }))
 }
 
@@ -172,6 +176,7 @@ export function normalizeOverview(raw: unknown): OpsOverview {
     worst: str(o.worst),
     kpis,
     attention: normalizeAttention(o.attention),
+    maintenance: normalizeMaintenance(o.maintenance),
     checked: o.checked
       ? {
         workspaces: first(num(c.workspaces), num(c.workspaces_with_backlog)),

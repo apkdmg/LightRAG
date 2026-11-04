@@ -8,8 +8,14 @@ export function useNow(ms: number, enabled = true) {
   const [now, setNow] = useState(() => Date.now())
   useEffect(() => {
     if (hidden || !enabled) return
+    // Catch up at once when (re)enabled or visible again: the clock did
+    // not run meanwhile, and a dialog that opens must not show its mount time.
+    const kick = setTimeout(() => setNow(Date.now()), 0)
     const timer = setInterval(() => setNow(Date.now()), ms)
-    return () => clearInterval(timer)
+    return () => {
+      clearTimeout(kick)
+      clearInterval(timer)
+    }
   }, [ms, hidden, enabled])
   return now
 }

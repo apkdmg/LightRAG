@@ -192,8 +192,51 @@ export function releaseFacts(d: WorkspaceDetail | null, now: number) {
 
 export type OutcomeTone = 'success' | 'info' | 'refused'
 
+/** Alert, maintenance and INFO-capture actions (PR-8): each answers `{ok, audit_id}`. */
+export type AlertActionKind = 'ack' | 'mute' | 'unmute' | 'maintenance' | 'maintenance_end' | 'capture' | 'capture_stop' | 'rules'
+
+/** Anything whose answer becomes an outcome toast. */
+export type OutcomeAction = ActionKind | 'reveal' | AlertActionKind
+
+/** The code an `{ok: true}` answer stands for, per alert action. */
+export const ALERT_OK_CODES: Record<AlertActionKind, string> = {
+  ack: 'acked',
+  mute: 'muted',
+  unmute: 'unmuted',
+  maintenance: 'maintenance_started',
+  maintenance_end: 'maintenance_ended',
+  capture: 'capture_started',
+  capture_stop: 'capture_stopped',
+  rules: 'rules_saved'
+}
+
+/**
+ * The server's result words per alert action (alerts.py AlertActions, the
+ * capture route): `started` means a maintenance window to one action and an
+ * INFO capture to another, so each is read in its action's terms.
+ */
+const ALERT_RESULTS: Record<AlertActionKind, Record<string, string>> = {
+  ack: { acked: 'acked', already_acked: 'already_acked', resolved: 'alert_resolved' },
+  mute: { muted: 'muted', unmuted: 'unmuted' },
+  unmute: { unmuted: 'unmuted', muted: 'muted' },
+  maintenance: { started: 'maintenance_started', ended: 'maintenance_ended', not_active: 'not_in_maintenance' },
+  maintenance_end: { ended: 'maintenance_ended', not_active: 'not_in_maintenance', started: 'maintenance_started' },
+  capture: { started: 'capture_started', stopped: 'capture_stopped', not_active: 'no_capture' },
+  capture_stop: { stopped: 'capture_stopped', not_active: 'no_capture', started: 'capture_started' },
+  rules: { updated: 'rules_saved', unchanged: 'no_change' }
+}
+
+const isAlertAction = (a: OutcomeAction): a is AlertActionKind => Object.prototype.hasOwnProperty.call(ALERT_OK_CODES, a)
+
+/** An alert action's answer → its code: the action's own word for the result, `ok` as done, anything else as sent. */
+function alertCode(action: AlertActionKind, r: { result?: unknown; ok?: unknown }): string {
+  const result = typeof r.result === 'string' && r.result ? r.result : null
+  if (result) return ALERT_RESULTS[action][result] ?? (result === 'ok' ? ALERT_OK_CODES[action] : result)
+  return r.ok === false ? 'unknown' : ALERT_OK_CODES[action]
+}
+
 export type ActionOutcome = {
-  action: ActionKind | 'reveal'
+  action: OutcomeAction
   tone: OutcomeTone
   /** The result or refusal code: cancellation_requested, not_busy, lock_unavailable, … */
   code: string
@@ -209,9 +252,21 @@ export type ActionOutcome = {
 }
 
 /** Codes that did what was asked. */
-const SUCCESS = new Set(['cancellation_requested', 'started', 'kicked', 'started_local', 'released', 'revealed'])
+const SUCCESS = new Set(['cancellation_requested', 'started', 'kicked', 'started_local', 'released', 'revealed', ...Object.values(ALERT_OK_CODES)])
 /** Nothing to do, or it will happen anyway: not an error, not a success. */
-const NO_OP = new Set(['not_busy', 'nothing_pending', 'nothing_to_process', 'request_pending', 'nothing_to_reveal'])
+const NO_OP = new Set([
+  'not_busy',
+  'nothing_pending',
+  'nothing_to_process',
+  'request_pending',
+  'nothing_to_reveal',
+  'already_acked',
+  'alert_resolved',
+  'not_muted',
+  'not_in_maintenance',
+  'no_capture',
+  'no_change'
+])
 
 const isRefusal = (code: string): code is Refusal => (REFUSALS as readonly string[]).includes(code)
 
@@ -235,10 +290,12 @@ export function inProgressOf(raw: unknown): InProgressBy | null {
 const toneOf = (code: string): OutcomeTone => (SUCCESS.has(code) ? 'success' : NO_OP.has(code) ? 'info' : isRefusal(code) ? 'refused' : 'info')
 
 /** A 2xx answer → an outcome. Release busy answers `released` plus a `reason` when it refused. */
-export function outcomeOf(action: ActionKind | 'reveal', resp: ActionResponse | null | undefined, hints: { requestPending?: boolean } = {}): ActionOutcome {
-  const r = resp ?? {}
+export function outcomeOf(action: OutcomeAction, resp: ActionResponse | null | undefined, hints: { requestPending?: boolean } = {}): ActionOutcome {
+  const r = (resp ?? {}) as ActionResponse & { ok?: unknown }
   let code: string
   if (action === 'reveal') code = 'revealed'
+  // An alert action answers {ok, audit_id}; a named result (already_acked, …) wins.
+  else if (isAlertAction(action)) code = alertCode(action, r)
   else if (action === 'release_busy') code = r.released === true ? 'released' : (text(r.reason) ?? text(r.result) ?? 'unknown')
   else code = text(r.result) ?? 'unknown'
   const inProgressBy = code === 'in_progress_by' ? inProgressOf(r) : null
@@ -256,7 +313,7 @@ export function outcomeOf(action: ActionKind | 'reveal', resp: ActionResponse | 
 }
 
 /** A thrown error → an outcome: a refusal code when the server named one, else the mapped error. */
-export function outcomeOfError(action: ActionKind | 'reveal', err: unknown): ActionOutcome {
+export function outcomeOfError(action: OutcomeAction, err: unknown): ActionOutcome {
   const e = toOpsError(err)
   const raw = (err as { detail?: unknown; response?: { data?: { detail?: unknown } } } | null) ?? null
   const detail = raw?.detail !== undefined ? raw.detail : raw?.response?.data?.detail
@@ -290,6 +347,8 @@ export function outcomeMessage(o: ActionOutcome): OutcomeMessage {
   if (o.code === 'not_busy' && o.action === 'release_busy') return { key: 'operations.actions.result.notBusyRelease', values: {} }
   // A reveal of a document or job that changed since the page was drawn.
   if (o.code === 'not_found' && o.action === 'reveal') return { key: 'operations.reveal.notFound', values: {} }
+  // An ack of an alert that retention removed (or a wrong id from an old link).
+  if (o.code === 'not_found' && o.action === 'ack') return { key: 'operations.alertDrawer.notFound', values: {} }
   if (SUCCESS.has(o.code) || NO_OP.has(o.code)) return { key: `operations.actions.result.${o.code}`, values: {} }
   if (isRefusal(o.code)) return { key: `operations.refusal.${o.code}`, values: {} }
   if (o.error) return { key: `operations.error.${o.code}`, values: {} }

@@ -38,6 +38,16 @@ pattern (counts only).
 The sink is created per worker by the ops runtime (never at import) and only
 when ``OPS_LOG_SINK=true``; ``OPS_LOG_LEVEL`` (default ``WARNING``) sets the
 lowest level stored.
+
+**INFO capture** (FR-26): an operator can store INFO lines of one
+allowlisted module for at most 60 minutes. The capture lives in KV
+``log_capture`` (``{module, until, id}``); every worker's flusher reads it
+every 10 s, so all workers capture, and each handler checks ``until`` on
+every record, so a capture ends on time even when the database cannot be
+read. While no capture runs the handler keeps its normal level, so INFO
+records are rejected before any work. Captured lines go through the same
+redaction, per-call-site limit and write budget, plus a cap per capture
+(20 000 lines server-wide, 1/N per worker).
 """
 
 from __future__ import annotations
@@ -60,6 +70,7 @@ from lightrag.api.ops.context import (
     ContextFilter,
     ContextFormatter,
     current_worker_id,
+    request_unauthenticated,
 )
 from lightrag.api.ops.redact import (
     EXC_MAX_CHARS,
@@ -121,6 +132,54 @@ _TRACEBACK_MARK = "Traceback (most recent call last):"
 _DOC_ID_IN_TEXT = re.compile(r"(?<![0-9A-Za-z-])(?:doc|dup)-[0-9a-f]{32}(?![0-9a-f])")
 _EXC_LINE = re.compile(r"^([A-Za-z_][\w.]{0,127})(?::|$)")
 _HEX32 = re.compile(r"^[0-9a-f]{32}$")
+
+# INFO capture (FR-26): the KV key, its limits, and the modules (a record's
+# ``module``, i.e. the file name) whose INFO lines may be captured.
+CAPTURE_KEY = "log_capture"
+CAPTURE_MAX_MINUTES = 60
+CAPTURE_POLL_S = 10.0
+CAPTURE_MAX_ROWS = 20000
+CAPTURE_MODULES = (
+    "pipeline",
+    "operate",
+    "lightrag",
+    "utils_pipeline",
+    "document_routes",
+    "email_routes",
+    "email_resync_queue",
+    "startup_resume",
+    "workspace_manager",
+    "llm_roles",
+    "openai",
+    "provider_rejection",
+    "provider_alerts",
+    "postgres_impl",
+    "milvus_impl",
+    "neo4j_impl",
+)
+
+
+def capture_view(value: Any, now: float) -> Optional[dict[str, Any]]:
+    """The capture in KV while it runs, as the console shows it."""
+    if not isinstance(value, dict):
+        return None
+    until = value.get("until")
+    module = value.get("module")
+    if not isinstance(until, (int, float)) or until <= now or not module:
+        return None
+    return {
+        "module": module,
+        "until": _iso(until),
+        "until_epoch": float(until),
+        "started_at": _iso(value.get("started_at")),
+        "expires_at": _iso(until),
+        "minutes": value.get("minutes"),
+        "actor": value.get("actor"),
+        "by": value.get("actor"),
+        "reason": value.get("reason"),
+        "id": value.get("id"),
+    }
+
 
 # Set inside the flusher's task: records logged while a flush writes (by the
 # database driver, the pool, the store) are never fed back into the sink.
@@ -191,6 +250,12 @@ class OpsLogHandler(logging.Handler):
         worker_id: Optional[str] = None,
     ):
         super().__init__(level)
+        # The configured level; lowered to INFO only while a capture runs.
+        self.base_level = level
+        self.capture: Optional[tuple[str, float, str]] = None
+        self.capture_cap = CAPTURE_MAX_ROWS
+        self.capture_rows = 0
+        self.capture_dropped = 0
         self.max_buffer = max_buffer
         self.rate_per_min = float(rate_per_min)
         self.clock = clock
@@ -202,7 +267,7 @@ class OpsLogHandler(logging.Handler):
         # The same hygiene filters as the file and console handlers; each
         # marks the record, so the work is done once whichever handler runs
         # first.
-        self.addFilter(_Gate())
+        self.addFilter(_Gate(self))
         self.addFilter(RedactFilter())
         self.addFilter(ContextFilter())
         # Counters (cumulative; the heartbeat exports them).
@@ -211,6 +276,47 @@ class OpsLogHandler(logging.Handler):
         self.rate_limited = 0
         self.self_suppressed = 0
         self.errors = 0
+        # WARNING+ lines logged while serving a request that presented no
+        # valid credential (rate-limited ones included): the
+        # unauth_warning_lines_5m rule (R24).
+        self.unauth_warnings = 0
+
+    # -- INFO capture ---------------------------------------------------------------
+    def set_capture(
+        self, module: Optional[str], until: float, capture_id: str = ""
+    ) -> None:
+        """Capture ``module``'s records below the configured level until
+        ``until`` (epoch); no module, or a past ``until``, ends it."""
+        if not module or until <= self.clock() or module not in CAPTURE_MODULES:
+            self.end_capture()
+            return
+        current = self.capture
+        if current is None or current[2] != capture_id:
+            self.capture_rows = 0
+        self.capture = (module, float(until), capture_id)
+        self.setLevel(min(self.base_level, logging.INFO))
+
+    def end_capture(self) -> None:
+        self.capture = None
+        if self.level != self.base_level:
+            self.setLevel(self.base_level)
+
+    def captures(self, record: logging.LogRecord) -> bool:
+        """Whether a record below the configured level is captured."""
+        capture = self.capture
+        if capture is None or record.levelno < logging.INFO:
+            return False
+        module, until, _ = capture
+        if self.clock() >= until:
+            self.end_capture()
+            return False
+        if record.module != module or not record.name.startswith("lightrag"):
+            return False
+        if self.capture_rows >= self.capture_cap:
+            self.capture_dropped += 1
+            return False
+        self.capture_rows += 1
+        return True
 
     # -- logging.Handler ------------------------------------------------------------
     def handle(self, record: logging.LogRecord) -> bool:
@@ -245,6 +351,8 @@ class OpsLogHandler(logging.Handler):
         if _in_flush.get():
             self.self_suppressed += 1
             return
+        if record.levelno >= logging.WARNING and request_unauthenticated():
+            self.unauth_warnings += 1
         msg, exc, exc_type = _texts(record)
         lineno = int(record.lineno or 0)
         module = (record.module or "")[:128]
@@ -367,10 +475,18 @@ class OpsLogHandler(logging.Handler):
 class _Gate(logging.Filter):
     """First filter: skips what the sink never takes before any work is done."""
 
+    def __init__(self, handler: "OpsLogHandler"):
+        super().__init__()
+        self.handler = handler
+
     def filter(self, record: logging.LogRecord) -> bool:
         if getattr(record, "_lightrag_ops_sunk", False):
             return False
-        return _accepted(record.name)
+        if not _accepted(record.name):
+            return False
+        if record.levelno < self.handler.base_level:
+            return self.handler.captures(record)
+        return True
 
 
 def _texts(record: logging.LogRecord) -> tuple[str, Optional[str], Optional[str]]:
@@ -472,6 +588,7 @@ class OpsLogSink:
         rate_per_min = max(1.0, float(rate_per_min) / self.workers)
         self.write_timeout_s = write_timeout_s
         self.max_retry_rows = max_retry_rows
+        self.level = level
         self.handler = OpsLogHandler(
             level=level,
             max_buffer=max_buffer,
@@ -479,6 +596,8 @@ class OpsLogSink:
             clock=clock,
             worker_id=worker_id,
         )
+        self.handler.capture_cap = max(1, CAPTURE_MAX_ROWS // self.workers)
+        self._capture_polled = 0.0
         self._attached: list[logging.Logger] = []
         self._stand_in: Optional[logging.Handler] = None
         self._task: Optional[asyncio.Task] = None
@@ -562,12 +681,45 @@ class OpsLogSink:
             if not self.handler.buffer and not self._retry:
                 return
 
+    # -- INFO capture -------------------------------------------------------------------
+    def apply_capture(self, value: Any) -> Optional[dict[str, Any]]:
+        """Follow the capture stored in KV (or end it); returns its view."""
+        view = capture_view(value, self.clock())
+        if view is None:
+            self.handler.end_capture()
+        else:
+            self.handler.set_capture(
+                view["module"], view["until_epoch"], str(view.get("id") or "")
+            )
+        return view
+
+    async def poll_capture(self) -> None:
+        """Read KV ``log_capture``; an unreadable store keeps the current
+        capture, which still ends at its ``until``."""
+        self._capture_polled = self.clock()
+        try:
+            value = await asyncio.wait_for(
+                self.store.kv_get(CAPTURE_KEY, None), timeout=self.write_timeout_s
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return
+        self.apply_capture(value)
+
     async def _run(self) -> None:
         # Everything this task logs or triggers is kept out of the sink.
         _in_flush.set(True)
         while True:
             await asyncio.sleep(self.poll_s)
             now = self.clock()
+            if now - self._capture_polled >= CAPTURE_POLL_S:
+                try:
+                    await self.poll_capture()
+                except asyncio.CancelledError:
+                    raise
+                except Exception:  # pragma: no cover - poll_capture guards itself
+                    pass
             waiting = len(self.handler.buffer) + len(self._retry)
             due = now - self._last_flush >= self.interval_s
             if not waiting and not due:
@@ -790,17 +942,27 @@ class OpsLogSink:
         handler = self.handler
         now = self.clock()
         last_ok = self.last_flush_ok_at
+        capture = handler.capture
         return {
             "enabled": True,
             "attached": self.attached,
             "workers": self.workers,
-            "level": logging.getLevelName(handler.level),
+            "level": logging.getLevelName(self.level),
+            "capture": {
+                "module": capture[0],
+                "until": _iso(capture[1]),
+                "rows": handler.capture_rows,
+                "dropped": handler.capture_dropped,
+            }
+            if capture is not None
+            else None,
             "buffer": len(handler.buffer) + len(self._retry),
             "accepted": handler.accepted,
             "written": self.written,
             "dropped": handler.dropped + self.dropped_retry,
             "rate_limited": handler.rate_limited,
             "self_suppressed": handler.self_suppressed,
+            "unauth_warnings": handler.unauth_warnings,
             "write_failures": self.write_failures,
             "bad_rows": self.bad_rows,
             "dropped_deleted": self.dropped_deleted,

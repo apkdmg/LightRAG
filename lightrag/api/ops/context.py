@@ -102,6 +102,13 @@ _run_id: ContextVar[Optional[str]] = ContextVar("lightrag_run_id", default=None)
 _log_workspace: ContextVar[Optional[str]] = ContextVar(
     "lightrag_log_workspace", default=None
 )
+# Per HTTP request: a one-item list that the auth dependencies set to True
+# once the caller presented a valid credential. A mutable holder, because
+# dependencies may run in a copied context (thread pool, middleware tasks)
+# and must still mark the request every log record of it sees.
+_request_auth: ContextVar[Optional[list]] = ContextVar(
+    "lightrag_request_auth", default=None
+)
 # Process-wide: set once per worker by the ops runtime, never at import time
 # (Gunicorn preloads the app before forking).
 _worker_id: Optional[str] = None
@@ -132,6 +139,20 @@ def set_run_id(run_id: Optional[str]) -> Any:
 
 def reset_run_id(token: Any) -> None:
     _run_id.reset(token)
+
+
+def mark_request_authenticated() -> None:
+    """The current request presented a valid credential."""
+    holder = _request_auth.get()
+    if holder is not None:
+        holder[0] = True
+
+
+def request_unauthenticated() -> bool:
+    """Inside an HTTP request that has not (yet) presented a valid
+    credential: an open path, or a caller that was refused."""
+    holder = _request_auth.get()
+    return holder is not None and not holder[0]
 
 
 def bind_log_workspace(workspace: Optional[str]) -> None:
@@ -167,6 +188,7 @@ def background_log_context(workspace: Optional[str] = None) -> Iterator[None]:
         tokens = [
             (_request_id, _request_id.set(None)),
             (_client_request_id, _client_request_id.set(None)),
+            (_request_auth, _request_auth.set(None)),
             (_log_workspace, _log_workspace.set(workspace or None)),
         ]
     except Exception:  # pragma: no cover - ContextVar.set does not fail
@@ -327,6 +349,7 @@ class RequestIdMiddleware:
             state["client_request_id"] = client_request_id
         rid_token = _request_id.set(request_id)
         cid_token = _client_request_id.set(client_request_id)
+        auth_token = _request_auth.set([False])
         header_value = request_id.encode("latin-1")
         started = time.perf_counter()
         # Until a response starts, a request that ends (cancelled, client
@@ -365,6 +388,7 @@ class RequestIdMiddleware:
                     observer(scope, status_holder["status"], duration)
                 except Exception:
                     pass
+            _request_auth.reset(auth_token)
             _client_request_id.reset(cid_token)
             _request_id.reset(rid_token)
 

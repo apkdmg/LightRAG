@@ -15,7 +15,7 @@ const BAD_KINDS = new Set(['provider_rejection', 'run_orphaned'])
 
 const markerColor = (kind: string) => (BAD_KINDS.has(kind) ? 'var(--ops-crit)' : 'var(--muted-foreground)')
 
-function EventLabel({ e }: { e: OpsEvent }) {
+export function EventLabel({ e }: { e: OpsEvent }) {
   const { t } = useTranslation()
   const d = e.detail ?? {}
   const status = typeof d.status_code === 'number' ? d.status_code : typeof d.status === 'number' ? d.status : null

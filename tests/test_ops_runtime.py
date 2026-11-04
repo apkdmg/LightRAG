@@ -133,6 +133,7 @@ async def test_postgres_starts_builder_and_scan_loop(monkeypatch, tmp_path):
             "ops:scan",
             "ops:probes",
             "ops:reconcile",
+            "ops:alerts",
             "ops:log-retention",
             "ops:retention",
             "ops:baselines",
@@ -167,7 +168,11 @@ async def test_flags_turn_off_builder_and_scan(monkeypatch, tmp_path):
     app = _app(email_resync_queue=SimpleNamespace(base_dir=tmp_path))
     rt = await runtime.start_ops(app, None, SimpleNamespace(kv_storage="PGKVStorage"))
     assert rt.index_task is None
-    assert [loop.name for loop in rt.loops] == ["ops:reconcile", "ops:log-retention"]
+    assert [loop.name for loop in rt.loops] == [
+        "ops:reconcile",
+        "ops:alerts",
+        "ops:log-retention",
+    ]
     assert rt.probes is None and rt.service.probes is None
     from lightrag.api.ops import metrics
 

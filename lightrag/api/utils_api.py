@@ -20,6 +20,7 @@ from fastapi import HTTPException, Security, Request, Response, status
 from fastapi.security import APIKeyHeader, OAuth2PasswordBearer
 from starlette.status import HTTP_403_FORBIDDEN
 from .auth import auth_handler
+from .ops.context import mark_request_authenticated
 from .config import ollama_server_infos, global_args, get_env_value
 
 logger = logging.getLogger("lightrag")
@@ -227,6 +228,7 @@ def get_combined_auth_dependency(api_key: Optional[str] = None):
             user_info = validate_user_api_key(user_api_key)
             if user_info:
                 request.state.api_key_user = user_info
+                mark_request_authenticated()
                 return  # Per-user API key validation successful
             # Invalid per-user API key
             raise HTTPException(
@@ -279,9 +281,11 @@ def get_combined_auth_dependency(api_key: Optional[str] = None):
                     # never stand in for a configured shared API key: fall
                     # through to the X-API-Key check below in that case.
                     if not api_key_configured:
+                        mark_request_authenticated()
                         return
                 elif auth_configured and not is_guest_token:
                     # Accept non-guest token if auth is configured
+                    mark_request_authenticated()
                     return
                 else:
                     # Token validation failed, immediately return 401 error
@@ -297,6 +301,7 @@ def get_combined_auth_dependency(api_key: Optional[str] = None):
 
         # 5. Accept all requests if no API protection is needed
         if not auth_configured and not api_key_configured:
+            mark_request_authenticated()
             return
 
         # 6. Validate the shared API key (X-API-Key) if configured
@@ -317,6 +322,7 @@ def get_combined_auth_dependency(api_key: Optional[str] = None):
                 "workspace_id": "service_account",
                 "metadata": {"auth_mode": "api_key"},
             }
+            mark_request_authenticated()
             return  # Shared API key validation successful
 
         ### Authentication failed ####

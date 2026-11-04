@@ -1,7 +1,7 @@
 import { FocusEvent, ReactNode, useState } from 'react'
 import { AnimatePresence, motion } from 'motion/react'
 import { useTranslation } from 'react-i18next'
-import { ArrowRightIcon } from 'lucide-react'
+import { ArrowRightIcon, BellIcon } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { AttentionItem } from '../api'
 import { ageSeconds, fmtAge, fmtCount } from '../format'
@@ -31,11 +31,13 @@ function AttentionRow({ row, base, now }: { row: Row; base: OpsHash; now: number
   const { title, runbook } = useItemText(item)
   const target = viewForTarget(base, attentionTarget(item))
   const since = item.since ? ageSeconds(item.since, now ?? undefined) : null
-  return (
+  const alertId = item.alert_id
+  const link = (
     <OpsLink
       to={target}
       className={cn(
-        'hover:bg-muted grid grid-cols-[auto_minmax(0,1fr)_auto] items-start gap-x-3 gap-y-0.5 rounded-lg px-2 py-2 text-left no-underline',
+        'hover:bg-muted grid min-w-0 grid-cols-[auto_minmax(0,1fr)_auto] items-start gap-x-3 gap-y-0.5 rounded-lg px-2 py-2 text-left no-underline',
+        alertId && 'flex-1',
         resolved && 'opacity-60'
       )}
     >
@@ -50,11 +52,28 @@ function AttentionRow({ row, base, now }: { row: Row; base: OpsHash; now: number
         {item.workspace && !title.includes(item.workspace) ? <span className="text-muted-foreground font-normal"> · {item.workspace}</span> : null}
         {since !== null ? <span className="text-muted-foreground font-normal"> · {fmtAge(since)}</span> : null}
         {resolved ? <span className="text-muted-foreground font-normal"> · {t('operations.attention.resolved')}</span> : null}
+        {item.acked_by ? <span className="text-muted-foreground font-normal"> · {t('operations.attention.ackedBy', { by: item.acked_by })}</span> : null}
+        {item.muted ? <span className="text-muted-foreground font-normal"> · {t('operations.attention.muted')}</span> : null}
       </span>
       <ArrowRightIcon className="text-muted-foreground mt-0.5 size-3.5" aria-hidden="true" />
       {item.detail ? <span className="text-muted-foreground col-start-2 text-xs">{item.detail}</span> : null}
       {runbook ? <span className="col-start-2 text-xs">{t('operations.attention.next', { step: runbook })}</span> : null}
     </OpsLink>
+  )
+  if (!alertId) return link
+  // The alert behind the item (PR-8): a sibling link, since links cannot nest.
+  return (
+    <div className="flex items-start gap-1">
+      {link}
+      <OpsLink
+        to={{ ...base, drawer: { kind: 'alert', id: alertId } }}
+        className="hover:bg-muted text-muted-foreground hover:text-foreground mt-1 inline-flex size-8 flex-none items-center justify-center rounded-lg"
+        aria-label={t('operations.attention.openAlert', { title })}
+        title={t('operations.attention.openAlert', { title })}
+      >
+        <BellIcon className="size-3.5" aria-hidden="true" />
+      </OpsLink>
+    </div>
   )
 }
 

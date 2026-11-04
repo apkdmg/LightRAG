@@ -51,7 +51,18 @@ export const REFUSALS = [
   'invalid_workspace',
   'workspace_not_served',
   'queue_unavailable',
-  'invalid_range'
+  'invalid_range',
+  // Alerts, maintenance and INFO capture (PR-8).
+  'invalid_minutes',
+  'unknown_rule',
+  'unknown_threshold',
+  'invalid_threshold',
+  'invalid_thresholds',
+  'conflicting_thresholds',
+  'threshold_order',
+  'threshold_out_of_bounds',
+  'invalid_module',
+  'log_sink_off'
 ] as const
 export type Refusal = (typeof REFUSALS)[number]
 

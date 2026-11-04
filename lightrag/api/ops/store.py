@@ -9,8 +9,8 @@ probe history (``LIGHTRAG_OPS_PROBES``), run tracking
 (``LIGHTRAG_OPS_RUNS``, ``LIGHTRAG_OPS_DOC_FAILURES``), the structured
 WARNING+ log store (``LIGHTRAG_OPS_LOGS``) and the latency histograms
 (``LIGHTRAG_OPS_METRICS_MIN`` per worker-minute, ``LIGHTRAG_OPS_METRICS_HOUR``
-rolled up hourly); the other ops tables arrive with
-the features that write them. Indexes on the large existing tables are never built
+rolled up hourly) and the alert history (``LIGHTRAG_OPS_ALERTS``, with a
+partial unique index that allows one open row per fingerprint). Indexes on the large existing tables are never built
 here: :mod:`lightrag.api.ops.indexes` builds them in the background.
 
 Rules every query follows:
@@ -157,6 +157,7 @@ AUDIT_READ_ACTIONS = (
     "correlate",
     "log_export",
     "audit_export",
+    "activity_export",
     "reveal",
 )
 WORKSPACE_KV_KEYS = ("resync:{ws}", "kick:{ws}", "action:{ws}")
@@ -705,6 +706,73 @@ class OpsStore(ABC):
         """Write ``value`` (which carries ``at``) unless the stored value's
         ``at`` is newer than ``older_than``. True when written."""
 
+    # -- alerts (written by the leased evaluator, see alerts.py) -------------------
+    @abstractmethod
+    async def alerts_open(self, limit: int) -> list[dict[str, Any]]:
+        """Open (unresolved) alert rows, newest first."""
+
+    @abstractmethod
+    async def alerts_upsert(self, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Insert a firing row per fingerprint, or touch its open row
+        (severity, title, scope, link, runbook, ``last_seen``). The partial
+        unique index on ``fingerprint WHERE resolved_at IS NULL`` makes a
+        second open row for a fingerprint impossible, also when two
+        evaluators race. Returns ``{id, fingerprint, inserted}`` per item."""
+
+    @abstractmethod
+    async def alerts_resolve(self, fingerprints: list[str]) -> list[dict[str, Any]]:
+        """Resolve the open rows of ``fingerprints``; returns the resolved rows."""
+
+    @abstractmethod
+    async def alerts_page(
+        self, state: Optional[str], before: Optional[int], limit: int
+    ) -> list[dict[str, Any]]:
+        """Alert rows (``open``, ``resolved`` or all), newest first, with
+        ``id < before``."""
+
+    @abstractmethod
+    async def alert_get(self, alert_id: int) -> Optional[dict[str, Any]]: ...
+
+    @abstractmethod
+    async def alerts_history(
+        self, fingerprint: str, limit: int
+    ) -> list[dict[str, Any]]:
+        """Rows of one fingerprint (its earlier incidents), newest first."""
+
+    @abstractmethod
+    async def alert_ack(
+        self, alert_id: int, actor: str, note: Optional[str]
+    ) -> tuple[str, Optional[dict[str, Any]]]:
+        """Record an ack on an open row (its state does not change). Returns
+        ``(code, row)``: ``acked``, ``already_acked``, ``resolved`` or
+        ``not_found``."""
+
+    @abstractmethod
+    async def alert_claim_email(
+        self, alert_id: int, kind: str, repeat_s: float
+    ) -> Optional[datetime]:
+        """Claim one email for a row with a conditional UPDATE; the new
+        ``last_emailed_at`` when this caller won, else None. ``open``: the
+        row is open and was never emailed or not within ``repeat_s``;
+        ``resolve``: the row is resolved and its last email went out before
+        it resolved."""
+
+    @abstractmethod
+    async def alert_unclaim_email(
+        self, alert_id: int, claimed: datetime, previous: Optional[datetime]
+    ) -> None:
+        """Undo a claim whose send failed (only if nobody claimed since)."""
+
+    @abstractmethod
+    async def alerts_window(
+        self, start: datetime, end: datetime, limit: int
+    ) -> list[dict[str, Any]]:
+        """Alert rows active at any time in ``[start, end)``, newest first."""
+
+    @abstractmethod
+    async def alerts_cleanup(self, days: int) -> int:
+        """Delete rows resolved more than ``days`` ago, in batches."""
+
     # -- logs (writes come from the buffered log sink) -----------------------------
     @abstractmethod
     async def logs_write(self, rows: list[dict[str, Any]]) -> None:
@@ -1047,6 +1115,31 @@ class PostgresOpsStore(OpsStore):
                 buckets BIGINT[] NOT NULL,
                 PRIMARY KEY (hour, series, key)
             )""",
+            # Alerts (180 d): firing -> resolved; at most one open row per
+            # fingerprint, enforced by the partial unique index.
+            f"""CREATE TABLE IF NOT EXISTS {TABLE_ALERTS} (
+                id BIGSERIAL PRIMARY KEY,
+                rule VARCHAR(64) NOT NULL,
+                fingerprint VARCHAR(128) NOT NULL,
+                severity VARCHAR(16) NOT NULL,
+                state VARCHAR(16) NOT NULL,
+                title VARCHAR(512) NOT NULL,
+                scope JSONB NOT NULL DEFAULT '{{}}'::jsonb,
+                link VARCHAR(512),
+                runbook VARCHAR(512),
+                first_seen TIMESTAMPTZ NOT NULL,
+                last_seen TIMESTAMPTZ NOT NULL,
+                resolved_at TIMESTAMPTZ,
+                acked_by VARCHAR(255),
+                acked_at TIMESTAMPTZ,
+                ack_note VARCHAR(512),
+                last_emailed_at TIMESTAMPTZ
+            )""",
+            f"""CREATE UNIQUE INDEX IF NOT EXISTS idx_ops_alerts_open ON {TABLE_ALERTS}
+                (fingerprint) WHERE resolved_at IS NULL""",
+            f"CREATE INDEX IF NOT EXISTS idx_ops_alerts_seen ON {TABLE_ALERTS} (last_seen DESC)",
+            # The Alert drawer's earlier occurrences of a fingerprint.
+            f"CREATE INDEX IF NOT EXISTS idx_ops_alerts_fp ON {TABLE_ALERTS} (fingerprint, id DESC)",
         ):
             await self._db.execute(statement)
         await self._refresh_tables(force=True)
@@ -1724,6 +1817,18 @@ class PostgresOpsStore(OpsStore):
                         SET title = replace(title, $1, $2),
                             scope = jsonb_set(scope, '{{workspace}}', to_jsonb($2::text))
                         WHERE scope->>'workspace' = $1""",
+                        workspace,
+                        hashed,
+                    )
+                    # Rules over several workspaces list them in the scope.
+                    await conn.execute(
+                        f"""UPDATE {TABLE_ALERTS}
+                        SET scope = jsonb_set(scope, '{{workspaces}}', (
+                            SELECT jsonb_agg(CASE WHEN e = to_jsonb($1::text)
+                                THEN to_jsonb($2::text) ELSE e END)
+                            FROM jsonb_array_elements(scope->'workspaces') e))
+                        WHERE jsonb_typeof(scope->'workspaces') = 'array'
+                            AND scope->'workspaces' @> jsonb_build_array($1::text)""",
                         workspace,
                         hashed,
                     )
@@ -2567,6 +2672,183 @@ class PostgresOpsStore(OpsStore):
             float(older_than),
         )
         return bool(rows)
+
+    # -- alerts ------------------------------------------------------------------------------
+    _ALERT_COLUMNS = """id, rule, fingerprint, severity, state, title, scope, link, runbook,
+        first_seen, last_seen, resolved_at, acked_by, acked_at, ack_note, last_emailed_at"""
+
+    def _alert_row(self, row: dict[str, Any]) -> dict[str, Any]:
+        row["id"] = int(row["id"])
+        row["scope"] = self._decode(row.get("scope")) or {}
+        return row
+
+    async def alerts_open(self, limit):
+        rows = await self._read(
+            f"""SELECT {self._ALERT_COLUMNS} FROM {TABLE_ALERTS}
+            WHERE resolved_at IS NULL ORDER BY id DESC LIMIT $1""",
+            int(limit),
+        )
+        return [self._alert_row(r) for r in rows]
+
+    async def alerts_upsert(self, items):
+        if not items:
+            return []
+        columns: list[list[Any]] = [[] for _ in range(7)]
+        for item in items:
+            for index, value in enumerate(
+                (
+                    item["rule"],
+                    item["fingerprint"],
+                    item["severity"],
+                    item["title"],
+                    json.dumps(item.get("scope") or {}, default=str),
+                    item.get("link"),
+                    item.get("runbook"),
+                )
+            ):
+                columns[index].append(value)
+        # ON CONFLICT names the partial unique index's predicate, so a
+        # concurrent insert of the same fingerprint waits and then touches
+        # the row the other one created instead of adding a second open row.
+        rows = await self._write(
+            f"""INSERT INTO {TABLE_ALERTS} (rule, fingerprint, severity, state, title,
+                scope, link, runbook, first_seen, last_seen)
+            SELECT u.rule, u.fingerprint, u.severity, 'firing', u.title, u.scope::jsonb,
+                u.link, u.runbook, now(), now()
+            FROM unnest($1::text[], $2::text[], $3::text[], $4::text[], $5::text[],
+                        $6::text[], $7::text[])
+                AS u(rule, fingerprint, severity, title, scope, link, runbook)
+            ON CONFLICT (fingerprint) WHERE resolved_at IS NULL DO UPDATE
+            SET severity = EXCLUDED.severity, title = EXCLUDED.title,
+                scope = EXCLUDED.scope, link = EXCLUDED.link,
+                runbook = EXCLUDED.runbook, last_seen = EXCLUDED.last_seen
+            RETURNING id, fingerprint, (xmax = 0) AS inserted""",
+            *columns,
+        )
+        return [
+            {
+                "id": int(r["id"]),
+                "fingerprint": r["fingerprint"],
+                "inserted": bool(r["inserted"]),
+            }
+            for r in rows
+        ]
+
+    async def alerts_resolve(self, fingerprints):
+        if not fingerprints:
+            return []
+        rows = await self._write(
+            f"""UPDATE {TABLE_ALERTS} SET state = 'resolved', resolved_at = now()
+            WHERE resolved_at IS NULL AND fingerprint = ANY($1::text[])
+            RETURNING {self._ALERT_COLUMNS}""",
+            list(fingerprints),
+        )
+        return [self._alert_row(dict(r)) for r in rows]
+
+    async def alerts_page(self, state, before, limit):
+        conditions: list[str] = []
+        params: list[Any] = []
+        if state == "open":
+            conditions.append("resolved_at IS NULL")
+        elif state == "resolved":
+            conditions.append("resolved_at IS NOT NULL")
+        if before is not None:
+            params.append(int(before))
+            conditions.append(f"id < ${len(params)}")
+        params.append(int(limit))
+        where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+        rows = await self._read(
+            f"""SELECT {self._ALERT_COLUMNS} FROM {TABLE_ALERTS} {where}
+            ORDER BY id DESC LIMIT ${len(params)}""",
+            *params,
+        )
+        return [self._alert_row(r) for r in rows]
+
+    async def alert_get(self, alert_id):
+        rows = await self._read(
+            f"SELECT {self._ALERT_COLUMNS} FROM {TABLE_ALERTS} WHERE id = $1",
+            int(alert_id),
+        )
+        return self._alert_row(rows[0]) if rows else None
+
+    async def alerts_history(self, fingerprint, limit):
+        rows = await self._read(
+            f"""SELECT {self._ALERT_COLUMNS} FROM {TABLE_ALERTS}
+            WHERE fingerprint = $1 ORDER BY id DESC LIMIT $2""",
+            fingerprint,
+            int(limit),
+        )
+        return [self._alert_row(r) for r in rows]
+
+    async def alert_ack(self, alert_id, actor, note):
+        rows = await self._write(
+            f"""UPDATE {TABLE_ALERTS} SET acked_by = $2, acked_at = now(), ack_note = $3
+            WHERE id = $1 AND resolved_at IS NULL AND acked_at IS NULL
+            RETURNING {self._ALERT_COLUMNS}""",
+            int(alert_id),
+            str(actor)[:255],
+            note[:512] if note else None,
+        )
+        if rows:
+            return "acked", self._alert_row(dict(rows[0]))
+        row = await self.alert_get(alert_id)
+        if row is None:
+            return "not_found", None
+        if row.get("resolved_at") is not None:
+            return "resolved", row
+        return "already_acked", row
+
+    async def alert_claim_email(self, alert_id, kind, repeat_s):
+        if kind == "resolve":
+            condition = """resolved_at IS NOT NULL AND last_emailed_at IS NOT NULL
+                AND last_emailed_at < resolved_at"""
+            args: list[Any] = [int(alert_id)]
+        else:
+            condition = """resolved_at IS NULL AND (last_emailed_at IS NULL
+                OR last_emailed_at < now() - make_interval(secs => $2::float8))"""
+            args = [int(alert_id), float(repeat_s)]
+        rows = await self._write(
+            f"""UPDATE {TABLE_ALERTS} SET last_emailed_at = clock_timestamp()
+            WHERE id = $1 AND {condition} RETURNING last_emailed_at""",
+            *args,
+        )
+        return rows[0]["last_emailed_at"] if rows else None
+
+    async def alert_unclaim_email(self, alert_id, claimed, previous):
+        await self._write(
+            f"""UPDATE {TABLE_ALERTS} SET last_emailed_at = $3
+            WHERE id = $1 AND last_emailed_at = $2""",
+            int(alert_id),
+            claimed,
+            previous,
+        )
+
+    async def alerts_window(self, start, end, limit):
+        rows = await self._read(
+            f"""SELECT {self._ALERT_COLUMNS} FROM {TABLE_ALERTS}
+            WHERE last_seen >= $1 AND first_seen < $2
+            ORDER BY first_seen DESC, id DESC LIMIT $3""",
+            start,
+            end,
+            int(limit),
+        )
+        return [self._alert_row(r) for r in rows]
+
+    async def alerts_cleanup(self, days):
+        deleted = 0
+        for _ in range(LOG_RETENTION_MAX_BATCHES):
+            rows = await self._write(
+                f"""DELETE FROM {TABLE_ALERTS} WHERE id IN (
+                    SELECT id FROM {TABLE_ALERTS}
+                    WHERE resolved_at IS NOT NULL
+                        AND resolved_at < now() - make_interval(days => $1::int)
+                    LIMIT {RETENTION_BATCH}) RETURNING 1""",
+                int(days),
+            )
+            deleted += len(rows)
+            if len(rows) < RETENTION_BATCH:
+                break
+        return deleted
 
     # -- logs ----------------------------------------------------------------------------
     async def logs_write(self, rows):
@@ -3857,9 +4139,13 @@ class MemoryOpsStore(OpsStore):
         ]
         self.log_rows = [r for r in self.log_rows if r.get("workspace") != workspace]
         for alert in self.alert_rows:
-            if (alert.get("scope") or {}).get("workspace") == workspace:
+            scope = alert.get("scope") or {}
+            if scope.get("workspace") == workspace:
                 alert["title"] = alert["title"].replace(workspace, hashed)
                 alert["scope"]["workspace"] = hashed
+            listed = scope.get("workspaces")
+            if isinstance(listed, list) and workspace in listed:
+                scope["workspaces"] = [hashed if w == workspace else w for w in listed]
 
     # -- workers ---------------------------------------------------------------------------
     async def worker_beat(self, row, sample=None):
@@ -4531,6 +4817,186 @@ class MemoryOpsStore(OpsStore):
             return False
         self.kv[key] = json.loads(json.dumps(value, default=str))
         return True
+
+    # -- alerts ------------------------------------------------------------------------
+    def _alert_copy(self, row: dict[str, Any]) -> dict[str, Any]:
+        return copy.deepcopy(row)
+
+    async def alerts_open(self, limit):
+        self._check()
+        rows = [r for r in self.alert_rows if r.get("resolved_at") is None]
+        rows.sort(key=lambda r: -int(r["id"]))
+        return [self._alert_copy(r) for r in rows[:limit]]
+
+    async def alerts_upsert(self, items):
+        await self._write_gate()
+        # No await below: like the partial unique index, the check and the
+        # insert are one step, so racing evaluators never add a second open
+        # row for a fingerprint.
+        now = self._aware_now()
+        out = []
+        for item in items:
+            current = next(
+                (
+                    r
+                    for r in self.alert_rows
+                    if r["fingerprint"] == item["fingerprint"]
+                    and r.get("resolved_at") is None
+                ),
+                None,
+            )
+            scope = json.loads(json.dumps(item.get("scope") or {}, default=str))
+            if current is None:
+                alert_id = max((int(r["id"]) for r in self.alert_rows), default=0) + 1
+                self.alert_rows.append(
+                    {
+                        "id": alert_id,
+                        "rule": item["rule"],
+                        "fingerprint": item["fingerprint"],
+                        "severity": item["severity"],
+                        "state": "firing",
+                        "title": item["title"],
+                        "scope": scope,
+                        "link": item.get("link"),
+                        "runbook": item.get("runbook"),
+                        "first_seen": now,
+                        "last_seen": now,
+                        "resolved_at": None,
+                        "acked_by": None,
+                        "acked_at": None,
+                        "ack_note": None,
+                        "last_emailed_at": None,
+                    }
+                )
+                out.append(
+                    {
+                        "id": alert_id,
+                        "fingerprint": item["fingerprint"],
+                        "inserted": True,
+                    }
+                )
+                continue
+            current.update(
+                {
+                    "severity": item["severity"],
+                    "title": item["title"],
+                    "scope": scope,
+                    "link": item.get("link"),
+                    "runbook": item.get("runbook"),
+                    "last_seen": now,
+                }
+            )
+            out.append(
+                {
+                    "id": int(current["id"]),
+                    "fingerprint": item["fingerprint"],
+                    "inserted": False,
+                }
+            )
+        return out
+
+    async def alerts_resolve(self, fingerprints):
+        await self._write_gate()
+        wanted = set(fingerprints)
+        now = self._aware_now()
+        out = []
+        for row in self.alert_rows:
+            if row.get("resolved_at") is None and row["fingerprint"] in wanted:
+                row["state"] = "resolved"
+                row["resolved_at"] = now
+                out.append(self._alert_copy(row))
+        return out
+
+    async def alerts_page(self, state, before, limit):
+        self._check()
+        rows = []
+        for row in self.alert_rows:
+            resolved = row.get("resolved_at") is not None
+            if (state == "open" and resolved) or (state == "resolved" and not resolved):
+                continue
+            if before is not None and int(row["id"]) >= int(before):
+                continue
+            rows.append(row)
+        rows.sort(key=lambda r: -int(r["id"]))
+        return [self._alert_copy(r) for r in rows[:limit]]
+
+    async def alert_get(self, alert_id):
+        self._check()
+        row = next((r for r in self.alert_rows if int(r["id"]) == int(alert_id)), None)
+        return self._alert_copy(row) if row else None
+
+    async def alerts_history(self, fingerprint, limit):
+        self._check()
+        rows = [r for r in self.alert_rows if r["fingerprint"] == fingerprint]
+        rows.sort(key=lambda r: -int(r["id"]))
+        return [self._alert_copy(r) for r in rows[:limit]]
+
+    async def alert_ack(self, alert_id, actor, note):
+        await self._write_gate()
+        row = next((r for r in self.alert_rows if int(r["id"]) == int(alert_id)), None)
+        if row is None:
+            return "not_found", None
+        if row.get("resolved_at") is not None:
+            return "resolved", self._alert_copy(row)
+        if row.get("acked_at") is not None:
+            return "already_acked", self._alert_copy(row)
+        row["acked_by"] = str(actor)[:255]
+        row["acked_at"] = self._aware_now()
+        row["ack_note"] = note[:512] if note else None
+        return "acked", self._alert_copy(row)
+
+    async def alert_claim_email(self, alert_id, kind, repeat_s):
+        await self._write_gate()
+        row = next((r for r in self.alert_rows if int(r["id"]) == int(alert_id)), None)
+        if row is None:
+            return None
+        now = self._aware_now()
+        last = row.get("last_emailed_at")
+        if kind == "resolve":
+            resolved = row.get("resolved_at")
+            ok = resolved is not None and last is not None and last < resolved
+        else:
+            ok = row.get("resolved_at") is None and (
+                last is None or last < now - timedelta(seconds=float(repeat_s))
+            )
+        if not ok:
+            return None
+        # Strictly later than the last claim, as clock_timestamp() would be.
+        if last is not None and now <= last:
+            now = last + timedelta(microseconds=1)
+        row["last_emailed_at"] = now
+        return now
+
+    async def alert_unclaim_email(self, alert_id, claimed, previous):
+        await self._write_gate()
+        for row in self.alert_rows:
+            if (
+                int(row["id"]) == int(alert_id)
+                and row.get("last_emailed_at") == claimed
+            ):
+                row["last_emailed_at"] = previous
+
+    async def alerts_window(self, start, end, limit):
+        self._check()
+        rows = [
+            r
+            for r in self.alert_rows
+            if r["last_seen"] >= start and r["first_seen"] < end
+        ]
+        rows.sort(key=lambda r: (r["first_seen"], int(r["id"])), reverse=True)
+        return [self._alert_copy(r) for r in rows[:limit]]
+
+    async def alerts_cleanup(self, days):
+        await self._write_gate()
+        cutoff = self._aware_now() - timedelta(days=int(days))
+        kept = [
+            r
+            for r in self.alert_rows
+            if r.get("resolved_at") is None or r["resolved_at"] >= cutoff
+        ]
+        deleted = len(self.alert_rows) - len(kept)
+        self.alert_rows = kept
+        return deleted
 
     # -- logs ----------------------------------------------------------------------------
     async def logs_write(self, rows):

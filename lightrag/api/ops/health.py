@@ -2,7 +2,7 @@
 
 Pure functions over what the probes and heartbeats stored, shared by the
 Health tab routes, the Overview and the leased attention snapshot
-(:mod:`lightrag.api.ops.reconcile`). Thresholds follow §1.7 of
+(:mod:`lightrag.api.ops.alerts`). Thresholds follow §1.7 of
 ``docs/ADMIN_OPERATIONS_DASHBOARD.md``.
 """
 
@@ -43,6 +43,9 @@ VLLM_WAITING_FOR_S = 120.0
 DISK_WARN_FREE_PCT = 15.0
 DISK_CRIT_FREE_PCT = 5.0
 DROPS_SERIOUS = 1000
+# unauth_warning_lines_5m (§1.7, R24): WARNING+ lines in 5 min, all workers,
+# logged while serving requests that presented no valid credential.
+UNAUTH_WARNINGS_WARN = 50
 RECORDER_FLUSH_STALE_S = 60.0
 WORKERS_CONSECUTIVE = 2
 # pg_pool_wait, pg_connections and manager_rtt hold for 2 evaluations.
@@ -780,5 +783,15 @@ def health_attention(
                 "stale_workers": stale,
                 "stale_sinks": sink_stale,
             },
+        )
+    unauth = sum(int(s.get("unauth_warnings_5m") or 0) for _, s in sinks)
+    if unauth > UNAUTH_WARNINGS_WARN:
+        add(
+            "unauth_warning_lines_5m",
+            "warning",
+            f"{unauth} warning lines in 5 min from requests without a valid credential",
+            health_link(odep="log_sink"),
+            params={"lines_5m": unauth, "threshold": UNAUTH_WARNINGS_WARN},
+            count=unauth,
         )
     return new_streaks
