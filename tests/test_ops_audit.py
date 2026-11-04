@@ -368,6 +368,10 @@ def _documents_app(store, user: UserInfo, monkeypatch) -> FastAPI:
         return user
 
     monkeypatch.setattr(dependencies, "resolve_user_from_request", resolve_user)
+    # On-behalf requests need a live admin (ADMIN_ACCOUNTS), not just the claim.
+    from lightrag.api import auth as core_auth
+
+    monkeypatch.setattr(core_auth.global_args, "admin_accounts", "root", raising=False)
     return app
 
 
@@ -486,6 +490,9 @@ def test_on_behalf_email_ingest_writes_intent_and_result(monkeypatch):
 
     monkeypatch.setattr(email_routes.EmailIngestionService, "ingest_email", fake_ingest)
     monkeypatch.setattr(dependencies, "resolve_user_from_request", resolve_user)
+    from lightrag.api import auth as core_auth
+
+    monkeypatch.setattr(core_auth.global_args, "admin_accounts", "root", raising=False)
     store = MemoryOpsStore()
     app = FastAPI()
     app.include_router(email_routes.create_email_routes(SimpleNamespace()))

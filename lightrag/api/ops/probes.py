@@ -4,7 +4,9 @@ One worker per host (the holder of the ``ops:probes`` lease) checks every
 dependency the server is configured to use, every 30 s; SMTP and TLS every
 15 min and the identity provider every 5 min. Postgres extras (connections,
 database size, blocked backends) are refreshed every 5 min. Without Postgres
-the checks still run, locally, and are kept in memory only.
+the checks still run, locally, and are kept in memory only. With
+``OPS_GPU_EXPORTER_URL`` set, a ``gpu`` probe also reads the
+nvidia_gpu_exporter sidecar (:mod:`lightrag.api.ops.gpu`).
 
 Never blocking the event loop:
 
@@ -174,6 +176,22 @@ DETAIL_KEYS = frozenset(
         "model",
         "binding",
         "note",
+        # GPU exporter sidecar (``gpu`` probe, see ops/gpu.py).
+        "gpus",
+        "gpu_count",
+        "index",
+        "name",
+        "util_pct",
+        "mem_used_bytes",
+        "mem_total_bytes",
+        "mem_pct",
+        "temp_c",
+        "power_w",
+        "power_limit_w",
+        "util_max_pct",
+        "mem_max_pct",
+        "temp_max_c",
+        "power_total_w",
     }
 )
 _DETAIL_MAX_STR = 200
@@ -1354,6 +1372,13 @@ def build_specs(
         specs.append(
             ProbeSpec("disk", "Disk", "disk", target=None, run=disk_probe(paths))
         )
+
+    # The nvidia_gpu_exporter sidecar (D5), only when OPS_GPU_EXPORTER_URL is set.
+    from lightrag.api.ops.gpu import gpu_spec
+
+    gpu = gpu_spec()
+    if gpu is not None:
+        specs.append(gpu)
     return specs
 
 

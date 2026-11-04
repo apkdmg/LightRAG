@@ -1,6 +1,6 @@
 import { CSSProperties, KeyboardEvent, memo, useId, useMemo, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
-import { Seg } from '@/features/TokenInsights/ui'
+import { Seg } from '@/components/admin'
 import { cn } from '@/lib/utils'
 import type { DepHealth } from '../api'
 import { useOpsNav } from '../context'

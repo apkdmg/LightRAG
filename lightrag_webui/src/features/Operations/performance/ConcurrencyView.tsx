@@ -1,5 +1,5 @@
 import { useTranslation } from 'react-i18next'
-import { Meter } from '@/features/TokenInsights/ui'
+import { Meter } from '@/components/admin'
 import { opsApi } from '../api'
 import { Panel } from '../components/Panel'
 import OpsLink from '../components/OpsLink'

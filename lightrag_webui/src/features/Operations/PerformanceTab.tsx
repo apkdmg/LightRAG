@@ -1,11 +1,12 @@
 import { useCallback, useMemo, useState } from 'react'
 import { useTranslation } from 'react-i18next'
-import { Seg } from '@/features/TokenInsights/ui'
+import { Seg } from '@/components/admin'
 import { opsApi } from './api'
 import { useOpsNav, useOpsShell } from './context'
 import { OPS_SUBS } from './hashState'
 import ConcurrencyView from './performance/ConcurrencyView'
 import DepLatencyView from './performance/DepLatencyView'
+import GpuView from './performance/GpuView'
 import HttpView from './performance/HttpView'
 import LlmView from './performance/LlmView'
 import { DEFAULT_PERF_WINDOW, PERF_WINDOWS, PERF_WINDOW_SECONDS, PerfSection, PerfWindow, isPerfWindow, perfRefreshSeconds } from './performance/model'
@@ -39,7 +40,8 @@ const SECTIONS = OPS_SUBS.performance as readonly PerfSection[]
 /**
  * Performance (§2.7): a window [15m | 1h | 24h | 7d] and one section at a
  * time [LLM | Embed & Rerank | HTTP | Throughput | Concurrency | Top
- * workspaces]. Only the visible section polls: every 60 s for 15 m and 1 h,
+ * workspaces | GPU]. GPU shows only while the server reads a GPU exporter
+ * (OPS_GPU_EXPORTER_URL, D5). Only the visible section polls: every 60 s for 15 m and 1 h,
  * by hand for 24 h and 7 d. Event markers for the window come from /events
  * (deployments, provider rejections, admin actions) and are drawn on every
  * chart. Charts never animate. Cost and tokens stay in Token Insights.
@@ -48,7 +50,8 @@ export default function PerformanceTab() {
   const { t } = useTranslation()
   const nav = useOpsNav()
   const { status } = useOpsShell()
-  const section: PerfSection = nav.view.sub && SECTIONS.includes(nav.view.sub as PerfSection) ? (nav.view.sub as PerfSection) : 'llm'
+  const sections = status?.features?.gpu === true ? SECTIONS : SECTIONS.filter((s) => s !== 'gpu')
+  const section: PerfSection = nav.view.sub && sections.includes(nav.view.sub as PerfSection) ? (nav.view.sub as PerfSection) : 'llm'
   const [win, setWinState] = useState<PerfWindow>(readWindow)
   const [fade, setFade] = useState<PerfSection | null>(null)
   // A window change keeps the section mounted: the old data stays on screen until the new answer lands.
@@ -85,7 +88,7 @@ export default function PerformanceTab() {
         <div className="text-muted-foreground flex min-w-0 flex-col gap-0.5 text-xs">
           {t('operations.perf.sectionLabel')}
           <div className="overflow-x-auto">
-            <Seg value={section} onChange={selectSection} label={t('operations.perf.sectionLabel')} options={SECTIONS.map((s) => ({ value: s, label: sectionLabel(s) }))} />
+            <Seg value={section} onChange={selectSection} label={t('operations.perf.sectionLabel')} options={sections.map((s) => ({ value: s, label: sectionLabel(s) }))} />
           </div>
         </div>
         <span className="text-muted-foreground pb-1.5 text-xs">
@@ -99,6 +102,7 @@ export default function PerformanceTab() {
         {section === 'throughput' ? <ThroughputView ctx={ctx} /> : null}
         {section === 'concurrency' ? <ConcurrencyView /> : null}
         {section === 'top' ? <TopWorkspacesView ctx={ctx} /> : null}
+        {section === 'gpu' ? <GpuView ctx={ctx} /> : null}
       </div>
     </div>
   )

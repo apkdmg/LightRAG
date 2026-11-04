@@ -51,6 +51,7 @@ TABLE_AUDIT = "LIGHTRAG_OPS_AUDIT"
 TABLE_DOC_STATUS = "LIGHTRAG_DOC_STATUS"
 TABLE_OWNERS = "LIGHTRAG_WORKSPACE_OWNERS"
 TABLE_USAGE_EVENTS = "LIGHTRAG_USAGE_EVENTS"
+TABLE_USAGE_CALLS = "LIGHTRAG_USAGE_CALLS"
 # Ops tables created by later features; deletion cleans them when they exist.
 WORKSPACE_ROW_TABLES = (
     "LIGHTRAG_OPS_LOGS",
@@ -74,6 +75,11 @@ NOT_REAL_FAILURE_KINDS = ("cancelled", "duplicate")
 TOP_WORKSPACE_METRICS = ("processing_minutes", "failures", "runs")
 # Built by ops/indexes.py; correlate reads doc status by id only through it.
 DOC_STATUS_ID_INDEX = "idx_lightrag_doc_status_id"
+USAGE_CALLS_REQUEST_INDEX = "idx_lightrag_usage_calls_req"
+# Without its request_id index, an LLM-call lookup by request ID only scans
+# this recent stretch (on the ts index).
+USAGE_REQUEST_FALLBACK_HOURS = 24
+GPU_DEPENDENCY = "gpu"
 # Columns the log sink writes, in COPY order.
 LOG_COLUMNS = (
     "ts",
@@ -154,6 +160,7 @@ DUP_PREFIX = "dup-"
 AUDIT_READ_ACTIONS = (
     "log_search",
     "log_groups",
+    "log_tail",
     "correlate",
     "log_export",
     "audit_export",
@@ -829,6 +836,20 @@ class OpsStore(ABC):
         """Workspaces holding a document ID (doc status, failures, log lines)."""
 
     @abstractmethod
+    async def usage_calls_by_request(
+        self, request_id: str, limit: int
+    ) -> list[dict[str, Any]]:
+        """LLM calls (``LIGHTRAG_USAGE_CALLS``) made while serving one request,
+        per workspace: ``n``, ``errors``, ``error_kinds``, ``last_ts``, and
+        ``window_hours`` (None when the whole table was searched)."""
+
+    @abstractmethod
+    async def log_trgm_state(self) -> dict[str, bool]:
+        """pg_trgm for log search (V7): ``available`` on the server,
+        ``installed`` in this database, and ``index_valid`` (the trigram
+        index on ``LIGHTRAG_OPS_LOGS(msg)`` exists and is valid)."""
+
+    @abstractmethod
     async def owners_by_email(self, email: str, limit: int) -> dict[str, str]:
         """Workspaces whose registered owner email or identity is ``email``."""
 
@@ -878,6 +899,15 @@ class OpsStore(ABC):
         averaged, waiting and KV cache use at their maximum)."""
 
     @abstractmethod
+    async def gpu_series(
+        self, start: datetime, end: datetime, bucket_s: int
+    ) -> list[dict[str, Any]]:
+        """Per-GPU history from the ``gpu`` probe rows' ``detail.gpus``:
+        ``[{t, gpu, util_pct, mem_pct, temp_c, power_w}]`` per bucket
+        (utilisation and power averaged, memory and temperature at their
+        peak)."""
+
+    @abstractmethod
     async def llm_queue_series(
         self, start: datetime, end: datetime, bucket_s: int
     ) -> list[dict[str, Any]]:
@@ -921,6 +951,8 @@ class PostgresOpsStore(OpsStore):
         self._tables: set[str] = set()
         self._tables_at = 0.0
         self._index_checks: dict[str, tuple[bool, float]] = {}
+        self._column_checks: dict[tuple[str, str], tuple[bool, float]] = {}
+        self._trgm: Optional[tuple[dict[str, bool], float]] = None
         self.ready = False
         self.doc_status_ready = False
 
@@ -1228,6 +1260,7 @@ class PostgresOpsStore(OpsStore):
             TABLE_DOC_STATUS,
             TABLE_OWNERS,
             TABLE_USAGE_EVENTS,
+            TABLE_USAGE_CALLS,
             TABLE_ALERTS,
             *WORKSPACE_ROW_TABLES,
         ]
@@ -3033,6 +3066,82 @@ class PostgresOpsStore(OpsStore):
         self._index_checks[name] = (valid, now)
         return valid
 
+    async def _has_column(self, table: str, column: str) -> bool:
+        """Whether a column exists (cached like the table list)."""
+        key = (table, column)
+        cached = self._column_checks.get(key)
+        now = time.monotonic()
+        if cached is not None and now - cached[1] < _TABLES_TTL_S:
+            return cached[0]
+        rows = await self._read(
+            """SELECT 1 FROM information_schema.columns
+            WHERE table_name = $1 AND column_name = $2
+              AND table_schema = ANY(current_schemas(false))""",
+            table.lower(),
+            column,
+        )
+        found = bool(rows)
+        self._column_checks[key] = (found, now)
+        return found
+
+    async def usage_calls_by_request(self, request_id, limit):
+        if not await self._has_table(TABLE_USAGE_CALLS) or not await self._has_column(
+            TABLE_USAGE_CALLS, "request_id"
+        ):
+            return []
+        window = (
+            None
+            if await self._index_valid(USAGE_CALLS_REQUEST_INDEX)
+            else USAGE_REQUEST_FALLBACK_HOURS
+        )
+        bound = (
+            f" AND ts >= now() - make_interval(hours => {int(window)})"
+            if window
+            else ""
+        )
+        rows = await self._read(
+            f"""SELECT workspace, count(*)::int AS n,
+                count(*) FILTER (WHERE status = 'error')::int AS errors,
+                array_remove(array_agg(DISTINCT error_kind), NULL) AS error_kinds,
+                max(ts) AS last_ts
+            FROM {TABLE_USAGE_CALLS} WHERE request_id = $1{bound}
+            GROUP BY workspace ORDER BY max(ts) DESC LIMIT $2""",
+            request_id,
+            int(limit),
+        )
+        for row in rows:
+            row["error_kinds"] = sorted(row.get("error_kinds") or [])
+            row["last_ts"] = as_utc(row.get("last_ts"))
+            row["window_hours"] = window
+        return rows
+
+    async def log_trgm_state(self):
+        from lightrag.api.ops.indexes import LOG_TRGM_INDEX, TRGM_EXTENSION
+
+        cached = self._trgm
+        now = time.monotonic()
+        if cached is not None and now - cached[1] < _TABLES_TTL_S:
+            return dict(cached[0])
+        rows = await self._read(
+            """SELECT
+                EXISTS (SELECT 1 FROM pg_available_extensions WHERE name = $1)
+                    AS available,
+                EXISTS (SELECT 1 FROM pg_extension WHERE extname = $1) AS installed,
+                COALESCE((SELECT i.indisvalid FROM pg_class c
+                    JOIN pg_index i ON i.indexrelid = c.oid
+                    WHERE c.relname = $2 AND c.relkind = 'i'), false) AS index_valid""",
+            TRGM_EXTENSION,
+            LOG_TRGM_INDEX,
+        )
+        row = rows[0] if rows else {}
+        state = {
+            "available": bool(row.get("available")),
+            "installed": bool(row.get("installed")),
+            "index_valid": bool(row.get("installed")) and bool(row.get("index_valid")),
+        }
+        self._trgm = (state, now)
+        return dict(state)
+
     async def correlate_docs(self, doc_id, limit):
         found: dict[Any, dict[str, Any]] = {}
 
@@ -3263,6 +3372,43 @@ class PostgresOpsStore(OpsStore):
             WHERE running IS NOT NULL OR waiting IS NOT NULL OR kv_cache_pct IS NOT NULL
             GROUP BY dependency, t ORDER BY dependency, t""",
             list(VLLM_DEPENDENCIES),
+            start,
+            end,
+        )
+
+    async def gpu_series(self, start, end, bucket_s):
+        bucket = max(60, int(bucket_s))
+        # The primary key (dependency, ts) bounds the scan; values the probe
+        # could not read as numbers are skipped, never cast.
+        return await self._read(
+            f"""WITH src AS (
+                SELECT (floor(extract(epoch FROM p.ts) / {bucket}) * {bucket})::bigint
+                        AS t,
+                    g.value AS gpu
+                FROM {TABLE_PROBES} p,
+                    jsonb_array_elements(CASE WHEN jsonb_typeof(p.detail->'gpus') = 'array'
+                        THEN p.detail->'gpus' ELSE '[]'::jsonb END) AS g
+                WHERE p.dependency = $1 AND p.ts >= $2 AND p.ts < $3
+            ), vals AS (
+                SELECT t,
+                    CASE WHEN jsonb_typeof(gpu->'index') = 'number'
+                        THEN (gpu->>'index')::float8::int END AS gpu,
+                    CASE WHEN jsonb_typeof(gpu->'util_pct') = 'number'
+                        THEN (gpu->>'util_pct')::float8 END AS util_pct,
+                    CASE WHEN jsonb_typeof(gpu->'mem_pct') = 'number'
+                        THEN (gpu->>'mem_pct')::float8 END AS mem_pct,
+                    CASE WHEN jsonb_typeof(gpu->'temp_c') = 'number'
+                        THEN (gpu->>'temp_c')::float8 END AS temp_c,
+                    CASE WHEN jsonb_typeof(gpu->'power_w') = 'number'
+                        THEN (gpu->>'power_w')::float8 END AS power_w
+                FROM src
+            )
+            SELECT t, gpu, avg(util_pct)::float8 AS util_pct,
+                max(mem_pct)::float8 AS mem_pct, max(temp_c)::float8 AS temp_c,
+                avg(power_w)::float8 AS power_w
+            FROM vals WHERE gpu IS NOT NULL
+            GROUP BY t, gpu ORDER BY gpu, t""",
+            GPU_DEPENDENCY,
             start,
             end,
         )
@@ -3618,6 +3764,10 @@ class MemoryOpsStore(OpsStore):
         # Performance histograms: minute rows, and hour rows by (hour, series, key).
         self.metric_rows: list[dict[str, Any]] = []
         self.metric_hours: dict[tuple, dict[str, Any]] = {}
+        # LIGHTRAG_USAGE_CALLS rows (dicts) for the request-ID lookup, and what
+        # the pg_trgm detection answers.
+        self.usage_call_rows: list[dict[str, Any]] = []
+        self.trgm_state = {"available": False, "installed": False, "index_valid": False}
         self.fail_writes: Optional[BaseException] = None
         self.write_delay_s: float = 0.0
         self.ready = True
@@ -5147,6 +5297,39 @@ class MemoryOpsStore(OpsStore):
             item["last_ts"] = max(item["last_ts"], row["ts"])
         return sorted(found.values(), key=lambda i: i["last_ts"], reverse=True)[:limit]
 
+    async def usage_calls_by_request(self, request_id, limit):
+        self._check()
+        found: dict[Any, dict[str, Any]] = {}
+        for row in self.usage_call_rows:
+            if row.get("request_id") != request_id:
+                continue
+            ts = as_utc(row["ts"])
+            item = found.setdefault(
+                row.get("workspace"),
+                {
+                    "workspace": row.get("workspace"),
+                    "n": 0,
+                    "errors": 0,
+                    "error_kinds": set(),
+                    "last_ts": ts,
+                    "window_hours": None,
+                },
+            )
+            item["n"] += 1
+            if row.get("status") == "error":
+                item["errors"] += 1
+            if row.get("error_kind"):
+                item["error_kinds"].add(row["error_kind"])
+            item["last_ts"] = max(item["last_ts"], ts)
+        out = sorted(found.values(), key=lambda i: i["last_ts"], reverse=True)[:limit]
+        for item in out:
+            item["error_kinds"] = sorted(item["error_kinds"])
+        return out
+
+    async def log_trgm_state(self):
+        self._check()
+        return dict(self.trgm_state)
+
     async def correlate_tracks(self, track_id, limit):
         self._check()
         found: dict[Any, dict[str, Any]] = {}
@@ -5329,6 +5512,45 @@ class MemoryOpsStore(OpsStore):
             for i, v in enumerate(row["buckets"][:METRIC_BUCKETS]):
                 agg["buckets"][i] += int(v)
         return [out[key] for key in sorted(out)]
+
+    async def gpu_series(self, start, end, bucket_s):
+        self._check()
+        bucket = max(60, int(bucket_s))
+        cells: dict[tuple[int, int], dict[str, list[float]]] = {}
+        for row in self.probe_rows:
+            if row["dependency"] != GPU_DEPENDENCY or not (start <= row["ts"] < end):
+                continue
+            gpus = (row.get("detail") or {}).get("gpus")
+            if not isinstance(gpus, list):
+                continue
+            t = int(row["ts"].timestamp()) // bucket * bucket
+            for gpu in gpus:
+                index = gpu.get("index") if isinstance(gpu, dict) else None
+                if not isinstance(index, (int, float)) or isinstance(index, bool):
+                    continue
+                cell = cells.setdefault(
+                    (int(index), t),
+                    {"util_pct": [], "mem_pct": [], "temp_c": [], "power_w": []},
+                )
+                for key, values in cell.items():
+                    value = gpu.get(key)
+                    if isinstance(value, (int, float)) and not isinstance(value, bool):
+                        values.append(float(value))
+        return [
+            {
+                "t": t,
+                "gpu": gpu,
+                "util_pct": sum(c["util_pct"]) / len(c["util_pct"])
+                if c["util_pct"]
+                else None,
+                "mem_pct": max(c["mem_pct"], default=None),
+                "temp_c": max(c["temp_c"], default=None),
+                "power_w": sum(c["power_w"]) / len(c["power_w"])
+                if c["power_w"]
+                else None,
+            }
+            for (gpu, t), c in sorted(cells.items())
+        ]
 
     async def vllm_series(self, start, end, bucket_s):
         self._check()

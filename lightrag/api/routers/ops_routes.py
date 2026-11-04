@@ -38,6 +38,9 @@ from lightrag.api.ops import log_sink as ops_log_sink
 from lightrag.api.ops import logs as ops_logs
 from lightrag.api.ops import actions as ops_actions
 from lightrag.api.ops import alerts as ops_alerts
+from lightrag.api.ops import gpu as ops_gpu
+from lightrag.api.ops import jsonl as ops_jsonl
+from lightrag.api.ops import prom as ops_prom
 from lightrag.api.ops.audit import (
     SearchAudit,
     audit_csv,
@@ -388,6 +391,7 @@ async def status(
     if heartbeat_live is not None:
         workers_live = heartbeat_live
     actions_on = ops_actions.actions_enabled()
+    log_trgm = (await ops_logs.trgm_state(service))["index_valid"]
     payload: dict[str, Any] = {
         "generated_at": _generated_at(),
         "available": available,
@@ -412,8 +416,21 @@ async def status(
             # confirmed dead.
             "actions": actions_on,
             "release_busy": actions_on and mode == "gunicorn" and service.durable_runs,
+            # A dead worker's scanning flag and pending_enqueues share (OQ-12):
+            # the same conditions (the shares are written by run tracking).
+            "release_reservations": actions_on
+            and mode == "gunicorn"
+            and service.durable_runs,
             "audit": service.available,
-            "gpu": False,
+            # The nvidia_gpu_exporter sidecar (OPS_GPU_EXPORTER_URL, D5).
+            "gpu": ops_gpu.gpu_enabled(),
+            # Text search beyond 24 h: the pg_trgm index on log messages is
+            # valid (V7).
+            "log_trgm": log_trgm,
+            # Per-process JSONL files and the live INFO tail (OPS_JSONL_LOGS).
+            "log_tail": _jsonl(request) is not None,
+            # GET /admin/ops/metrics in Prometheus text (OPS_PROMETHEUS).
+            "prometheus": ops_prom.prometheus_enabled(),
             # HTTP, embed/rerank and sign-in metrics recorded in this worker.
             "metrics": getattr(getattr(request.app.state, "ops", None), "metrics", None)
             is not None,
@@ -827,6 +844,8 @@ async def logs(
     service = _service(request)
 
     async def call() -> dict[str, Any]:
+        # 24 h for a text search, 7 days once the pg_trgm index is valid.
+        text_window_s = await ops_logs.text_search_window(service)
         f = ops_logs.parse_filter(
             _query_filters(
                 level=level,
@@ -842,7 +861,8 @@ async def logs(
                 worker_id=worker_id,
                 q=q,
                 **{"from": from_},
-            )
+            ),
+            text_window_s=text_window_s,
         )
         body = await ops_logs.LogsReader(service).page(
             f,
@@ -857,7 +877,11 @@ async def logs(
             filters=ops_logs.search_fields(f),
             request=request,
         )
-        return {**body, **await _sink_meta(request, service)}
+        return {
+            **body,
+            **await _sink_meta(request, service),
+            "text_search_window_s": text_window_s,
+        }
 
     return await _answer(
         service,
@@ -900,6 +924,66 @@ async def log_groups(
     return await _answer(
         service, call, {"hours": hours, "groups": [], "capped": False}, needs_docs=False
     )
+
+
+# -- Live tail of the per-process JSONL files (OPS_JSONL_LOGS) --------------------------------
+
+
+def _jsonl(request: Request) -> Any:
+    return getattr(getattr(request.app.state, "ops", None), "jsonl", None)
+
+
+@router.get("/logs/tail")
+async def log_tail(
+    request: Request,
+    user: UserInfo = Depends(require_admin),
+    lines: int = Query(ops_jsonl.TAIL_DEFAULT_LINES, ge=1, le=ops_jsonl.TAIL_MAX_LINES),
+    level: Optional[str] = Query(None, max_length=16),
+    module: Optional[str] = Query(None, max_length=128),
+) -> dict[str, Any]:
+    """The newest INFO+ lines across this host's server processes, merged by
+    time, newest first (bounded reads from the files' ends, redacted again).
+
+    Works without Postgres; ``enabled: false`` while ``OPS_JSONL_LOGS`` is
+    off in this process. Audited like a log search (when the ops store is
+    available, once per actor and filters every few minutes).
+    """
+    try:
+        min_level = ops_logs.parse_level(level or "INFO")
+        name = (
+            ops_logs._token(module, ops_logs._NAME, "invalid_module")
+            if module
+            else None
+        )
+    except OpsBadRequest as e:
+        return _err(400, e.code)
+    jsonl = _jsonl(request)
+    base: dict[str, Any] = {
+        "generated_at": _generated_at(),
+        "enabled": jsonl is not None,
+        "level": logging.getLevelName(min_level),
+        "module": name,
+    }
+    if jsonl is None:
+        return {**base, "items": [], "sources": [], "lines": lines, "newest_ts": None}
+    directory = os.path.dirname(jsonl.handler.baseFilename)
+    try:
+        body = await asyncio.to_thread(
+            ops_jsonl.tail, directory, lines=lines, level=min_level, module=name
+        )
+    except OSError as e:
+        logger.warning("Ops log tail unreadable (%s)", type(e).__name__)
+        return _err(503, "log_files_unavailable")
+    service = _service(request)
+    if service.available:
+        await _search_audit(service).record(
+            service.store,
+            user=user,
+            action="log_tail",
+            filters={"level": min_level, "module": name},
+            request=request,
+        )
+    return {**base, **body}
 
 
 # -- INFO capture (Logs tab) ------------------------------------------------------------------
@@ -1103,7 +1187,8 @@ async def log_export(
         return _rate_limited(retry_after)
     try:
         f = ops_logs.parse_filter(
-            {str(k): None if v is None else str(v) for k, v in body.filters.items()}
+            {str(k): None if v is None else str(v) for k, v in body.filters.items()},
+            text_window_s=await ops_logs.text_search_window(service),
         )
     except OpsBadRequest as e:
         return _err(400, e.code)
@@ -1425,6 +1510,20 @@ async def performance_deps(request: Request, window: str = _WINDOW) -> dict[str,
     )
 
 
+@router.get("/performance/gpu")
+async def performance_gpu(request: Request, window: str = _WINDOW) -> dict[str, Any]:
+    """Per-GPU utilisation, memory, temperature and power from the
+    nvidia_gpu_exporter sidecar (latest probe, plus history from the probe
+    rows); ``enabled: false`` without ``OPS_GPU_EXPORTER_URL``."""
+    service = _service(request)
+    return await _perf_answer(
+        service,
+        lambda: ops_gpu.gpu_view(service, window),
+        {},
+        needs_store=False,
+    )
+
+
 @router.get("/performance/http")
 async def performance_http(request: Request, window: str = _WINDOW) -> dict[str, Any]:
     """Latency, rate and 5xx share per route template (``<unmatched>`` for
@@ -1472,6 +1571,18 @@ async def performance_top_workspaces(
         lambda: service.perf.top_workspaces(metric, window),
         {"metric": metric, "window": window, "items": []},
     )
+
+
+@router.get("/metrics")
+async def prometheus_metrics(request: Request) -> Response:
+    """Host-wide console numbers in the Prometheus text format (admin only;
+    404 unless ``OPS_PROMETHEUS=true``). No workspace, user, route or worker
+    labels."""
+    if not ops_prom.prometheus_enabled():
+        return _err(404, "not_found")
+    service = _service(request)
+    text = await ops_prom.render(service, _workers(request))
+    return Response(content=text, media_type=ops_prom.CONTENT_TYPE)
 
 
 @router.get("/signin")
@@ -1522,6 +1633,17 @@ class RunRequest(BaseModel):
 class ReleaseBusyRequest(ActionRequest):
     expected_run_id: Optional[str] = Field(None, max_length=64)
     expected_job_start: Optional[str] = Field(None, max_length=64)
+    # The workspace name, typed by the operator.
+    confirm: str = Field(..., min_length=1, max_length=255)
+
+
+class ReleaseReservationsRequest(ActionRequest):
+    # The dead worker whose reservations are released (its worker_id).
+    worker_id: str = Field(..., min_length=32, max_length=36)
+    # What the operator saw: the scan it owns (None when it owns none) and
+    # its share of pending_enqueues.
+    expected_scan_started_at: Optional[str] = Field(None, max_length=64)
+    expected_pending: int = Field(0, ge=0, le=100000)
     # The workspace name, typed by the operator.
     confirm: str = Field(..., min_length=1, max_length=255)
 
@@ -1667,6 +1789,49 @@ async def action_release_busy(
             mode=process_mode(),
             expected_run_id=body.expected_run_id,
             expected_job_start=body.expected_job_start,
+        )
+
+    return await _act(call)
+
+
+@router.post(
+    "/workspaces/{ws}/actions/release-reservations",
+    dependencies=[*_ACTION_GUARDS, Depends(require_operator)],
+)
+async def action_release_reservations(
+    request: Request,
+    ws: str,
+    body: ReleaseReservationsRequest = Body(...),
+    user: UserInfo = Depends(require_live_admin),
+) -> Any:
+    """Release a dead worker's ``scanning`` flag and its share of
+    ``pending_enqueues`` (operator, Gunicorn only, typed workspace name,
+    compare-and-set on what the operator saw)."""
+    actions = _actions(request)
+
+    async def call() -> dict[str, Any]:
+        if body.confirm.strip() != ws:
+            raise ops_actions.ActionRefused(400, "confirm_mismatch")
+        worker_id = ops_logs.parse_hex_id(body.worker_id, "invalid_worker_id")
+        action = ops_actions.build_call(
+            user=user,
+            request=request,
+            action="release_reservations",
+            workspace=ws,
+            reason=body.reason,
+            params={
+                "worker_id": worker_id,
+                "expected_scan_started_at": body.expected_scan_started_at,
+                "expected_pending": body.expected_pending,
+            },
+            target=ws,
+        )
+        return await actions.release_reservations(
+            action,
+            mode=process_mode(),
+            worker_id=worker_id,
+            expected_scan_started_at=body.expected_scan_started_at,
+            expected_pending=body.expected_pending,
         )
 
     return await _act(call)

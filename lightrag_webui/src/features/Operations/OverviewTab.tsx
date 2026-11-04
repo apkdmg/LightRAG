@@ -1,5 +1,5 @@
 import { useTranslation } from 'react-i18next'
-import { Card, Kv, Title } from '@/features/TokenInsights/ui'
+import { Card, Kv, Title } from '@/components/admin'
 import { OpsFeatures, OpsOverview } from './api'
 import ActiveRunsTable from './components/ActiveRunsTable'
 import AttentionList from './components/AttentionList'
@@ -19,12 +19,17 @@ import { KPI_TARGETS, KpiId, OVERVIEW_REFRESH_SECONDS, kpiState, stuckTotal } fr
 import { OpsPoll } from './poll'
 import { isMultiWorker } from './severity'
 
-const FEATURE_ORDER: (keyof OpsFeatures)[] = ['durable', 'runs', 'logs', 'probes', 'metrics', 'alerts', 'release_busy', 'gpu', 'insights']
+const FEATURE_ORDER: (keyof OpsFeatures)[] = ['durable', 'runs', 'logs', 'log_trgm', 'log_tail', 'probes', 'metrics', 'alerts', 'release_busy', 'gpu', 'prometheus', 'insights']
+/** Rows a server one release behind does not report: no row rather than a false "Off". */
+const REPORTED_ONLY = new Set<keyof OpsFeatures>(['metrics', 'log_trgm', 'log_tail', 'prometheus'])
 const TOP_ACTIVE = 5
 
-/** Why a feature is off: Insights, probes, metrics and alerts can be switched off, release busy needs Gunicorn, the rest ships later. */
+/** Features an operator switches on or off in the server's configuration. */
+const SWITCHABLE = new Set<keyof OpsFeatures>(['insights', 'probes', 'metrics', 'alerts', 'gpu', 'log_trgm', 'log_tail', 'prometheus'])
+
+/** Why a feature is off: most can be switched off, release busy needs Gunicorn, the rest ships later. */
 const offLabel = (key: keyof OpsFeatures, singleProcess: boolean) => {
-  if (key === 'insights' || key === 'probes' || key === 'metrics' || key === 'alerts') return 'operations.feature.off'
+  if (SWITCHABLE.has(key)) return 'operations.feature.off'
   if (key === 'release_busy' && singleProcess) return 'operations.feature.multiWorkerOnly'
   return 'operations.feature.later'
 }
@@ -66,8 +71,7 @@ export function ServerCard() {
       <div>
         <h3 className="m-0 mb-1.5 text-[13px] font-semibold">{t('operations.system.features')}</h3>
         <ul className="m-0 grid list-none grid-cols-1 gap-1 p-0 sm:grid-cols-2">
-          {/* A server one release behind does not report `metrics`: no row rather than a false "Off". */}
-          {FEATURE_ORDER.filter((key) => key !== 'metrics' || typeof features.metrics === 'boolean').map((key) => (
+          {FEATURE_ORDER.filter((key) => !REPORTED_ONLY.has(key) || typeof features[key] === 'boolean').map((key) => (
             <li key={key} className="flex items-center justify-between gap-3 text-xs">
               <span className="text-muted-foreground">{t(`operations.feature.${key}`)}</span>
               {features[key] ? (

@@ -5,7 +5,8 @@ import { LinkIcon, PlusIcon, SlidersHorizontalIcon, XIcon } from 'lucide-react'
 import Input from '@/components/ui/Input'
 import { cn } from '@/lib/utils'
 import { useDebounce } from '@/hooks/useDebounce'
-import { DEFAULT_LOG_FILTER, ID_FIELDS, IdField, LOG_LEVELS, LOG_WINDOWS, LogFilter, activeFields, effectiveWindow, filterKey, normalizeFilter } from '../logs'
+import { useOpsShell } from '../context'
+import { DEFAULT_LOG_FILTER, ID_FIELDS, IdField, LOG_LEVELS, LOG_WINDOWS, LogFilter, activeFields, effectiveWindow, filterKey, normalizeFilter, textSearchWindow } from '../logs'
 
 /** Typing settles for this long before the URL and the query change. */
 const TYPE_DEBOUNCE_MS = 300
@@ -63,7 +64,9 @@ export default function LogFilterBar({ filter, onChange }: { filter: LogFilter; 
   const active = activeFields(filter)
   const ids = ID_FIELDS.filter((k) => k !== 'fingerprint')
   const visibleIds = ids.filter((k) => !!draft[k] || shownIds.includes(k))
-  const capped = !!filter.q && effectiveWindow(filter) !== filter.window
+  // A valid pg_trgm index lets a text search span the whole 7 days (V7); otherwise it is capped at 24 h.
+  const textWindow = textSearchWindow(useOpsShell().status?.features)
+  const capped = !!filter.q && effectiveWindow(filter, textWindow) !== filter.window
 
   const copyLink = async () => {
     try {
@@ -121,7 +124,7 @@ export default function LogFilterBar({ filter, onChange }: { filter: LogFilter; 
             type="search"
             value={draft.q}
             onChange={(e) => setText('q', e.target.value)}
-            placeholder={t('operations.logs.textPlaceholder')}
+            placeholder={textWindow === '7d' ? t('operations.logs.textPlaceholderWeek') : t('operations.logs.textPlaceholder')}
             className="h-9 w-56"
             maxLength={200}
             aria-describedby="ops-log-q-note"
@@ -150,7 +153,7 @@ export default function LogFilterBar({ filter, onChange }: { filter: LogFilter; 
         </div>
       </div>
       <p id="ops-log-q-note" className={cn('text-muted-foreground m-0 text-xs', !capped && 'sr-only')}>
-        {t('operations.logs.textWindow')}
+        {textWindow === '7d' ? t('operations.logs.textWindowShort') : t('operations.logs.textWindow')}
       </p>
       {active.length ? (
         <div className="flex flex-wrap items-center gap-1.5 text-xs">

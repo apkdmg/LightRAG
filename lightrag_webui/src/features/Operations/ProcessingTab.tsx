@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { useTranslation } from 'react-i18next'
-import { Seg } from '@/features/TokenInsights/ui'
+import { Seg } from '@/components/admin'
 import { ProcessingSummary, opsApi } from './api'
 import { Panel } from './components/Panel'
 import { useOpsNav } from './context'

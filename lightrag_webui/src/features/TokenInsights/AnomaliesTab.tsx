@@ -3,7 +3,8 @@ import { AnimatePresence, motion, useReducedMotion } from 'motion/react'
 import { useTranslation } from 'react-i18next'
 import { insightsApi } from './api'
 import { useData, useInsights } from './context'
-import { Card, Empty, PurposeName, RowButton, Seg, SeverityLabel, Title, fmtDay, fmtMoney, fmtTokens } from './ui'
+import { Card, Empty, RowButton, Seg, Title } from '@/components/admin'
+import { PurposeName, SeverityLabel, fmtDay, fmtMoney, fmtTokens } from './ui'
 
 const RANK: Record<string, number> = { critical: 3, serious: 2, warning: 1 }
 

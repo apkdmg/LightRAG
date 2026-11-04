@@ -1015,7 +1015,9 @@ async def _reserve_enqueue_slot(rag: LightRAG) -> bool:
       success.
 
     ``pending_enqueues`` is incremented so the scan endpoint can refuse
-    while bg tasks are mid-enqueue.  The counter does NOT gate
+    while bg tasks are mid-enqueue. With run tracking on, this worker's share
+    of it (``pending_enqueue_owners``) is incremented in the same critical
+    section, so an operator can later release a dead worker's share.  The counter does NOT gate
     ``apipeline_process_enqueue_documents`` — concurrent processing is
     explicitly allowed and is what makes "upload while pipeline is
     busy" possible.
@@ -1064,9 +1066,16 @@ async def _reserve_enqueue_slot(rag: LightRAG) -> bool:
                     "new work."
                 ),
             )
+        # The worker's share is written in the same locked block (OQ-12);
+        # the counter stays what every reader uses.
+        owner_share = ops_runs.pending_reserve_fields(
+            pipeline_status.get(ops_runs.PENDING_OWNERS_KEY)
+        )
         pipeline_status["pending_enqueues"] = (
             pipeline_status.get("pending_enqueues", 0) + 1
         )
+        if owner_share:
+            pipeline_status.update(owner_share)
     return True
 
 
@@ -1214,6 +1223,11 @@ async def _release_enqueue_slot(rag: LightRAG) -> None:
         current = pipeline_status.get("pending_enqueues", 0)
         if current > 0:
             pipeline_status["pending_enqueues"] = current - 1
+            owner_share = ops_runs.pending_release_fields(
+                pipeline_status.get(ops_runs.PENDING_OWNERS_KEY)
+            )
+            if owner_share:
+                pipeline_status.update(owner_share)
 
 
 def find_existing_file_by_file_path(input_dir: Path, file_path: str) -> Path | None:

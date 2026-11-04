@@ -15,7 +15,8 @@ import ForecastTab from './ForecastTab'
 import { ICON_CHECK, ICON_CLOCK, PURPOSES, Purpose, SEVERITY } from './meta'
 import OverviewTab from './OverviewTab'
 import SettingsDialog from './SettingsDialog'
-import { Card, Empty, Seg, StatusIcon, Swatch, ViewBoundary, fmtDay } from './ui'
+import { Card, Empty, Seg, StatusIcon, ViewBoundary } from '@/components/admin'
+import { Swatch, fmtDay } from './ui'
 import WhyPanel from './WhyPanel'
 import WorkspacesTab from './WorkspacesTab'
 import WorkTab from './WorkTab'
@@ -130,7 +131,7 @@ function Attention({ overview, scope, set }: { overview: any; scope: Scope; set:
 }
 
 export default function TokenInsights() {
-  return <ViewBoundary><InsightsPage /></ViewBoundary>
+  return <ViewBoundary name="Token Insights"><InsightsPage /></ViewBoundary>
 }
 
 function InsightsPage() {
@@ -224,7 +225,7 @@ function InsightsPage() {
                 </button>
               ))}
             </div>
-            <ViewBoundary resetKey={JSON.stringify([scope.tab, scope.purpose, scope.workspace, params, scope.unit])}>
+            <ViewBoundary name="Token Insights" resetKey={JSON.stringify([scope.tab, scope.purpose, scope.workspace, params, scope.unit])}>
               {scope.tab === 'overview' ? <OverviewTab /> : null}
               {scope.tab === 'workspaces' ? <WorkspacesTab /> : null}
               {scope.tab === 'explore' ? <ExploreTab /> : null}

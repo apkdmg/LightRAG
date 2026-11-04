@@ -2,7 +2,7 @@ import { useCallback, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { DownloadIcon, PauseIcon, PlayIcon } from 'lucide-react'
 import { cn } from '@/lib/utils'
-import { Seg } from '@/features/TokenInsights/ui'
+import { Seg } from '@/components/admin'
 import ExportDialog from './components/ExportDialog'
 import LogCaptureControl from './components/LogCaptureControl'
 import LogFilterBar from './components/LogFilterBar'
@@ -11,8 +11,10 @@ import { useLogCapture } from './logCapture'
 import { LogFilter, decodeLogFilter, encodeLogFilter } from './logs'
 import GroupedView from './logview/GroupedView'
 import StreamView from './logview/StreamView'
+import { tailFeature } from './logview/tail'
+import TailView from './logview/TailView'
 
-type Sub = 'stream' | 'grouped'
+type Sub = 'stream' | 'grouped' | 'tail'
 
 /**
  * Logs (§2.5, US-6): WARNING+ lines from every process, redacted when they
@@ -20,13 +22,16 @@ type Sub = 'stream' | 'grouped'
  * chat. Stream follows new rows every 5 s; Grouped counts by call site.
  * Export is audited and operator-only. INFO is stored only during an INFO
  * capture: one module, at most 60 minutes, started here by an operator.
+ * Live tail reads the newest lines, INFO included, straight from each live
+ * process's redacted JSONL file (§3.8.6) when the server writes them.
  */
 export default function LogsTab() {
   const { t } = useTranslation()
   const nav = useOpsNav()
   const { status } = useOpsShell()
   const filter = decodeLogFilter(nav.view.logQuery)
-  const sub: Sub = nav.view.sub === 'grouped' ? 'grouped' : 'stream'
+  const tail = tailFeature(status?.features)
+  const sub: Sub = nav.view.sub === 'grouped' ? 'grouped' : nav.view.sub === 'tail' && tail !== false ? 'tail' : 'stream'
   const [follow, setFollow] = useState(true)
   const [exportOpen, setExportOpen] = useState(false)
   const [captureOpen, setCaptureOpen] = useState(false)
@@ -63,7 +68,9 @@ export default function LogsTab() {
           label={t('operations.logs.viewLabel')}
           options={[
             { value: 'stream' as const, label: t('operations.logs.stream') },
-            { value: 'grouped' as const, label: t('operations.logs.grouped') }
+            { value: 'grouped' as const, label: t('operations.logs.grouped') },
+            // A server that writes no JSONL files has nothing to tail.
+            ...(tail === false ? [] : [{ value: 'tail' as const, label: t('operations.logs.tail') }])
           ]}
         />
         <span className="ms-auto inline-flex flex-wrap gap-2">
@@ -92,7 +99,9 @@ export default function LogsTab() {
         </span>
       </div>
       <div key={sub} className={fadeSub === sub ? 'ops-fade-in' : undefined}>
-        {sub === 'stream' ? <StreamView filter={filter} follow={follow} onCapture={captureOffered ? () => setCaptureOpen(true) : undefined} /> : <GroupedView filter={filter} />}
+        {sub === 'stream' ? <StreamView filter={filter} follow={follow} onCapture={captureOffered ? () => setCaptureOpen(true) : undefined} /> : null}
+        {sub === 'grouped' ? <GroupedView filter={filter} /> : null}
+        {sub === 'tail' ? <TailView module={filter.module} enabled={tail} /> : null}
       </div>
       <p className="text-muted-foreground m-0 text-xs">{t('operations.logs.privacy')}</p>
       <ExportDialog open={exportOpen} onOpenChange={setExportOpen} filter={filter} operator={operator} />

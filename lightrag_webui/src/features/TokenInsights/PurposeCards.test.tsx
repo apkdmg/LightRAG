@@ -15,7 +15,7 @@ Object.defineProperty(globalThis, 'localStorage', {
   configurable: true
 })
 const { PurposeCards } = await import('./OverviewTab')
-const { ViewBoundary } = await import('./ui')
+const { ViewBoundary } = await import('@/components/admin')
 
 const purpose = (id: string, others_per_unit: number | null, others_ratio: number | null) => ({
   id,

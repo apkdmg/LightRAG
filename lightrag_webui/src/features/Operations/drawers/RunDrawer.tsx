@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { useTranslation } from 'react-i18next'
-import { Kv } from '@/features/TokenInsights/ui'
+import { Kv } from '@/components/admin'
 import { DocFailure, OpsRun, opsApi } from '../api'
 import { OWNER_SUSPECT_STATES } from '../actions'
 import ErrorPanel from '../components/ErrorPanel'

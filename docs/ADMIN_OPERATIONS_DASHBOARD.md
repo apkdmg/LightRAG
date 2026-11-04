@@ -442,7 +442,9 @@ Admins cannot tell from inside the product whether LightRAG is healthy, what it 
 - **OQ-10** Should parse and analyze workers honour cancellation (`pipeline.py:1489-1700` never checks it)? This is a separate pipeline fix that the dashboard makes visible.
 - **OQ-11** Are the `history_messages` wipes intended? They happen on email bundle delete (`email_routes.py:413-414`), on email-queue batches with deletes (`email_resync_queue.py:227-231`) and on single-doc delete (`lightrag.py:2810-2813`). Ops copes with them through `reset` detection on the feed.
 - **OQ-12** A guarded release for orphaned `scanning`/`pending_enqueues` reservations. This needs per-worker owner tracking for reservations, because `pending_enqueues` is a shared counter. Is that worth a contract change in AGENTS.md?
+  **Resolved (PR-9): yes, additively.** `pipeline_status.pending_enqueue_owners` (`{worker_id: count}`) is maintained next to the counter at the same two sites (`_reserve_enqueue_slot`, `_release_enqueue_slot`) under the same lock, only with run tracking on; the counter stays authoritative and no existing reader changed. The operator-only `POST /workspaces/{ws}/actions/release-reservations {worker_id, expected_scan_started_at, expected_pending, confirm, reason}` follows the §3.9 sequence and releases only a worker confirmed dead (heartbeat ≥ 60 s **and** psutil PID/create time, or a `child_exit` marker): its `scanning` flag when it owns the scan, and exactly its share of `pending_enqueues`. Refusals: `single_process`, `not_held`, `cas_mismatch`, `owner_alive`, `owner_unknown`, `lock_unavailable`; every attempt is audited. Reconcile reports dead workers' shares as `reservation_without_owner` with `reason_code: owner_dead` and `dead_owners[]`. AGENTS.md's contract table lists the new key.
 - **OQ-13** Should Documents get an admin "act on workspace" mode (an `X-Target-Workspace` on every Documents call and a persistent "Acting on <ws>" banner) to replace the dropped "Open in Documents"?
+  **Resolved (PR-9): yes.** The Operations workspace drawer's "Open in Documents" sets the target workspace for the Documents tab; every Documents API call then carries `X-Target-Workspace`, and a persistent "Acting on <ws>" banner with Exit stays visible until it is cleared. Server side, `get_current_workspace` / `resolve_workspace_from_request` refuse the header (403) for anyone whose role is not admin and, for interactive sessions, also apply the PR-7 live check: an impersonated session gets 403 `impersonation_not_allowed` and a token whose `role: admin` claim outlived its user's removal from `ADMIN_ACCOUNTS` (renewal copies the claim forward) gets 403 `admin_not_current`; service accounts keep the OBO allowlist. In acting mode the Documents tab reads pipeline activity from `/documents/pipeline_status` (which carries the header) instead of `/health`, which reports the admin's own workspace. The PR-7 hooks write intent and result rows to `LIGHTRAG_OPS_AUDIT` (`documents_mutation`, mode `on_behalf`) for every mutating `/documents/*` call on another workspace.
 
 ---
 
@@ -888,7 +890,7 @@ Topology nodes and edges on prod:
    - the running dot
    - the edge flow
    - the hairline (≤ 5 s) and the skeleton (≤ 4 s), which end with their request
-   
+
    The running dot and the edge flow stop when motion is reduced (OS or page toggle), when `⏸ auto` is on, or when their panel is stale. The browser already stops rendering hidden tabs.
 4. **≤ 300 ms for UI.** The only exceptions are the ones listed under Tokens.
 5. **Animate only `transform` and `opacity`.**
@@ -1424,6 +1426,10 @@ All endpoints are under `/admin/ops` with a router-wide `require_admin`. POSTs a
 | POST | `/health/{dep}/probe` | Re-check (rate-limited) | probe result | 3 |
 | POST | `/smtp/test` | EHLO/NOOP, no send (1/min) | `{ok, error_class?, latency_ms}` | 3 |
 | POST | `/logs/capture {module, minutes≤60}` (op) | INFO capture (audited) | `{expires_at}` | 8 |
+| GET | `/logs/tail?lines≤1000&level=&module=` | Live INFO tail of the per-PID JSONL files (k-way merge, bounded reads, redacted again; works without Postgres) | `{enabled, items[], sources[{pid,alive,bytes_read,truncated,lines,modified_at}], newest_ts, lines, level, module}` | 9 |
+| GET | `/performance/gpu?window=15m\|1h\|24h\|7d` | GPU section (exporter sidecar) | `{enabled, configured, latest{status,checked_at,gpus[{index,name,util_pct,mem_used_bytes,mem_total_bytes,mem_pct,temp_c,power_w,power_limit_w}],summary}, series[{t,gpu,util_pct,mem_pct,temp_c,power_w}], bucket_s}` | 9 |
+| POST | `/workspaces/{ws}/actions/release-reservations {worker_id, expected_scan_started_at, expected_pending, confirm, reason}` (op, Gunicorn) | Release a dead worker's reservations (OQ-12) | `{released:bool, reason?:not_held\|owner_alive\|owner_unknown\|cas_mismatch\|lock_unavailable\|single_process, released_scanning, released_pending, audit_id}` | 9 |
+| GET | `/metrics` | Prometheus text (`OPS_PROMETHEUS`, 404 when off); no workspace/user labels | `text/plain; version=0.0.4` | 9 |
 
 ### 3.8 Log pipeline changes
 
@@ -1770,5 +1776,15 @@ These checks were settled from the repository, not on the server: reading the pr
 | V4 | **Not checked.** | vLLM probes treat `/health` 200 as ok. A 401 or 404 on `/metrics` marks metrics unavailable in `detail` without failing the dependency. | `docker exec lightrag-enterprise-lightrag-1 python -c "import urllib.request as u; print(u.urlopen('http://vllm-embed:8001/health',timeout=3).status)"` |
 | V5 | **No compose or Dockerfile health check calls LightRAG `/health`.** nginx config lives only on the server. | D6 ships with `HEALTH_DETAIL=authenticated` as the default: anonymous callers still get 200 with `{status, version}`. `HEALTH_DETAIL=all` restores today's output. | `grep -n health /opt/lightrag-enterprise/nginx/conf.d/rag.conf` |
 | V6 | **nginx config is not in the repo.** | `OPS_TRUSTED_PROXIES` defaults to empty, so LightRAG always generates its own request ID and keeps a client-sent one as `client_request_id`. To trust nginx, add `proxy_set_header X-Request-ID $request_id;` and set `OPS_TRUSTED_PROXIES` to the proxy's network address. | `grep -n -i request_id /opt/lightrag-enterprise/nginx/conf.d/rag.conf` |
-| V7 | **Not checked.** | Detected at runtime (`pg_available_extensions`). Log substring search stays limited to 24 h until `pg_trgm` is installed (Phase 2). | `SELECT name, installed_version FROM pg_available_extensions WHERE name='pg_trgm';` |
+| V7 | **Not checked.** | Detected at runtime (`pg_available_extensions`, `pg_extension`). PR-9: when `pg_trgm` is installed the background builder adds `idx_ops_logs_msg_trgm` (GIN, `CONCURRENTLY`); once it is valid, a `q` holding a run of 3+ letters or digits may span 7 days (`/status.features.log_trgm`); a shorter `q`, or one like `a b` or `1.2` that gives the index no full trigram, keeps the 24 h cap, and the WebUI applies the same rule so it never sends a window the server refuses. `CREATE EXTENSION` only with `OPS_PG_TRGM_CREATE=true`. | `SELECT name, installed_version FROM pg_available_extensions WHERE name='pg_trgm';` |
 | V8 | **Not answered.** | `OPS_OPERATOR_ACCOUNTS` stays unset, so every admin is an operator (D8 default). | Ask the admin, then set `OPS_OPERATOR_ACCOUNTS` in `.env`. |
+
+## Appendix: PR-9 hardening notes (2026-11-04)
+
+- **GPU (D5).** `OPS_GPU_EXPORTER_URL` (unset = off) adds a `gpu` probe that reads the `utkuozdemir/nvidia_gpu_exporter` sidecar's `/metrics` on the probe executor (5 s deadline). The wizard adds the sidecar (`scripts/setup/templates/gpu-exporter.yml`, pinned) only when `OPS_GPU_EXPORTER=true` and a wizard service runs on cuda, and sets the URL in the compose layer only; `docker-compose-full.yml` carries it behind the `gpu-metrics` profile. The API container never gets `runtime: nvidia`. `/status.features.gpu`, a GPU dependency card, `/performance/gpu` (history from `LIGHTRAG_OPS_PROBES.detail.gpus`). vLLM `/metrics` is unchanged.
+- **Per-PID JSONL + tail (§3.8.6).** `OPS_JSONL_LOGS` (off) writes `LOG_DIR/lightrag-<pid>.jsonl` (INFO+, redacted, 0600, `O_NOFOLLOW`, rotated by size). `/logs/tail` lists only matching file names, reads at most 512 KiB from each file's end and merges by timestamp.
+- **`pg_trgm` (V7).** See the V7 row above. EXPLAIN is covered by the `requires_db` test `tests/test_ops_hardening_postgres.py`.
+- **OQ-12, OQ-13.** Resolved in §1.10.
+- **Prometheus.** `OPS_PROMETHEUS` (off), admin-only `/metrics`; labels limited to `role`, `series`, `severity`, `dependency`, `gpu`.
+- **Usage calls.** `LIGHTRAG_USAGE_CALLS.error_kind` / `request_id` (nullable, `ADD COLUMN IF NOT EXISTS` under a 5 s `lock_timeout`); the recorder fills them from `classify_failure` and the request-ID ContextVar. Insights `/calls` returns them and filters on `request_id`; `/correlate` adds the LLM calls of a request ID to its `request` matches (`usage_calls{calls,errors,error_kinds}`), on `idx_lightrag_usage_calls_req` (built by the background builder) or, before it exists, over the last 24 h only.
+- **Not built: log partitioning.** §3.12 makes it conditional on `LIGHTRAG_OPS_LOGS` volume above about 1M rows/day; that volume has not been measured (V3), so the table stays plain with batched retention.

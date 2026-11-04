@@ -2,7 +2,10 @@ import { useTranslation } from 'react-i18next'
 import { downloadFile, insightsApi, Params } from './api'
 import { useData, useInsights } from './context'
 import { ItemName } from './WorkspacePage'
-import { Card, Empty, Meter, Seg, TextButton, fmtDay, fmtMoney, fmtTokens, fmtCount } from './ui'
+import { RequestCell } from './callCells'
+import { callStatusText } from './callStatus'
+import { Card, Empty, Meter, Seg, TextButton } from '@/components/admin'
+import { fmtDay, fmtMoney, fmtTokens, fmtCount } from './ui'
 
 const DIMS = ['purpose', 'operation', 'workspace', 'model', 'source', 'document', 'client'] as const
 const NEXT: Record<string, string> = { purpose: 'operation', operation: 'workspace', workspace: 'purpose', model: 'operation', source: 'purpose' }
@@ -72,8 +75,8 @@ export default function ExploreTab() {
       {error ? <Empty>{error}</Empty> : null}
       {selected ? (
         <div className="overflow-x-auto">
-          <table className="w-full min-w-[700px] text-[13px]">
-            <thead><tr className="text-muted-foreground border-b text-xs">{['time', 'purpose', 'operation', 'model', 'prompt', 'answer', 'latency', 'status'].map((c) => <th key={c} className={`p-2 font-medium ${c === 'prompt' || c === 'answer' || c === 'latency' ? 'text-right' : 'text-left'}`}>{t(`insights.explore.call.${c}`)}</th>)}</tr></thead>
+          <table className="w-full min-w-[780px] text-[13px]">
+            <thead><tr className="text-muted-foreground border-b text-xs">{['time', 'purpose', 'operation', 'model', 'prompt', 'answer', 'latency', 'status', 'request'].map((c) => <th key={c} className={`p-2 font-medium ${c === 'prompt' || c === 'answer' || c === 'latency' ? 'text-right' : 'text-left'}`}>{t(`insights.explore.call.${c}`)}</th>)}</tr></thead>
             <tbody>
               {(calls?.rows ?? []).map((r: any, i: number) => (
                 <tr key={i} className="border-b last:border-0">
@@ -84,7 +87,8 @@ export default function ExploreTab() {
                   <td className="p-2 text-right">{fmtTokens(r.prompt_tokens)}</td>
                   <td className="p-2 text-right">{fmtTokens(r.completion_tokens)}</td>
                   <td className="p-2 text-right">{(r.latency_ms / 1000).toFixed(1)} s</td>
-                  <td className="p-2">{r.cache_hit ? t('insights.explore.cacheHit') : t(`insights.explore.status.${r.status}`, { defaultValue: r.status })}{r.estimated ? ` · ${t('insights.explore.estimated')}` : ''}</td>
+                  <td className="p-2">{callStatusText(t, r)}</td>
+                  <td className="p-2"><RequestCell id={r.request_id} /></td>
                 </tr>
               ))}
             </tbody>

@@ -8,11 +8,19 @@ same reason are counted too.
 The read-only accessors (:meth:`UsageRecorder.health` and the properties) let
 the Operations console report the recorder's state through each worker's
 heartbeat.
+
+Each record is completed as it arrives, in the caller's context: a failed
+call gets its ``error_kind`` from the Operations console's failure taxonomy
+(:func:`lightrag.api.ops.classify.classify_failure`), and every call the API
+request ID it served (the request-ID ContextVar), so ``/correlate`` can find
+the LLM calls of a request. The exception itself is dropped before the
+record is buffered.
 """
 
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import hashlib
 import time
 from typing import Any, Optional
@@ -41,6 +49,38 @@ def deleted_workspace_label(workspace: str, ts: float) -> str:
     return f"deleted-{digest[:8]}"
 
 
+def complete_record(record: UsageRecord) -> UsageRecord:
+    """``record`` with ``error_kind`` and ``request_id`` filled in and the
+    exception dropped. Never raises: on any problem the record is kept as it
+    came, minus the exception."""
+    try:
+        from lightrag.api.ops.classify import classify_failure
+        from lightrag.api.ops.context import current_request_id
+
+        error_kind = record.error_kind
+        if record.status == "error" and error_kind is None:
+            error_kind = classify_failure(record.error).error_kind
+        request_id = record.request_id or current_request_id()
+        if (
+            record.error is None
+            and error_kind == record.error_kind
+            and request_id == record.request_id
+        ):
+            return record
+        return dataclasses.replace(
+            record,
+            error=None,
+            error_kind=(error_kind or None) and str(error_kind)[:32],
+            request_id=(request_id or None) and str(request_id)[:64],
+        )
+    except Exception as e:
+        logger.warning(f"Could not classify a usage record: {type(e).__name__}")
+        try:
+            return dataclasses.replace(record, error=None)
+        except Exception:
+            return record
+
+
 class UsageRecorder:
     def __init__(
         self,
@@ -67,7 +107,7 @@ class UsageRecorder:
             self._lost += 1
             self._lost_total += 1
             return
-        self._records.append(record)
+        self._records.append(complete_record(record))
 
     def event(self, event: SystemEvent) -> None:
         if len(self._events) < self._max_buffer:

@@ -412,14 +412,14 @@ _WIZARD_COMPOSE_LIGHTRAG_KEYS=(
   "EMBEDDING_BINDING_HOST" "RERANK_BINDING_HOST" "LLM_BINDING_HOST"
   "REDIS_URI" "MONGO_URI" "NEO4J_URI" "MILVUS_URI" "QDRANT_URL" "MEMGRAPH_URI" "OPENSEARCH_HOSTS"
   "POSTGRES_HOST" "POSTGRES_PORT" "PORT" "HOST" "SSL_CERTFILE" "SSL_KEYFILE"
-  "WORKING_DIR" "INPUT_DIR" "PROMPT_DIR"
+  "WORKING_DIR" "INPUT_DIR" "PROMPT_DIR" "OPS_GPU_EXPORTER_URL"
 )
 
 _managed_service_root_name() {
   local service_name="$1"
 
   case "$service_name" in
-    postgres|neo4j|mongodb|redis|qdrant|memgraph|opensearch|vllm-embed|vllm-rerank)
+    postgres|neo4j|mongodb|redis|qdrant|memgraph|opensearch|vllm-embed|vllm-rerank|gpu-exporter)
       printf '%s' "$service_name"
       ;;
     milvus|milvus-etcd|milvus-minio)
@@ -2284,6 +2284,10 @@ inject_lightrag_depends_on() {
   local -a preserved_dep_order=()
 
   for candidate_service in "$@"; do
+    # The GPU metrics sidecar is optional: lightrag never waits for it.
+    if [[ "$candidate_service" == "gpu-exporter" ]]; then
+      continue
+    fi
     if _is_wizard_managed_root_service_name "$candidate_service"; then
       managed_services+=("$candidate_service")
     fi

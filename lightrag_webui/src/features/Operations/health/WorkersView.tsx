@@ -1,5 +1,5 @@
 import { useTranslation } from 'react-i18next'
-import { Kv } from '@/features/TokenInsights/ui'
+import { Kv } from '@/components/admin'
 import type { DepHealth, OpsWorkers } from '../api'
 import { Panel } from '../components/Panel'
 import WorkersTable from '../components/WorkersTable'
@@ -7,6 +7,7 @@ import { fmtBytes, fmtClock, fmtCount } from '../format'
 import { OpsPoll } from '../poll'
 import { workersState } from '../severity'
 import { StatusChip } from '../components/StatusChip'
+import { gpuDep, gpuLine, normalizeGpus } from './gpu'
 import { currentWorkers, pgHostFacts } from './model'
 
 /** Heartbeats are written every 15 s; the table refreshes with the Health tab (30 s). */
@@ -85,11 +86,27 @@ function PostgresFacts({ deps }: { deps: DepHealth[] | null }) {
   )
 }
 
+/** The GPU line of the Host view: per GPU from the exporter card, else where GPU numbers come from. */
+function GpuSummary({ deps }: { deps: DepHealth[] | null }) {
+  const { t } = useTranslation()
+  const gpus = normalizeGpus(gpuDep(deps)?.detail)
+  if (!gpus.length) return <>{t('operations.host.gpuNote')}</>
+  return (
+    <span className="flex flex-col items-end">
+      {gpus.map((g) => {
+        const line = gpuLine(g)
+        return <span key={g.index}>{t('operations.host.gpuLine', { index: g.index, util: line.util, mem: line.mem, temp: line.temp })}</span>
+      })}
+    </span>
+  )
+}
+
 /**
  * Health › Host (§3.6, FR-33): container memory and CPU from cgroup v2, the
  * host load average (host-wide, labelled so), disk use and the Postgres
- * numbers from its probe. GPU numbers come only from vLLM /metrics in this
- * release (D5).
+ * numbers from its probe. GPU numbers come from the GPU exporter card when
+ * the server reads one (D5, OPS_GPU_EXPORTER_URL); otherwise only vLLM's
+ * /metrics (KV cache, queues) says anything about the GPU.
  */
 export function HostView({ poll, deps = null }: { poll: OpsPoll<OpsWorkers>; deps?: DepHealth[] | null }) {
   const { t } = useTranslation()
@@ -117,7 +134,9 @@ export function HostView({ poll, deps = null }: { poll: OpsPoll<OpsWorkers>; dep
                   : fmtBytes(d.used)}
               </Kv>
             ))}
-            <Kv k={t('operations.host.gpu')}>{t('operations.host.gpuNote')}</Kv>
+            <Kv k={t('operations.host.gpu')}>
+              <GpuSummary deps={deps} />
+            </Kv>
             {h.sampled_at ? <p className="text-muted-foreground m-0 text-xs">{t('operations.host.sampled', { time: fmtClock(h.sampled_at) })}</p> : null}
             <p className="text-muted-foreground m-0 text-xs">{t('operations.host.workers', { count: fmtCount(currentWorkers(data.items).length) })}</p>
             <h3 className="m-0 mt-2 text-[13px] font-semibold">{t('operations.host.pg.title')}</h3>

@@ -4,7 +4,8 @@ import { insightsApi } from './api'
 import { useData, useInsights } from './context'
 import { PURPOSE_COLOR, PURPOSE_SETTINGS, Purpose } from './meta'
 import { ChartCard } from './OverviewTab'
-import { Card, Counter, Empty, Kv, Meter, RowButton, StatusLabel, Swatch, TextButton, Tile, Title, fmtChange, fmtCount, fmtDay, fmtMoney, fmtPct, fmtTokens } from './ui'
+import { Card, Empty, Kv, Meter, RowButton, TextButton, Tile, Title } from '@/components/admin'
+import { Counter, StatusLabel, Swatch, fmtChange, fmtCount, fmtDay, fmtMoney, fmtPct, fmtTokens } from './ui'
 
 function ChangeCheck({ change, unit }: { change: any; unit: string }) {
   const { t } = useTranslation()

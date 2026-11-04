@@ -1,9 +1,10 @@
 import { useTranslation } from 'react-i18next'
-import { Kv } from '@/features/TokenInsights/ui'
+import { Kv } from '@/components/admin'
 import { LogEntry, opsApi } from '../api'
 import ErrorPanel from '../components/ErrorPanel'
 import LogSection from '../components/LogSection'
 import MaskedValue from '../components/MaskedValue'
+import OpsLink from '../components/OpsLink'
 import { StaleChip } from '../components/Panel'
 import Skeleton from '../components/Skeleton'
 import StageTimeline from '../components/StageTimeline'
@@ -11,6 +12,7 @@ import { StatusChip } from '../components/StatusChip'
 import { useOpsNav, useOpsShell } from '../context'
 import { fmtClock, fmtCount, fmtLatency, shortId, utcTitle } from '../format'
 import { useStale } from '../hooks'
+import { logsView, pivotFilter } from '../logs'
 import { normalizeLogEntry } from '../logsNormalize'
 import { useOpsPoll } from '../poll'
 import { docStatusState } from '../severity'
@@ -226,6 +228,21 @@ export default function DocumentDrawer({ workspace, docId }: { workspace: string
                         </td>
                         <td className="p-1.5" data-label={t('operations.document.call.status')}>
                           {c.cache_hit ? t('operations.document.cacheHit') : t(`operations.document.callStatus.${c.status}`, { defaultValue: c.status ?? '–' })}
+                          {c.error_kind ? (
+                            <span className="text-muted-foreground">
+                              {' · '}
+                              <ErrorKindText kind={c.error_kind} />
+                            </span>
+                          ) : null}
+                          {c.request_id ? (
+                            <OpsLink
+                              to={logsView(pivotFilter('request_id', c.request_id))}
+                              className="text-muted-foreground block font-mono text-xs underline-offset-2 hover:underline"
+                              title={c.request_id}
+                            >
+                              {t('operations.logs.ctx.request', { id: shortId(c.request_id, 8) })}
+                            </OpsLink>
+                          ) : null}
                         </td>
                       </tr>
                     ))}

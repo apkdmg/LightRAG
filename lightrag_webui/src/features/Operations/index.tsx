@@ -5,7 +5,7 @@ import { PauseIcon, PlayIcon, RefreshCwIcon } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { useSettingsStore } from '@/stores/settings'
 import { InsightsTarget, insightsLink } from '@/features/TokenInsights/hash'
-import { Card, ViewBoundary } from '@/features/TokenInsights/ui'
+import { Card, ViewBoundary } from '@/components/admin'
 import { actionsEnabled } from './actions'
 import ActivityTab from './ActivityTab'
 import { OpsOverview, OpsStatus, opsApi } from './api'
@@ -55,7 +55,7 @@ const PANELS: Record<OpsTab, () => React.JSX.Element> = {
 
 export default function Operations() {
   return (
-    <ViewBoundary>
+    <ViewBoundary name="Operations">
       <OperationsPage />
     </ViewBoundary>
   )
@@ -427,7 +427,7 @@ function StatusShell({
                       aria-labelledby={`ops-tab-${view.tab}`}
                       className={fadeTab === view.tab ? 'ops-fade-in' : undefined}
                     >
-                      <ViewBoundary resetKey={view.tab}>
+                      <ViewBoundary name="Operations" resetKey={view.tab}>
                         <Panel />
                       </ViewBoundary>
                     </div>
@@ -435,7 +435,7 @@ function StatusShell({
                 )}
               </div>
             </div>
-            <ViewBoundary resetKey={view.drawer ? writeOpsHash({ ...DEFAULT_OPS_HASH, drawer: view.drawer }) : 'none'}>
+            <ViewBoundary name="Operations" resetKey={view.drawer ? writeOpsHash({ ...DEFAULT_OPS_HASH, drawer: view.drawer }) : 'none'}>
               <DrawerStack animateOpen={animateDrawer} render={renderDrawer} />
             </ViewBoundary>
             {actionsEnabled(status) ? <HostedActionDialogs /> : null}

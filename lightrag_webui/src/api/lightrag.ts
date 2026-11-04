@@ -3,6 +3,7 @@ import { backendBaseUrl, popularLabelsDefaultLimit, searchLabelsDefaultLimit } f
 import { errorMessage } from '@/lib/utils'
 import { useSettingsStore } from '@/stores/settings'
 import { useAuthStore } from '@/stores/state'
+import { actingHeaderFor, useActingStore } from '@/stores/actingWorkspace'
 import { navigationService } from '@/services/navigation'
 
 // Types
@@ -314,6 +315,10 @@ export type PipelineStatusResponse = {
   cur_batch: number
   request_pending: boolean
   cancellation_requested?: boolean
+  // Passed through from pipeline_status (the response allows extra keys).
+  scanning?: boolean
+  destructive_busy?: boolean
+  pending_enqueues?: number
   latest_message: string
   history_messages?: string[]
   update_status?: Record<string, any>
@@ -436,6 +441,14 @@ axiosInstance.interceptors.request.use((config) => {
   }
   if (apiKey) {
     config.headers['X-API-Key'] = apiKey
+  }
+  // Admin "act on workspace" (OQ-13): Documents calls go to the chosen
+  // workspace. The server accepts the header from admins only and audits it.
+  const acting = actingHeaderFor(config.url, useActingStore.getState().acting, useAuthStore.getState())
+  if (acting) {
+    for (const [name, value] of Object.entries(acting)) {
+      config.headers[name] = value
+    }
   }
   return config
 })

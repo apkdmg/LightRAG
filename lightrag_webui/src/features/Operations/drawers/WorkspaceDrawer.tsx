@@ -1,8 +1,9 @@
 import { useEffect, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
-import { CopyIcon, PlayIcon } from 'lucide-react'
-import { Kv, Seg } from '@/features/TokenInsights/ui'
+import { CopyIcon, FolderOpenIcon, PlayIcon } from 'lucide-react'
+import { Kv, Seg } from '@/components/admin'
+import { useActingWorkspace } from '@/hooks/useActingWorkspace'
 import { useSettingsStore } from '@/stores/settings'
 import { Feed, WorkspaceDetail, opsApi } from '../api'
 import { OWNER_SUSPECT_STATES } from '../actions'
@@ -269,6 +270,7 @@ export default function WorkspaceDrawer({ workspace }: { workspace: string }) {
   const { t } = useTranslation()
   const nav = useOpsNav()
   const { status, openInsights } = useOpsShell()
+  const acting = useActingWorkspace()
   const poll = useOpsPoll((signal) => opsApi.workspace(workspace, signal), [workspace], DETAIL_SECONDS)
   const { stale, ageSeconds: age } = useStale(poll.updatedAt, DETAIL_SECONDS)
   const d = poll.data
@@ -279,6 +281,14 @@ export default function WorkspaceDrawer({ workspace }: { workspace: string }) {
     } catch {
       toast.error(t('operations.workspace.copyFailed'))
     }
+  }
+  /** OQ-13: Documents acts on this workspace (X-Target-Workspace on every call) under an "Acting on" banner. */
+  const openInDocuments = () => {
+    if (!acting.start(workspace)) {
+      toast.error(t('operations.workspace.openDocumentsRefused'))
+      return
+    }
+    useSettingsStore.getState().setCurrentTab('documents')
   }
   const c = d?.counts
   const eq = d?.email_queue
@@ -446,6 +456,15 @@ export default function WorkspaceDrawer({ workspace }: { workspace: string }) {
         <button type="button" className="hover:bg-muted inline-flex min-h-8 items-center gap-1.5 rounded-lg border px-3 text-[13px]" onClick={copy}>
           <CopyIcon className="size-3.5" aria-hidden="true" />
           {t('operations.workspace.copyId')}
+        </button>
+        <button
+          type="button"
+          className="hover:bg-muted inline-flex min-h-8 items-center gap-1.5 rounded-lg border px-3 text-[13px]"
+          onClick={openInDocuments}
+          title={t('operations.workspace.openDocumentsHint')}
+        >
+          <FolderOpenIcon className="size-3.5" aria-hidden="true" />
+          {acting.workspace === workspace ? t('operations.workspace.openDocumentsActive') : t('operations.workspace.openDocuments')}
         </button>
         {status?.features?.insights ? (
           <button type="button" className="hover:bg-muted min-h-8 rounded-lg border px-3 text-[13px]" onClick={() => openInsights({ workspace })}>

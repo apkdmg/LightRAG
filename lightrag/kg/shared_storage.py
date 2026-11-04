@@ -1784,6 +1784,8 @@ SNAPSHOT_KEYS: Dict[str, frozenset] = {
             "heartbeat_at",
             "scan_owner_worker_id",
             "scan_started_at",
+            # Per-worker shares of pending_enqueues (OQ-12)
+            "pending_enqueue_owners",
         }
     ),
 }

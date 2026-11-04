@@ -7,7 +7,8 @@ import Textarea from '@/components/ui/Textarea'
 import { LogExportFormat, opsApi } from '../api'
 import { OpsError, toOpsError } from '../errors'
 import { fmtCount } from '../format'
-import { LogFilter, activeFields, effectiveWindow, exportFilters } from '../logs'
+import { useOpsShell } from '../context'
+import { LogFilter, activeFields, effectiveWindow, exportFilters, textSearchWindow } from '../logs'
 import { RequestRef } from './ErrorPanel'
 
 /** The server caps an export at this many rows, newest first (FR-25). */
@@ -36,6 +37,7 @@ export default function ExportDialog({
   operator: boolean
 }) {
   const { t } = useTranslation()
+  const textWindow = textSearchWindow(useOpsShell().status?.features)
   const [reason, setReason] = useState('')
   const [format, setFormat] = useState<LogExportFormat>('ndjson')
   const [includeExc, setIncludeExc] = useState(false)
@@ -46,7 +48,7 @@ export default function ExportDialog({
   const valid = trimmed.length >= MIN_REASON && trimmed.length <= MAX_REASON
   const summary = [
     t('operations.logs.levelOption.' + filter.level),
-    t(`operations.logs.window.${effectiveWindow(filter)}`),
+    t(`operations.logs.window.${effectiveWindow(filter, textWindow)}`),
     ...activeFields(filter).map((k) => `${t(`operations.logs.field.${k}`)}=${filter[k]}`)
   ].join(' · ')
 
@@ -56,7 +58,7 @@ export default function ExportDialog({
     setPending(true)
     setError(null)
     try {
-      const result = await opsApi.exportLogs({ filters: exportFilters(filter, Date.now()), reason: trimmed, include_exc: includeExc, format })
+      const result = await opsApi.exportLogs({ filters: exportFilters(filter, Date.now(), textWindow), reason: trimmed, include_exc: includeExc, format })
       toast.success(
         result.auditId
           ? t('operations.export.doneAudit', { file: result.filename, audit: result.auditId })

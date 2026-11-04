@@ -18,9 +18,11 @@ import {
   normalizeWorkspace
 } from './normalize'
 import { normalizeConfig, normalizeDepDetail, normalizeHealth, normalizeProbeResult, normalizeSmtpTest, normalizeWorkerHistory, normalizeWorkers } from './health/model'
+import { normalizePerfGpu } from './health/gpu'
 import { normalizeAlertDetail, normalizeAlertRules, normalizeAlertsPage, normalizeLogCapture } from './activity/alerts'
 import { filenameFromDisposition } from './logs'
 import { normalizeCorrelate, normalizeLogDetail, normalizeLogGroups, normalizeLogPage } from './logsNormalize'
+import { normalizeLogTail } from './logview/tail'
 import {
   LlmGroup,
   PerfWindow,
@@ -83,6 +85,17 @@ export type OpsFeatures = {
   alert_email: boolean
   /** This process has a log sink, so an INFO capture can be started here. */
   log_capture: boolean
+  /**
+   * A valid pg_trgm index on the log messages (V7): text search may span the
+   * whole 7-day window; without it a search is capped at 24 h (FR-20).
+   */
+  log_trgm: boolean
+  /** Per-process redacted JSONL files are written (OPS_JSONL_LOGS), so the Live tail can read INFO. */
+  log_tail: boolean
+  /** Release of a dead worker's reservations (scanning, pending enqueues) is available (OQ-12). */
+  release_reservations: boolean
+  /** GET /admin/ops/metrics serves Prometheus text (OPS_PROMETHEUS). */
+  prometheus: boolean
 }
 
 export type OpsStatus = {
@@ -384,6 +397,12 @@ export type StuckRun = {
   /** Reservations: which flag is held without an owner. */
   scanning?: boolean | null
   pending_enqueues?: Num
+  /** Reservations: the scan's owner worker (scan_owner_worker_id), when the slot names one. */
+  owner_worker_id?: string | null
+  /** Reservations: the scan's start as held in shared state (compared on release). */
+  scan_started_at?: string | null
+  /** Pending-enqueue reservations: the confirmed-dead workers' shares of the counter (OQ-12). */
+  dead_owners?: { worker_id: string; count: number }[] | null
   /** Orphaned: how the owner's death was confirmed (pid_gone, create_time, exit_marker, exited, superseded, host_gone). */
   confirmed_by?: string | null
 }
@@ -596,6 +615,10 @@ export type LlmCall = {
   status?: string | null
   cache_hit?: boolean | null
   billing?: string | null
+  /** A failed call's error kind (classify.py), recorded since PR-9; null for successes and older rows. */
+  error_kind?: string | null
+  /** The HTTP request that made the call, when it came from one. */
+  request_id?: string | null
 }
 
 export type DocumentDetail = Generated & {
@@ -845,6 +868,34 @@ export type LogGroup = {
 
 export type LogGroups = Generated & { groups: LogGroup[] }
 
+/** One line of the Live tail: read from a process's redacted JSONL file, so it has no stored id. */
+export type TailLine = {
+  /** Stable across polls: the server's key, else time, pid, call site and a message hash. */
+  key: string
+  ts: string
+  level: number
+  logger: string
+  module: string | null
+  lineno: number | null
+  pid: number | null
+  workspace: string | null
+  request_id: string | null
+  run_id: string | null
+  msg: string
+  exc_type: string | null
+}
+
+/** GET /logs/tail: the newest lines across live processes, merged by time on the server (§3.8.6). */
+export type LogTail = Generated & {
+  /** false when OPS_JSONL_LOGS is off on the server; null when it does not say. */
+  enabled: boolean | null
+  items: TailLine[]
+  /** Live process files read. */
+  files: number | null
+  /** The server stopped before reading every file (its own byte budget). */
+  truncated: boolean
+}
+
 export type CorrelateType = 'request' | 'log' | 'run' | 'track' | 'doc' | 'workspace' | 'owner'
 
 /** One thing an ID resolved to (FR-50); owner emails come back masked with their workspace. */
@@ -933,6 +984,9 @@ export type ActionResponse = {
   in_progress_by?: InProgressBy | string | null
   /** release-busy: a "process again" request was queued before the release and is kept; offer Run now. */
   run_now_offered?: boolean | null
+  /** Release reservations: whether the dead worker's scanning flag was cleared, and how many of its pending enqueues were released. */
+  released_scanning?: boolean | null
+  released_pending?: Num
   /** The dry run's live flags: what a run now would meet. */
   live?: { busy?: boolean | null; destructive_busy?: boolean | null; paused?: boolean | null; pause_retry_at?: string | null } | null
   generated_at?: string
@@ -1185,6 +1239,12 @@ export const opsApi = {
   logEntry: async (id: string | number, signal?: AbortSignal) => normalizeLogDetail(await get(`/logs/${enc(String(id))}`, undefined, signal)),
   /** Rows grouped by call site (FR-23). */
   logGroups: async (params: Params, signal?: AbortSignal) => normalizeLogGroups(await get('/logs/groups', params, signal)),
+  /**
+   * The newest lines of every live process's JSONL file, INFO included,
+   * merged by time on the server (§3.8.6). Read from the ends of the files
+   * only, and redacted again on read.
+   */
+  logTail: async (params: Params, signal?: AbortSignal) => normalizeLogTail(await get('/logs/tail', params, signal)),
   /** Redacted export of the current filters, at most 10k rows, audited and operator-only (FR-25). */
   exportLogs: (body: LogExportRequest) =>
     postDownload('/logs/export', body, `ops-logs-${new Date().toISOString().slice(0, 10)}.${body.format === 'csv' ? 'csv' : 'ndjson'}`),
@@ -1195,6 +1255,8 @@ export const opsApi = {
     normalizePerfLlm(await get('/performance/llm', { window, group }, signal), window, group),
   /** Embed and rerank latency and errors plus vLLM running/waiting/KV cache (FR-41). */
   perfDeps: async (window: PerfWindow, signal?: AbortSignal) => normalizePerfDeps(await get('/performance/deps', { window }, signal), window),
+  /** Per-GPU utilisation, memory, temperature and power from the GPU exporter (D5): the latest probe and the window's history. */
+  perfGpu: async (window: PerfWindow, signal?: AbortSignal) => normalizePerfGpu(await get('/performance/gpu', { window }, signal)),
   /** HTTP latency and 5xx by route template (FR-42). */
   perfHttp: async (window: PerfWindow, signal?: AbortSignal) => normalizePerfHttp(await get('/performance/http', { window }, signal), window),
   /** Summed queues across loaded instances and the top 10 by queued (FR-44). */
@@ -1222,6 +1284,16 @@ export const opsApi = {
   /** Gunicorn only, operator only; `confirm` is the workspace name as typed, the expected values are compared under the lock. */
   releaseBusy: (ws: string, body: { reason: string; expected_run_id: string | null; expected_job_start: string | null; confirm: string }) =>
     post<ActionResponse>(`/workspaces/${enc(ws)}/actions/release-busy`, body),
+  /**
+   * Gunicorn only, operator only (OQ-12): releases one dead worker's
+   * scanning flag (when it owns it) and its share of pending enqueues,
+   * nothing else. The expected values are what the page showed; the server
+   * compares them under the lock and refuses with cas_mismatch if they changed.
+   */
+  releaseReservations: (
+    ws: string,
+    body: { reason: string; confirm: string; worker_id: string; expected_scan_started_at: string | null; expected_pending: number }
+  ) => post<ActionResponse>(`/workspaces/${enc(ws)}/actions/release-reservations`, body),
   /**
    * One field in clear (still secret- and email-redacted), audited, operator
    * only. `id` is the document for doc fields; for the job name it is the run

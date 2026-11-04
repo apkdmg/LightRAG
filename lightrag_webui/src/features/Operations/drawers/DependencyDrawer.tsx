@@ -1,7 +1,7 @@
 import { useTranslation } from 'react-i18next'
 import { CartesianGrid, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts'
 import { RefreshCwIcon, SendIcon } from 'lucide-react'
-import { Kv } from '@/features/TokenInsights/ui'
+import { Kv } from '@/components/admin'
 import { DepDetail, DepHealth, opsApi } from '../api'
 import ErrorPanel from '../components/ErrorPanel'
 import OpsLink from '../components/OpsLink'
@@ -12,6 +12,8 @@ import { useOpsNav } from '../context'
 import { fmtAge, fmtBytes, fmtClock, fmtCount, fmtLatency, utcTitle } from '../format'
 import { viewForTarget } from '../hashState'
 import { useHealthChanged, useProbeActions } from '../health/actions'
+import { GPU_DEP, normalizeGpus } from '../health/gpu'
+import { GpuCards } from '../performance/GpuView'
 import { PROBE_INTERVAL_SECONDS, canRecheck, depState, detailParts, drawerStatus } from '../health/model'
 import { useStale } from '../hooks'
 import { OPS_CHART } from '../motion'
@@ -304,6 +306,18 @@ export default function DependencyDrawer({ dep }: { dep: string }) {
             {d.latency_series.length ? <LatencyChart series={d.latency_series} end={poll.updatedAt ?? d.latency_series[d.latency_series.length - 1].t} /> : <p className="text-muted-foreground m-0 text-sm">{t('operations.depDrawer.noSeries')}</p>}
           </Section>
           {isPostgres ? <Blocking rows={d.blocking} /> : null}
+          {dep === GPU_DEP ? (
+            <Section
+              title={t('operations.gpu.now')}
+              aside={
+                <OpsLink to={viewForTarget(nav.view, { tab: 'performance', sub: 'gpu' })} className="text-xs underline underline-offset-2">
+                  {t('operations.gpu.openHistory')}
+                </OpsLink>
+              }
+            >
+              <GpuCards gpus={normalizeGpus({ ...card.detail, ...d.detail })} />
+            </Section>
+          ) : null}
           <DetailLists detail={{ ...card.detail, ...d.detail }} />
           {d.error_classes.length ? (
             <Section title={t('operations.depDrawer.errorClasses')}>

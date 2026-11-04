@@ -58,6 +58,12 @@ _TABLE_DAILY = "LIGHTRAG_USAGE_DAILY"
 _TABLE_EVENTS = "LIGHTRAG_USAGE_EVENTS"
 _TABLE_KV = "LIGHTRAG_USAGE_KV"
 _TABLE_DOC_STATUS = "LIGHTRAG_DOC_STATUS"
+# Columns added to the calls table after release (PR-9), nullable: the
+# failure class of an ``error`` call and the API request it served.
+CALL_EXTRA_COLUMNS = {"error_kind": "VARCHAR(32)", "request_id": "VARCHAR(64)"}
+# ``ALTER TABLE ... ADD COLUMN`` needs a brief exclusive lock; never queue
+# behind a long query (and block every writer behind us) for longer.
+ALTER_LOCK_TIMEOUT_MS = 5000
 
 
 def insights_timezone() -> tzinfo:
@@ -214,9 +220,11 @@ class UsageStore(ABC):
         client: Optional[str] = None,
         limit: int = 100,
         before_ts: Optional[Any] = None,
+        request_id: Optional[str] = None,
     ) -> list[dict[str, Any]]:
         """Newest first, at most ``CALLS_LIMIT_MAX``; ``before_ts`` (epoch
-        seconds or datetime) pages further back."""
+        seconds or datetime) pages further back; ``request_id`` keeps the
+        calls made while serving one API request."""
 
     @abstractmethod
     async def llm_health(
@@ -446,13 +454,15 @@ class MemoryUsageStore(UsageStore):
         client=None,
         limit=100,
         before_ts=None,
+        request_id=None,
     ):
         before = _epoch(before_ts) if before_ts is not None else None
         rows = [
-            asdict(r)
+            {k: v for k, v in asdict(r).items() if k != "error"}
             for r in self._matching_calls(start, end, filters)
             if (doc_id is None or r.doc_id == doc_id)
             and (client is None or r.client == client)
+            and (request_id is None or r.request_id == request_id)
             and (before is None or r.ts < before)
         ]
         rows.sort(key=lambda x: -x["ts"])
@@ -691,6 +701,9 @@ class PostgresUsageStore(UsageStore):
         super().__init__(tz)
         self._vector_storage = vector_storage
         self._db: Any = None
+        # Which of CALL_EXTRA_COLUMNS the calls table has (written and read
+        # only when present, so a failed migration never stops recording).
+        self.call_columns: frozenset[str] = frozenset()
 
     async def initialize(self) -> None:
         from lightrag.kg.postgres_impl import ClientManager
@@ -756,6 +769,60 @@ class PostgresUsageStore(UsageStore):
         async with self._db.ddl_lock():
             for statement in statements:
                 await self._db.execute(statement)
+            await self._add_call_columns()
+
+    async def _add_call_columns(self) -> None:
+        """Add the nullable PR-9 columns to an existing calls table.
+
+        The catalog is read first and only missing columns are altered:
+        ``ADD COLUMN IF NOT EXISTS`` takes its ACCESS EXCLUSIVE lock before
+        it checks, so issuing it on every start would queue every reader and
+        recorder flush behind it even when nothing needs migrating. When a
+        column is missing, the ALTER (catalog-only, no default) runs under a
+        short ``lock_timeout`` so it never waits long behind a slow query. On
+        failure recording goes on without the column (and the next start
+        tries again).
+        """
+        present = await self._read_call_columns()
+        missing = [c for c in CALL_EXTRA_COLUMNS if c not in present]
+        for column in missing:
+            try:
+                async with await self._connection() as conn:
+                    async with conn.transaction():
+                        await conn.execute(
+                            f"SET LOCAL lock_timeout = {ALTER_LOCK_TIMEOUT_MS}"
+                        )
+                        await conn.execute(
+                            f"ALTER TABLE {_TABLE_CALLS} ADD COLUMN IF NOT EXISTS "
+                            f"{column} {CALL_EXTRA_COLUMNS[column]}"
+                        )
+            except Exception as e:
+                logger.warning(
+                    f"Token Insights: could not add {_TABLE_CALLS}.{column} "
+                    f"({type(e).__name__}); recording continues without it"
+                )
+        if missing:
+            present = await self._read_call_columns()
+        self.call_columns = present
+
+    async def _read_call_columns(self) -> frozenset[str]:
+        """The PR-9 columns the calls table has now; empty when unreadable."""
+        try:
+            async with await self._connection() as conn:
+                rows = await conn.fetch(
+                    """SELECT column_name FROM information_schema.columns
+                    WHERE table_name = $1 AND column_name = ANY($2::text[])
+                      AND table_schema = ANY(current_schemas(false))""",
+                    _TABLE_CALLS.lower(),
+                    list(CALL_EXTRA_COLUMNS),
+                )
+            return frozenset(r["column_name"] for r in rows)
+        except Exception as e:
+            logger.warning(
+                f"Token Insights: could not read {_TABLE_CALLS} columns "
+                f"({type(e).__name__})"
+            )
+            return frozenset()
 
     async def finalize(self) -> None:
         if self._db is not None:
@@ -769,6 +836,7 @@ class PostgresUsageStore(UsageStore):
         return self._db.pool.acquire()
 
     async def write(self, records, events) -> None:
+        extra_columns = [c for c in CALL_EXTRA_COLUMNS if c in self.call_columns]
         calls = [
             (
                 datetime.fromtimestamp(r.ts, timezone.utc),
@@ -787,6 +855,7 @@ class PostgresUsageStore(UsageStore):
                 r.measured,
                 r.doc_id,
                 r.track_id,
+                *(getattr(r, c) for c in extra_columns),
             )
             for r in records
             if r.source != BACKFILL_SOURCE
@@ -816,6 +885,7 @@ class PostgresUsageStore(UsageStore):
         call_marks = (
             ", ".join(f"${i}" for i in range(1, len(calls[0]) + 1)) if calls else ""
         )
+        extra_sql = "".join(f", {c}" for c in extra_columns)
         async with await self._connection() as conn:
             async with conn.transaction():
                 if calls:
@@ -823,7 +893,7 @@ class PostgresUsageStore(UsageStore):
                         f"""INSERT INTO {_TABLE_CALLS} (ts, {dim_names}, client, host,
                             prompt_tokens, completion_tokens, reasoning_tokens,
                             cached_tokens, cost, latency_ms, status, cache_hit,
-                            estimated, measured, doc_id, track_id)
+                            estimated, measured, doc_id, track_id{extra_sql})
                             VALUES ({call_marks})""",
                         calls,
                     )
@@ -924,6 +994,7 @@ class PostgresUsageStore(UsageStore):
         client=None,
         limit=100,
         before_ts=None,
+        request_id=None,
     ):
         params: list[Any] = [start, end]
         conditions = ["ts >= $1", "ts < $2"]
@@ -931,6 +1002,11 @@ class PostgresUsageStore(UsageStore):
         if doc_id is not None:
             params.append(doc_id)
             conditions.append(f"doc_id = ${len(params)}")
+        if request_id is not None:
+            if "request_id" not in self.call_columns:
+                return []
+            params.append(request_id)
+            conditions.append(f"request_id = ${len(params)}")
         if client is not None:
             params.append(client)
             conditions.append(f"client = ${len(params)}")
@@ -938,11 +1014,12 @@ class PostgresUsageStore(UsageStore):
             params.append(datetime.fromtimestamp(_epoch(before_ts), timezone.utc))
             conditions.append(f"ts < ${len(params)}")
         params.append(_clamp_limit(limit))
+        extra = "".join(f", {c}" for c in CALL_EXTRA_COLUMNS if c in self.call_columns)
         rows = await self._rows(
             f"""SELECT EXTRACT(EPOCH FROM ts)::float8 AS ts, workspace, purpose, operation,
                 source, model, billing, prompt_tokens, completion_tokens,
                 reasoning_tokens, cached_tokens, latency_ms, status, cache_hit,
-                estimated, measured, doc_id, client
+                estimated, measured, doc_id, client{extra}
             FROM {_TABLE_CALLS} WHERE {" AND ".join(conditions)}
             ORDER BY ts DESC LIMIT ${len(params)}""",
             params,

@@ -4,7 +4,8 @@ import { insightsApi } from './api'
 import { WorkCharts } from './charts'
 import { useData, useInsights } from './context'
 import { INGEST, Purpose, QUESTIONS } from './meta'
-import { Card, Empty, Mix, Seg, Title, fmtCount, fmtMoney, fmtPct, fmtTokens } from './ui'
+import { Card, Empty, Seg, Title } from '@/components/admin'
+import { Mix, fmtCount, fmtMoney, fmtPct, fmtTokens } from './ui'
 
 export default function WorkTab() {
   const { t } = useTranslation()

@@ -20,6 +20,17 @@ lock timeout behind a long transaction) leaves an INVALID index that writers
 would still maintain, so it is dropped at once; the builder then tries again
 later (``OPS_INDEX_BUILD_RETRY_S``, doubling, ``OPS_INDEX_BUILD_ATTEMPTS`` in
 all, each attempt inside the window) and finally on the next start.
+
+An index on a column another module adds (``request_id`` on usage calls,
+added by Token Insights) is skipped while that column is missing.
+
+**Log substring search (V7).** When the ``pg_trgm`` extension is installed,
+the builder also creates a GIN trigram index on ``LIGHTRAG_OPS_LOGS(msg)``;
+once it is valid, a log search with ``q`` may span the whole 7-day window
+instead of 24 h. The extension is detected at runtime
+(``pg_available_extensions`` / ``pg_extension``) and never created unless
+``OPS_PG_TRGM_CREATE=true`` (it needs a privileged role; managed databases
+often have it already).
 """
 
 from __future__ import annotations
@@ -47,11 +58,18 @@ ADVISORY_LOCK_KEY = int.from_bytes(
 _WINDOW = re.compile(r"^\s*(\d{1,2}):(\d{2})\s*-\s*(\d{1,2}):(\d{2})\s*$")
 
 
+TRGM_EXTENSION = "pg_trgm"
+TRGM_CREATE_ENV = "OPS_PG_TRGM_CREATE"
+LOG_TRGM_INDEX = "idx_ops_logs_msg_trgm"
+
+
 @dataclass(frozen=True)
 class IndexSpec:
     name: str
     table: str
     definition: str  # everything after "ON"
+    # Built only once this column exists (added by another module).
+    column: Optional[str] = None
 
     def create_sql(self) -> str:
         return (
@@ -94,7 +112,94 @@ OPS_INDEXES: tuple[IndexSpec, ...] = (
         "LIGHTRAG_USAGE_EVENTS",
         "LIGHTRAG_USAGE_EVENTS (kind, ts DESC)",
     ),
+    # /correlate: request ID -> LLM calls (PR-9).
+    IndexSpec(
+        "idx_lightrag_usage_calls_req",
+        "LIGHTRAG_USAGE_CALLS",
+        "LIGHTRAG_USAGE_CALLS (request_id) WHERE request_id IS NOT NULL",
+        column="request_id",
+    ),
 )
+
+# Log substring search beyond 24 h (V7); only while pg_trgm is installed.
+LOG_TRGM_SPEC = IndexSpec(
+    LOG_TRGM_INDEX,
+    "LIGHTRAG_OPS_LOGS",
+    "LIGHTRAG_OPS_LOGS USING gin (msg gin_trgm_ops)",
+)
+
+
+def trgm_create_allowed() -> bool:
+    """``OPS_PG_TRGM_CREATE`` (default off): the builder may create pg_trgm."""
+    value = os.getenv(TRGM_CREATE_ENV)
+    return bool(value) and value.strip().lower() in ("1", "true", "yes", "on")
+
+
+async def trgm_state(conn: Any) -> dict[str, bool]:
+    """Whether pg_trgm can be installed on this server, and whether it is."""
+    row = await conn.fetchrow(
+        """SELECT
+            EXISTS (SELECT 1 FROM pg_available_extensions WHERE name = $1)
+                AS available,
+            EXISTS (SELECT 1 FROM pg_extension WHERE extname = $1) AS installed""",
+        TRGM_EXTENSION,
+    )
+    return {
+        "available": bool(row and row["available"]),
+        "installed": bool(row and row["installed"]),
+    }
+
+
+async def prepare_trgm(conn: Any, *, create: Optional[bool] = None) -> bool:
+    """True when pg_trgm is installed (created first only when allowed).
+
+    Never raises except on cancel: no extension simply means no trigram
+    index, and log searches with ``q`` stay capped at 24 h.
+    """
+    if create is None:
+        create = trgm_create_allowed()
+    try:
+        state = await trgm_state(conn)
+        if state["installed"]:
+            return True
+        if not create or not state["available"]:
+            return False
+        await conn.execute(f"CREATE EXTENSION IF NOT EXISTS {TRGM_EXTENSION}")
+        logger.info("Created the %s extension for log search", TRGM_EXTENSION)
+        return bool((await trgm_state(conn))["installed"])
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        logger.warning(
+            "The %s extension is not usable (%s); log search stays limited to 24 h",
+            TRGM_EXTENSION,
+            type(e).__name__,
+        )
+        return False
+
+
+async def index_specs(conn: Any, *, create: Optional[bool] = None) -> tuple:
+    """The indexes to build on this server: the fixed set, plus the log
+    trigram index when pg_trgm is (or may be made) installed."""
+    if await prepare_trgm(conn, create=create):
+        return (*OPS_INDEXES, LOG_TRGM_SPEC)
+    return OPS_INDEXES
+
+
+async def _skip(conn: Any, spec: IndexSpec) -> bool:
+    """True while the spec's table (or required column) does not exist."""
+    if await conn.fetchval("SELECT to_regclass($1)", spec.table.lower()) is None:
+        return True
+    if spec.column is None:
+        return False
+    found = await conn.fetchval(
+        """SELECT 1 FROM information_schema.columns
+           WHERE table_name = $1 AND column_name = $2
+             AND table_schema = ANY(current_schemas(false))""",
+        spec.table.lower(),
+        spec.column,
+    )
+    return found is None
 
 
 def parse_window(value: Optional[str]) -> Optional[tuple[dtime, dtime]]:
@@ -174,7 +279,7 @@ async def missing_indexes(conn: Any, specs=OPS_INDEXES) -> list[IndexSpec]:
     """Specs whose table exists but whose index is absent or invalid."""
     out = []
     for spec in specs:
-        if await conn.fetchval("SELECT to_regclass($1)", spec.table.lower()) is None:
+        if await _skip(conn, spec):
             continue
         state = await _index_state(conn, spec.name)
         if state is None or not state["indisvalid"]:
@@ -197,10 +302,7 @@ async def build_indexes(conn: Any, specs=OPS_INDEXES) -> dict[str, str]:
         await conn.execute(f"SET statement_timeout = {BUILD_STATEMENT_TIMEOUT_MS}")
         for spec in specs:
             try:
-                if (
-                    await conn.fetchval("SELECT to_regclass($1)", spec.table.lower())
-                    is None
-                ):
+                if await _skip(conn, spec):
                     outcome[spec.name] = "skipped"
                     continue
                 state = await _index_state(conn, spec.name)
@@ -309,8 +411,9 @@ async def _build_once(
     """One attempt: ``(outcome, retry)``. Never raises except on cancel."""
     try:
         async with store.dedicated_connection() as conn:
-            if not await missing_indexes(conn):
-                return {spec.name: "valid" for spec in OPS_INDEXES}, False
+            specs = await index_specs(conn)
+            if not await missing_indexes(conn, specs):
+                return {spec.name: "valid" for spec in specs}, False
         wait = seconds_until_window(parsed, datetime.now(_local_tz()))
         if wait > 0:
             logger.info(
@@ -319,10 +422,14 @@ async def _build_once(
             )
             await asyncio.sleep(wait)
         async with store.dedicated_connection() as conn:
-            outcome = await build_indexes(conn)
+            outcome = await build_indexes(conn, specs)
         built = sorted(n for n, o in outcome.items() if o in ("created", "rebuilt"))
         if built:
             logger.info("Ops indexes built: %s", ", ".join(built))
+        if LOG_TRGM_INDEX in built and hasattr(store, "_trgm"):
+            # Drop the cached pg_trgm state so the 7-day text window opens now,
+            # not when the cache next expires.
+            store._trgm = None
         # "locked": another process builds (and retries) them.
         return outcome, "failed" in outcome.values()
     except asyncio.CancelledError:

@@ -7,6 +7,8 @@ import { SiteInfo, webuiPrefix } from '@/lib/constants'
 import { useBackendState, useAuthStore } from '@/stores/state'
 import { useSettingsStore } from '@/stores/settings'
 import { useAdminCapability } from '@/hooks/useAdminCapability'
+import { useActingWorkspace } from '@/hooks/useActingWorkspace'
+import ActingWorkspaceBanner from '@/components/ActingWorkspaceBanner'
 import { hasOpsMarker } from '@/features/Operations/hashState'
 import { getAuthStatus } from '@/api/lightrag'
 import SiteHeader from '@/features/SiteHeader'
@@ -33,6 +35,17 @@ function App() {
   const currentTab = useSettingsStore.use.currentTab()
   // true / false, or null while an SSO session without a known role asks the server.
   const isAdmin = useAdminCapability()
+  // An admin acting on another workspace in Documents (OQ-13): the list is
+  // rebuilt for the target, so nothing from the previous workspace lingers.
+  const { workspace: actingWorkspace } = useActingWorkspace()
+  // Entering, switching or leaving the mode changes which workspace the
+  // pipeline-activity flag follows: re-read it now rather than at the next tick.
+  const actingSeenRef = useRef(actingWorkspace)
+  useEffect(() => {
+    if (actingSeenRef.current === actingWorkspace) return
+    actingSeenRef.current = actingWorkspace
+    useBackendState.getState().check().catch(() => {})
+  }, [actingWorkspace])
   const [apiKeyAlertOpen, setApiKeyAlertOpen] = useState(false)
   const [initializing, setInitializing] = useState(true) // Add initializing state
   const versionCheckRef = useRef(false); // Prevent duplicate calls in Vite dev mode
@@ -236,9 +249,10 @@ function App() {
               onValueChange={handleTabChange}
             >
               <SiteHeader />
+              <ActingWorkspaceBanner />
               <div className="relative grow">
                 <TabsContent value="documents" className="absolute top-0 right-0 bottom-0 left-0 overflow-auto">
-                  <DocumentManager />
+                  <DocumentManager key={actingWorkspace ?? ''} />
                 </TabsContent>
                 <TabsContent value="knowledge-graph" className="absolute top-0 right-0 bottom-0 left-0 overflow-hidden">
                   <GraphViewer />

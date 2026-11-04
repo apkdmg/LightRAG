@@ -30,6 +30,9 @@ hot-path hook a no-op. ``OPS_ALERTS_ENABLED`` (default on) records alerts
 in ``LIGHTRAG_OPS_ALERTS``; the leased evaluator that owns the attention
 snapshot runs either way. ``OPS_ALERT_EMAIL`` (default **off**: the first
 week is record-only) emails critical and serious alerts.
+``OPS_JSONL_LOGS`` (default **off**) writes this process's INFO+ lines,
+redacted, to ``LOG_DIR/lightrag-<pid>.jsonl`` for the Logs tab's live tail;
+it needs no database.
 """
 
 from __future__ import annotations
@@ -81,6 +84,7 @@ class OpsRuntime:
     log_sink: Any = None
     metrics: Any = None
     alerts: Any = None
+    jsonl: Any = None
 
     def leases_held(self) -> list[str]:
         return [
@@ -481,6 +485,21 @@ async def _start(app: Any, rag: Any, args: Any) -> OpsRuntime:
     )
     service.worker_id = worker_id
     app.state.ops = runtime
+    from lightrag.api.ops import jsonl
+
+    if jsonl.jsonl_enabled():
+        # Files, not the database: on whatever storage the server uses.
+        try:
+            runtime.jsonl = jsonl.start_jsonl()
+            logger.info(
+                "Operations console: INFO+ lines also go to %s",
+                runtime.jsonl.stats()["path"],
+            )
+        except Exception as e:
+            logger.error(
+                "Operations console JSONL log file could not start (%s)",
+                type(e).__name__,
+            )
     if env_flag("OPS_ENABLED"):
         # Each part is optional: a failure leaves the rest running.
         try:
@@ -587,6 +606,11 @@ async def stop_ops(app: Any) -> None:
     if not isinstance(runtime, OpsRuntime):
         return
     remove_event_sink(runtime.on_event)
+    if runtime.jsonl is not None:
+        try:
+            runtime.jsonl.detach()
+        except Exception:
+            logger.debug("Ops JSONL log file did not close cleanly", exc_info=True)
     if runtime.log_sink is not None:
         # Detached first, so nothing logged while stopping is buffered.
         try:

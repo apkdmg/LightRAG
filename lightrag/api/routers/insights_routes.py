@@ -295,6 +295,7 @@ async def calls(
     billing: Optional[str] = None,
     doc_id: Optional[str] = None,
     client: Optional[str] = None,
+    request_id: Optional[str] = Query(None, max_length=64),
 ) -> dict[str, Any]:
     service = _service(request)
     return {
@@ -304,6 +305,7 @@ async def calls(
             doc_id=doc_id,
             client=client,
             day=day,
+            request_id=request_id or None,
         )
     }
 

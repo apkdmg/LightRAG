@@ -30,8 +30,10 @@ import {
   followSince,
   isAtNewest,
   logsQuery,
-  newestTs
+  newestTs,
+  textSearchWindow
 } from '../logs'
+import { useOpsShell } from '../context'
 import { useOpsMotion } from '../motion'
 import { useOpsPoll } from '../poll'
 
@@ -71,7 +73,9 @@ export default function StreamView({
 }) {
   const { t } = useTranslation()
   const { paused } = useOpsMotion()
-  const key = filterKey(filter)
+  const textWindow = textSearchWindow(useOpsShell().status?.features)
+  // The window a text search may cover is part of the query: a change (the index became valid) starts over.
+  const key = `${filterKey(filter)}|${textWindow}`
   const [view, setView] = useState<View>(EMPTY_VIEW)
   const [atNewest, setAtNewest] = useState(true)
   const [older, setOlder] = useState<{ key: string; loading: boolean; error: OpsError | null }>({ key, loading: false, error: null })
@@ -86,10 +90,10 @@ export default function StreamView({
       // With rows for this filter, ask only for what is newer; otherwise the newest page.
       const since = current?.items.length ? followSince(newestTs(current.items)) : null
       if (since) {
-        const page = await opsApi.logs({ ...logsQuery(filter, Date.now(), LOG_PAGE_MAX), after_ts: since }, signal)
+        const page = await opsApi.logs({ ...logsQuery(filter, Date.now(), LOG_PAGE_MAX, textWindow), after_ts: since }, signal)
         return { kind: 'follow', key, page, limit: LOG_PAGE_MAX }
       }
-      return { kind: 'head', key, page: await opsApi.logs(logsQuery(filter, Date.now(), LOG_PAGE), signal), limit: LOG_PAGE }
+      return { kind: 'head', key, page: await opsApi.logs(logsQuery(filter, Date.now(), LOG_PAGE, textWindow), signal), limit: LOG_PAGE }
     },
     [key],
     follow ? FOLLOW_SECONDS : undefined
@@ -149,7 +153,7 @@ export default function StreamView({
     if (!s || !canLoadOlder(s) || olderState.loading) return
     setOlder({ key, loading: true, error: null })
     try {
-      const page = await opsApi.logs({ ...logsQuery(filter, Date.now(), LOG_PAGE), before: beforeParam(s.older) })
+      const page = await opsApi.logs({ ...logsQuery(filter, Date.now(), LOG_PAGE, textWindow), before: beforeParam(s.older) })
       setView((v) => (v.stream.key === key ? { ...v, stream: applyOlder(v.stream, page), change: 'older' } : v))
       setOlder((o) => (o.key === key ? { key, loading: false, error: null } : o))
     } catch (err) {
@@ -161,7 +165,7 @@ export default function StreamView({
   const { stale, ageSeconds } = useStale(follow ? poll.updatedAt : null, FOLLOW_SECONDS)
   const items = current?.items ?? []
   const showStale = follow && !paused && !!current && (stale || !!poll.error)
-  const win = effectiveWindow(filter)
+  const win = effectiveWindow(filter, textWindow)
 
   if (!current) {
     if (poll.error) return <ErrorPanel error={poll.error} onRetry={poll.reload} />

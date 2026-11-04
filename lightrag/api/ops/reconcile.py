@@ -23,8 +23,10 @@ minute:
    ``busy_without_run`` (``busy`` with no live run or owner, seen that way
    for ``busy_without_run_minutes`` by this reconciler) and, in multi-worker
    mode only, ``reservation_without_owner`` (``scanning`` whose owner is
-   dead or unknown, ``pending_enqueues`` held for longer than
-   ``reservation_minutes`` while no live run holds the workspace). Results
+   dead or unknown, a share of ``pending_enqueues`` whose worker is
+   confirmed dead (``pending_enqueue_owners``, OQ-12), or ``pending_enqueues``
+   held for longer than ``reservation_minutes`` while no live run holds the
+   workspace). Results
    go to KV ``busy_without_run`` and ``reservations``. Persisted provider
    pauses that shared state no longer holds are closed.
 3. **Retention**, hourly: runs after 30 days, failure rows after 90 days,
@@ -35,7 +37,9 @@ attention snapshot written) by the alerts evaluator alone, under its own
 lease ``ops:alerts`` (:mod:`lightrag.api.ops.alerts`).
 
 Reconciliation **never** clears ``busy`` or a reservation: it only reports
-them, with restart guidance.
+them, with restart guidance. An operator can release a dead worker's
+``scanning`` flag and its ``pending_enqueues`` share with the guarded
+``release-reservations`` action (:mod:`lightrag.api.ops.actions`).
 """
 
 from __future__ import annotations
@@ -87,6 +91,7 @@ RECONCILE_KEYS = (
     "scan_owner_worker_id",
     "scan_started_at",
     "pending_enqueues",
+    "pending_enqueue_owners",
     "provider_rejection",
 )
 
@@ -508,10 +513,50 @@ async def check_shared_state(
                     }
                 )
         pending = snap.get("pending_enqueues")
+        # Shares of the counter whose worker is confirmed dead (OQ-12): they
+        # can never be released by their owner, whatever else holds the
+        # workspace; an operator can release exactly those.
+        dead_shares = []
+        if isinstance(pending, int) and pending > 0:
+            for worker, count in sorted(
+                run_hooks.pending_owners(snap.get("pending_enqueue_owners")).items()
+            ):
+                state = owner_state(
+                    worker=workers.get(worker),
+                    pid=(workers.get(worker) or {}).get("pid"),
+                    worker_id=worker,
+                    since=None,
+                    my_worker_id=my_worker_id,
+                    host=host,
+                    markers=markers,
+                    stale_s=stale_s,
+                    alive=alive,
+                    owner_host=(workers.get(worker) or {}).get("host"),
+                )
+                if state == "dead":
+                    dead_shares.append({"worker_id": worker, "count": count})
+        if dead_shares:
+            first = float(prior.get("pending_enqueues") or now)
+            marks["pending_enqueues"] = first
+            reservations.append(
+                {
+                    "workspace": ws,
+                    "kind": "pending_enqueues",
+                    "scanning": False,
+                    "reason_code": "owner_dead",
+                    "owner_worker_id": dead_shares[0]["worker_id"],
+                    "dead_owners": dead_shares,
+                    "since": run_hooks.iso(first),
+                    "age_s": now - first,
+                    "count": sum(d["count"] for d in dead_shares),
+                    "pending_enqueues": pending,
+                    "exclusive": False,
+                }
+            )
         # An upload or insert holds its reservation for its whole processing
         # run: only a hold with no live run behind it counts, and the hold
         # time restarts whenever a live run holds the workspace.
-        if isinstance(pending, int) and pending > 0 and not held_live:
+        elif isinstance(pending, int) and pending > 0 and not held_live:
             first = float(prior.get("pending_enqueues") or now)
             marks["pending_enqueues"] = first
             if now - first >= hold_s:

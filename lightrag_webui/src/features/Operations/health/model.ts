@@ -18,6 +18,7 @@ import type {
 import type { LightragStatus } from '@/api/lightrag'
 import { ageSeconds, fmtBytes, fmtClock, fmtCount, fmtLatency } from '../format'
 import { OpsState, isStale } from '../severity'
+import { gpuLine, normalizeGpus } from './gpu'
 
 /**
  * Read models for the Health tab (spec §2.6, §3.7 PR-3): the dependency grid
@@ -700,6 +701,8 @@ export function pgHostFacts(deps: DepHealth[] | null | undefined): PgHostFacts |
 
 /** Why a graph or vector store card is not probed (the server's `detail.reason`). */
 const UNPROBED_REASONS = new Set(['covered_by_postgres', 'local_storage', 'not_configured', 'no_probe'])
+/** Why the GPU card warns (ops/gpu.py gpu_status). */
+const GPU_REASONS = new Set(['hot', 'memory_full', 'no_gpus'])
 
 export function detailParts(d: DepHealth): [string, Record<string, unknown>][] {
   const x = d.detail ?? {}
@@ -736,6 +739,15 @@ export function detailParts(d: DepHealth): [string, Record<string, unknown>][] {
   if (used !== null) out.push(['operations.health.detail.diskUsed', { pct: pct(used) }])
   const rtt = n('rtt_ms')
   if (rtt !== null) out.push(['operations.health.detail.rtt', { rtt: fmtLatency(rtt) }])
+  // The GPU exporter card (D5): one line per GPU, the first two, then a count.
+  const gpus = normalizeGpus(x)
+  for (const g of gpus.slice(0, 2)) {
+    const line = gpuLine(g)
+    out.push(['operations.health.detail.gpu', { index: g.index, util: line.util, mem: line.mem, temp: line.temp }])
+  }
+  if (gpus.length > 2) out.push(['operations.health.detail.gpuMore', { count: gpus.length - 2 }])
+  const gpuReason = d.id === 'gpu' ? str(x.reason) : null
+  if (gpuReason && GPU_REASONS.has(gpuReason)) out.push([`operations.health.detail.gpuReason.${gpuReason}`, {}])
   const reason = str(x.reason)
   if (reason && UNPROBED_REASONS.has(reason)) out.push([`operations.health.detail.reason.${reason}`, {}])
   if (d.id === 'signin' && (n('sso_errors') !== null || n('lockouts') !== null)) {
