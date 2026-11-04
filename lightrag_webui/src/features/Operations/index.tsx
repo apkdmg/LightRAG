@@ -6,20 +6,27 @@ import { cn } from '@/lib/utils'
 import { useSettingsStore } from '@/stores/settings'
 import { Card, ViewBoundary } from '@/features/TokenInsights/ui'
 import ActivityTab from './ActivityTab'
-import { OpsStatus, opsApi } from './api'
+import { OpsOverview, OpsStatus, opsApi } from './api'
+import DrawerStack from './components/DrawerStack'
 import ErrorPanel from './components/ErrorPanel'
 import ProcessChip from './components/ProcessChip'
 import RefreshHairline from './components/RefreshHairline'
 import Skeleton from './components/Skeleton'
-import { OpsShellContext } from './context'
+import { OverallStateChip } from './components/StatusChip'
+import { DrawerMove, OpsNav, OpsNavContext, OpsOverviewContext, OpsShellContext, useOpsNav } from './context'
+import DocumentDrawer from './drawers/DocumentDrawer'
+import UnsupportedDrawer from './drawers/UnsupportedDrawer'
+import WorkspaceDrawer from './drawers/WorkspaceDrawer'
 import { ageSeconds, fmtAge, fmtClock } from './format'
-import { DEFAULT_OPS_HASH, OPS_TABS, OpsHash, OpsTab, readOpsHash, writeOpsHash } from './hashState'
+import { DEFAULT_OPS_HASH, Drawer, OPS_TABS, OpsHash, OpsTab, readOpsHash, sameDrawer, writeOpsHash } from './hashState'
 import HealthTab from './HealthTab'
+import { useNow, useStale } from './hooks'
 import LogsTab from './LogsTab'
-import { useOpsMotion } from './motion'
+import { AttentionSlot, AttentionSlotContext, useOpsMotion } from './motion'
+import { OVERVIEW_REFRESH_SECONDS, attentionCounts, overallState, overallWord, ringCandidates } from './overview'
 import OverviewTab from './OverviewTab'
 import PerformanceTab from './PerformanceTab'
-import { OpsPoll, useDocumentHidden, useOpsPoll } from './poll'
+import { OpsPoll, useOpsPoll } from './poll'
 import { OpsPrefsContext, PAUSE_KEY, REDUCE_MOTION_KEY, readFlag, useOpsPrefs, writeFlag } from './prefs'
 import ProcessingTab from './ProcessingTab'
 import { isStale } from './severity'
@@ -45,25 +52,13 @@ export default function Operations() {
   )
 }
 
-/** Re-renders a small part of the page every `ms`, so "updated 3 min ago" moves; idle while hidden. */
-function useNow(ms: number) {
-  const hidden = useDocumentHidden()
-  const [now, setNow] = useState(() => Date.now())
-  useEffect(() => {
-    if (hidden) return
-    const timer = setInterval(() => setNow(Date.now()), ms)
-    return () => clearInterval(timer)
-  }, [ms, hidden])
-  return now
-}
-
 function Freshness({ poll }: { poll: OpsPoll<OpsStatus> }) {
   const { t } = useTranslation()
   const now = useNow(15_000)
   if (!poll.updatedAt) return null
   const stale = isStale(poll.updatedAt, STATUS_REFRESH_SECONDS, now)
   return stale ? (
-    <span className="text-[color:var(--ops-stale-fg)] rounded-md border border-dashed px-1.5 py-0.5 text-xs">
+    <span className="rounded-md border border-dashed px-1.5 py-0.5 text-xs text-[color:var(--ops-stale-fg)]">
       {t('operations.stale', { age: fmtAge(ageSeconds(poll.updatedAt, now)) })}
     </span>
   ) : (
@@ -71,7 +66,23 @@ function Freshness({ poll }: { poll: OpsPoll<OpsStatus> }) {
   )
 }
 
-function Header({ poll }: { poll: OpsPoll<OpsStatus> }) {
+/** The overall state from /overview; the only aria-live region of the page besides the "N new" pill. */
+function StateChip({ poll }: { poll: OpsPoll<OpsOverview> }) {
+  const { stale } = useStale(poll.updatedAt, OVERVIEW_REFRESH_SECONDS)
+  const data = poll.data
+  if (!data) return poll.loading && !poll.error ? <Skeleton className="h-6 w-40" /> : null
+  if (data.available === false) return null
+  return (
+    <OverallStateChip
+      state={overallState(data)}
+      word={overallWord(data.state, data.maintenance)}
+      counts={attentionCounts(data.attention)}
+      stale={stale || !!poll.error}
+    />
+  )
+}
+
+function Header({ poll, overview, reloadAll }: { poll: OpsPoll<OpsStatus>; overview: OpsPoll<OpsOverview>; reloadAll: () => void }) {
   const { t } = useTranslation()
   const { paused, reduced, osReduced } = useOpsMotion()
   // The button shows the effective state. While the OS asks for reduced motion
@@ -81,7 +92,10 @@ function Header({ poll }: { poll: OpsPoll<OpsStatus> }) {
   return (
     <div className="relative flex flex-wrap items-center gap-x-4 gap-y-2.5">
       <h1 className="m-0 text-[26px] font-semibold tracking-tight">{t('operations.title')}</h1>
-      <div className="flex flex-wrap items-center gap-2" aria-live="polite">
+      <div aria-live="polite" className="inline-flex">
+        <StateChip poll={overview} />
+      </div>
+      <div className="flex flex-wrap items-center gap-2">
         {status ? <ProcessChip process={status.process} /> : poll.loading ? <Skeleton className="h-6 w-36" /> : null}
         {status?.version ? <span className="text-muted-foreground text-xs">{t('operations.version', { version: status.version })}</span> : null}
       </div>
@@ -89,7 +103,7 @@ function Header({ poll }: { poll: OpsPoll<OpsStatus> }) {
         <Freshness poll={poll} />
         <button
           type="button"
-          onClick={poll.reload}
+          onClick={reloadAll}
           className="hover:bg-muted inline-flex min-h-8 items-center gap-1.5 rounded-lg border px-2.5 text-[13px]"
         >
           <RefreshCwIcon className="size-3.5" aria-hidden="true" />
@@ -116,7 +130,7 @@ function Header({ poll }: { poll: OpsPoll<OpsStatus> }) {
           {t('operations.reduceMotion')}
         </button>
       </div>
-      <RefreshHairline slow={poll.slow} />
+      <RefreshHairline slow={poll.slow || overview.slow} />
     </div>
   )
 }
@@ -164,8 +178,21 @@ function TabRow({ tab, onSelect }: { tab: OpsTab; onSelect: (tab: OpsTab) => voi
   )
 }
 
+type NavState = {
+  view: OpsHash
+  stack: Drawer[]
+  move: DrawerMove
+  /** False for a drawer that came with the page's URL: a deep link does not animate. */
+  animate: boolean
+}
+
 function OperationsPage() {
-  const [view, setView] = useState<OpsHash>(() => readOpsHash(window.location.hash) ?? DEFAULT_OPS_HASH)
+  const [nav, setNav] = useState<NavState>(() => ({
+    view: readOpsHash(window.location.hash) ?? DEFAULT_OPS_HASH,
+    stack: [],
+    move: 'none',
+    animate: false
+  }))
   // Only a tab the user switched to fades in; the first paint and deep links do not.
   const [fadeTab, setFadeTab] = useState<OpsTab | null>(null)
   const [paused, setPausedState] = useState(() => readFlag(PAUSE_KEY))
@@ -181,12 +208,28 @@ function OperationsPage() {
   }, [])
   const prefs = useMemo(() => ({ paused, setPaused, reduceMotion, setReduceMotion }), [paused, setPaused, reduceMotion, setReduceMotion])
 
+  const view = nav.view
   // The URL holds the view; leaving the tab drops it, so a reload lands where the user went.
   useEffect(() => {
     const next = writeOpsHash(view)
     if (window.location.hash !== next) window.history.replaceState(null, '', next)
   }, [view])
   useEffect(() => () => window.history.replaceState(null, '', '#/'), [])
+
+  /** A view from a link or a pasted URL: the breadcrumb survives only if the drawer stays the same. */
+  const setView = useCallback((next: OpsHash) => {
+    setNav((s) => {
+      if (writeOpsHash(next) === writeOpsHash(s.view)) return s
+      const keep = sameDrawer(next.drawer, s.view.drawer)
+      return {
+        view: next,
+        stack: keep ? s.stack : [],
+        move: keep ? s.move : next.drawer ? (s.view.drawer ? 'push' : 'open') : s.view.drawer ? 'close' : s.move,
+        animate: true
+      }
+    })
+  }, [])
+
   // A pasted link while the tab is open switches the view too.
   useEffect(() => {
     const onHash = () => {
@@ -195,7 +238,7 @@ function OperationsPage() {
     }
     window.addEventListener('hashchange', onHash)
     return () => window.removeEventListener('hashchange', onHash)
-  }, [])
+  }, [setView])
 
   // Radix portals render outside .ops-root; the page toggle reaches them through <html>.
   useEffect(() => {
@@ -205,81 +248,169 @@ function OperationsPage() {
     return () => root.removeAttribute('data-ops-motion')
   }, [reduceMotion])
 
-  const selectTab = useCallback((tab: OpsTab) => {
-    setView((v) => (v.tab === tab ? v : { ...v, tab, sub: null }))
-    setFadeTab(tab)
+  const go = useCallback((tab: OpsTab, sub?: string | null) => {
+    setNav((s) => {
+      const sameTab = s.view.tab === tab
+      const nextSub = sub === undefined ? (sameTab ? s.view.sub : null) : sub
+      if (sameTab && nextSub === s.view.sub) return s
+      // A tab switch closes the drawer; a sub-view switch keeps it.
+      return {
+        ...s,
+        view: { ...s.view, tab, sub: nextSub, drawer: sameTab ? s.view.drawer : null, logQuery: sameTab ? s.view.logQuery : null },
+        stack: sameTab ? s.stack : [],
+        move: sameTab || !s.view.drawer ? s.move : 'close',
+        animate: true
+      }
+    })
+    setFadeTab((current) => (current === tab ? current : tab))
+  }, [])
+  const setSub = useCallback((sub: string) => setNav((s) => (s.view.sub === sub ? s : { ...s, view: { ...s.view, sub } })), [])
+  const openDrawer = useCallback((drawer: Drawer, opts?: { push?: boolean }) => {
+    setNav((s) => {
+      if (sameDrawer(drawer, s.view.drawer)) return s
+      const current = s.view.drawer
+      return {
+        view: { ...s.view, drawer },
+        stack: opts?.push && current ? [...s.stack, current] : [],
+        move: current ? 'push' : 'open',
+        animate: true
+      }
+    })
+  }, [])
+  const backDrawer = useCallback((index?: number) => {
+    setNav((s) => {
+      if (!s.stack.length) return s
+      const i = index === undefined ? s.stack.length - 1 : Math.max(0, Math.min(index, s.stack.length - 1))
+      return { view: { ...s.view, drawer: s.stack[i] }, stack: s.stack.slice(0, i), move: 'back', animate: true }
+    })
+  }, [])
+  const closeDrawer = useCallback(() => {
+    setNav((s) => (s.view.drawer ? { ...s, view: { ...s.view, drawer: null }, stack: [], move: 'close', animate: true } : s))
   }, [])
 
-  const openInsights = useCallback(() => useSettingsStore.getState().setCurrentTab('insights'), [])
+  const navValue: OpsNav = useMemo(
+    () => ({ view, stack: nav.stack, move: nav.move, go, setSub, openDrawer, backDrawer, closeDrawer, setView }),
+    [view, nav.stack, nav.move, go, setSub, openDrawer, backDrawer, closeDrawer, setView]
+  )
+
+  const selectTab = useCallback((tab: OpsTab) => go(tab, null), [go])
+
+  /**
+   * Cost and token questions belong to Token Insights (§2.1). The Insights page
+   * reads its hash while it renders, before this page's unmount clears the
+   * URL, so a workspace link lands on that workspace.
+   */
+  const openInsights = useCallback((workspace?: string) => {
+    if (workspace) {
+      const q = new URLSearchParams({ insights: '1', itab: 'explore', iws: workspace })
+      window.history.replaceState(null, '', `#/?${q.toString()}`)
+    }
+    useSettingsStore.getState().setCurrentTab('insights')
+  }, [])
 
   return (
     <OpsPrefsContext.Provider value={prefs}>
-      {/* The first MotionConfig in the app, scoped to Operations: 'always' honours the page toggle. */}
-      <MotionConfig reducedMotion={reduceMotion ? 'always' : 'user'}>
-        <StatusShell view={view} fadeTab={fadeTab} selectTab={selectTab} openInsights={openInsights} />
-      </MotionConfig>
+      <OpsNavContext.Provider value={navValue}>
+        {/* The first MotionConfig in the app, scoped to Operations: 'always' honours the page toggle. */}
+        <MotionConfig reducedMotion={reduceMotion ? 'always' : 'user'}>
+          <StatusShell fadeTab={fadeTab} selectTab={selectTab} openInsights={openInsights} animateDrawer={nav.animate} />
+        </MotionConfig>
+      </OpsNavContext.Provider>
     </OpsPrefsContext.Provider>
   )
 }
 
+function renderDrawer(drawer: Drawer) {
+  if (drawer.kind === 'workspace') return <WorkspaceDrawer workspace={drawer.id} />
+  if (drawer.kind === 'document') return <DocumentDrawer workspace={drawer.workspace} docId={drawer.id} />
+  return <UnsupportedDrawer kind={drawer.kind} />
+}
+
 function StatusShell({
-  view,
   fadeTab,
   selectTab,
-  openInsights
+  openInsights,
+  animateDrawer
 }: {
-  view: OpsHash
   fadeTab: OpsTab | null
   selectTab: (tab: OpsTab) => void
-  openInsights: () => void
+  openInsights: (workspace?: string) => void
+  animateDrawer: boolean
 }) {
   const { t } = useTranslation()
-  const { paused, reduced } = useOpsMotion()
+  const { view } = useOpsNav()
+  const { paused, reduced, hidden } = useOpsMotion()
   const poll = useOpsPoll((signal) => opsApi.status(signal), [], STATUS_REFRESH_SECONDS)
+  const overview = useOpsPoll((signal) => opsApi.overview(signal), [], OVERVIEW_REFRESH_SECONDS)
   const status = poll.data
   const shell = useMemo(() => ({ status, openInsights }), [status, openInsights])
   const Panel = PANELS[view.tab]
 
+  // One page-level slot for rings (§2.12 rule 2); a non-baseline overview offers its candidates.
+  const [slot] = useState(() => new AttentionSlot())
+  const previousOverview = useRef<OpsOverview | null>(null)
+  useEffect(() => {
+    const prev = previousOverview.current
+    const next = overview.data
+    previousOverview.current = next
+    if (!prev || !next || prev === next || overview.baseline || reduced || hidden || paused) return
+    slot.offer(ringCandidates(prev, next), Date.now())
+  }, [overview.data, overview.baseline, reduced, hidden, paused, slot])
+
+  const reloadStatus = poll.reload
+  const reloadOverview = overview.reload
+  const reloadAll = useCallback(() => {
+    reloadStatus()
+    reloadOverview()
+  }, [reloadStatus, reloadOverview])
+
   return (
     <OpsShellContext.Provider value={shell}>
-      <div className="ops-root relative h-full overflow-hidden" data-motion={reduced ? 'reduced' : undefined} data-paused={paused ? '' : undefined}>
-        <div className="h-full overflow-y-auto">
-          <div className="mx-auto flex max-w-[1360px] flex-col gap-4 px-4 pt-5 pb-14 md:px-7">
-            <Header poll={poll} />
-            {status && !status.available ? (
-              <Card className="flex max-w-[760px] flex-col gap-1">
-                <h2 className="m-0 text-[15px] font-semibold">{t('operations.unavailable.title')}</h2>
-                <p className="text-muted-foreground m-0 text-sm">{t('operations.unavailable.body')}</p>
-              </Card>
-            ) : null}
-            {poll.error && !status ? (
-              <Card>
-                <ErrorPanel error={poll.error} onRetry={poll.reload} />
-              </Card>
-            ) : (
-              <>
-                {poll.error ? (
-                  <Card className="py-2.5">
-                    <ErrorPanel error={poll.error} onRetry={poll.reload} compact />
+      <OpsOverviewContext.Provider value={overview}>
+        <AttentionSlotContext.Provider value={slot}>
+          <div className="ops-root relative h-full overflow-hidden" data-motion={reduced ? 'reduced' : undefined} data-paused={paused ? '' : undefined}>
+            <div className="h-full overflow-y-auto">
+              <div className="mx-auto flex max-w-[1360px] flex-col gap-4 px-4 pt-5 pb-14 md:px-7">
+                <Header poll={poll} overview={overview} reloadAll={reloadAll} />
+                {status && !status.available ? (
+                  <Card className="flex max-w-[760px] flex-col gap-1">
+                    <h2 className="m-0 text-[15px] font-semibold">{t('operations.unavailable.title')}</h2>
+                    <p className="text-muted-foreground m-0 text-sm">{t('operations.unavailable.body')}</p>
                   </Card>
                 ) : null}
-                <TabRow tab={view.tab} onSelect={selectTab} />
-                <div
-                  key={view.tab}
-                  id={`ops-panel-${view.tab}`}
-                  role="tabpanel"
-                  aria-labelledby={`ops-tab-${view.tab}`}
-                  className={fadeTab === view.tab ? 'ops-fade-in' : undefined}
-                >
-                  <ViewBoundary resetKey={view.tab}>
-                    <Panel />
-                  </ViewBoundary>
-                </div>
-              </>
-            )}
+                {poll.error && !status ? (
+                  <Card>
+                    <ErrorPanel error={poll.error} onRetry={poll.reload} />
+                  </Card>
+                ) : (
+                  <>
+                    {poll.error ? (
+                      <Card className="py-2.5">
+                        <ErrorPanel error={poll.error} onRetry={poll.reload} compact />
+                      </Card>
+                    ) : null}
+                    <TabRow tab={view.tab} onSelect={selectTab} />
+                    <div
+                      key={view.tab}
+                      id={`ops-panel-${view.tab}`}
+                      role="tabpanel"
+                      aria-labelledby={`ops-tab-${view.tab}`}
+                      className={fadeTab === view.tab ? 'ops-fade-in' : undefined}
+                    >
+                      <ViewBoundary resetKey={view.tab}>
+                        <Panel />
+                      </ViewBoundary>
+                    </div>
+                  </>
+                )}
+              </div>
+            </div>
+            <ViewBoundary resetKey={view.drawer ? writeOpsHash({ ...DEFAULT_OPS_HASH, drawer: view.drawer }) : 'none'}>
+              <DrawerStack animateOpen={animateDrawer} render={renderDrawer} />
+            </ViewBoundary>
           </div>
-        </div>
-      </div>
+        </AttentionSlotContext.Provider>
+      </OpsOverviewContext.Provider>
     </OpsShellContext.Provider>
   )
 }

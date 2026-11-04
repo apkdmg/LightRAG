@@ -105,6 +105,104 @@
 }
 .ops-hairline[data-static] > i { animation: none; width: 100%; opacity: 0.4; transform: none; }
 
+/* One ring (§2.12): a ::after outline that grows by at most 8 px per side while
+   fading 0.6 → 0. Two identical keyframe names let the class alternate, which
+   restarts the animation without a forced reflow. The per-axis scale comes
+   from ResizeObserver (--ring-sx / --ring-sy). */
+@keyframes ops-ring-a {
+  from { opacity: 0.6; transform: scale(1, 1); }
+  to { opacity: 0; transform: scale(var(--ring-sx, 1.08), var(--ring-sy, 1.35)); }
+}
+@keyframes ops-ring-b {
+  from { opacity: 0.6; transform: scale(1, 1); }
+  to { opacity: 0; transform: scale(var(--ring-sx, 1.08), var(--ring-sy, 1.35)); }
+}
+.ops-ringable { position: relative; }
+.ops-ring-a::after,
+.ops-ring-b::after {
+  content: "";
+  position: absolute;
+  inset: -1px;
+  border-radius: inherit;
+  border: 2px solid currentColor;
+  pointer-events: none;
+}
+.ops-ring-a::after { animation: ops-ring-a var(--ops-dur-ring) var(--ops-ease-out) forwards; }
+.ops-ring-b::after { animation: ops-ring-b var(--ops-dur-ring) var(--ops-ease-out) forwards; }
+
+/* KPI tint: only on a severity change; held 1 s, then faded. Text stays >= 4.5:1. */
+.ops-kpi { transition: background-color var(--ops-dur-value) var(--ops-ease-out), border-color var(--ops-dur-fast) var(--ops-ease-out); }
+.ops-kpi.ops-tint { background-color: var(--ops-flash); transition-duration: 0ms; }
+
+/* Running dot: opacity 1 → 0.55 → 1 every 2 s, phase-aligned through --ops-phase. */
+@keyframes ops-breathe {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.55; }
+}
+.ops-dot {
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  flex: none;
+  border-radius: 9999px;
+  background: var(--ops-info);
+}
+.ops-breathe { animation: ops-breathe var(--ops-dur-breathe) var(--ops-ease-loop) infinite; animation-delay: calc(var(--ops-phase, 0) * -1ms); }
+
+/* Progress bar: scaleX from the left; a new run or a smaller total jumps. */
+.ops-bar {
+  display: inline-block;
+  width: 64px;
+  height: 5px;
+  flex: none;
+  overflow: hidden;
+  border-radius: 3px;
+  background: var(--muted);
+  vertical-align: middle;
+}
+.ops-bar > i {
+  display: block;
+  width: 100%;
+  height: 100%;
+  background: var(--ops-info);
+  transform-origin: left;
+  transition: transform var(--ops-dur-value) var(--ops-ease-out);
+}
+.ops-bar[data-jump] > i { transition: none; }
+.ops-bar[data-tone="serious"] > i { background: var(--ops-serious); }
+.ops-bar[data-tone="crit"] > i { background: var(--ops-crit); }
+.ops-bar[data-tone="paused"] > i { background: var(--ops-paused); }
+
+/* Stale panel: graphics dim, text switches colour (dimming would push muted text below AA). */
+.ops-dim { transition: opacity var(--ops-dur-fast) var(--ops-ease-out); }
+.ops-stale .ops-dim { opacity: 0.6; transition-duration: var(--ops-dur-value); }
+.ops-stale,
+.ops-stale .text-muted-foreground { color: var(--ops-stale-fg); }
+
+/* Drawer list rows and table rows that open something. */
+.ops-row-link { cursor: pointer; }
+.ops-row-link:hover { background: var(--muted); }
+
+/* Narrow screens: tables become stacked cards (one markup, labels from data-label). */
+@media (max-width: 767px) {
+  .ops-stack thead {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip: rect(0 0 0 0);
+    white-space: nowrap;
+  }
+  .ops-stack,
+  .ops-stack tbody,
+  .ops-stack tr,
+  .ops-stack td { display: block; width: 100%; min-width: 0; }
+  .ops-stack tr { border: 1px solid var(--border); border-radius: 8px; padding: 6px 8px; margin-bottom: 8px; }
+  .ops-stack td { display: flex; justify-content: space-between; gap: 12px; padding: 3px 0 !important; text-align: right; border: 0; }
+  .ops-stack td::before { content: attr(data-label); color: var(--muted-foreground); text-align: left; font-size: 12px; }
+  .ops-stack td[data-label=""]::before { content: none; }
+}
+
 /* "⏸ auto" and stale panels stop every loop. */
 .ops-root[data-paused] .ops-loop,
 .ops-stale .ops-loop { animation: none; }
@@ -117,6 +215,7 @@
  */
 @media (prefers-reduced-motion: reduce) {
   .ops-root *,
+  .ops-root *::after,
   .ops-portal,
   .ops-portal * {
     animation: none !important;
@@ -125,6 +224,7 @@
   .ops-root .ops-fade { transition: opacity var(--ops-dur-fast) linear !important; }
 }
 .ops-root[data-motion="reduced"] *,
+.ops-root[data-motion="reduced"] *::after,
 html[data-ops-motion="reduced"] .ops-portal,
 html[data-ops-motion="reduced"] .ops-portal * {
   animation: none !important;

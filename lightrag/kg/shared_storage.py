@@ -1740,3 +1740,154 @@ def get_pipeline_status_lock(
     return get_namespace_lock(
         "pipeline_status", workspace=actual_workspace, enable_logging=enable_logging
     )
+
+
+# ---------------------------------------------------------------------------
+# Read-only snapshots (admin Operations console)
+#
+# ``get_namespace_data`` enters the internal lock (one Manager lock shared by
+# every worker) and creates missing namespaces, so a dashboard must not call it
+# for many workspaces. ``snapshot_namespace`` reads an existing namespace
+# without either: the internal lock only guards namespace *creation*, and a
+# read of whitelisted keys needs neither consistency nor creation. It is
+# synchronous on purpose: under Gunicorn every key read is a blocking Manager
+# round trip, so callers run it on a dedicated thread with a timeout
+# (``lightrag.api.ops.snapshot``); in single-process mode it reads plain
+# dictionaries and is called directly.
+# ---------------------------------------------------------------------------
+
+# Keys an ops snapshot may read, per namespace. List-valued keys are only
+# returned as a bounded slice (see ``list_slices``), never whole.
+SNAPSHOT_KEYS: Dict[str, frozenset] = {
+    "pipeline_status": frozenset(
+        {
+            "autoscanned",
+            "busy",
+            "destructive_busy",
+            "scanning",
+            "scanning_exclusive",
+            "pending_enqueues",
+            "request_pending",
+            "cancellation_requested",
+            "job_name",
+            "job_start",
+            "docs",
+            "batchs",
+            "cur_batch",
+            "latest_message",
+            "history_messages",
+            "provider_rejection",
+            # Run ownership keys (written once run tracking exists)
+            "run_id",
+            "owner_worker_id",
+            "owner_pid",
+            "heartbeat_at",
+            "scan_owner_worker_id",
+            "scan_started_at",
+        }
+    ),
+}
+SNAPSHOT_LIST_KEYS = frozenset({"history_messages"})
+SNAPSHOT_MAX_SLICE = 500
+
+
+def is_multiprocess() -> bool:
+    """True when shared state lives in a ``multiprocessing.Manager`` (Gunicorn)."""
+    return bool(_is_multiprocess)
+
+
+def manager_pid() -> Optional[int]:
+    """PID of the ``multiprocessing.Manager`` server process, when there is one.
+
+    Under Gunicorn the master starts the Manager before it forks the workers,
+    so the Manager is a sibling of the workers; the ops worker count skips it.
+    """
+    if not _is_multiprocess or _manager is None:
+        return None
+    try:
+        pid = _manager._process.pid
+    except Exception:
+        return None
+    return pid if isinstance(pid, int) and pid > 0 else None
+
+
+def _snapshot_value(value: Any) -> Any:
+    """A detached copy, so callers never hold a live reference or a proxy."""
+    if isinstance(value, dict):
+        return {k: _snapshot_value(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_snapshot_value(v) for v in value]
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    # Manager proxies and anything exotic: never hand them out.
+    return None
+
+
+def _slice_bounds(total: int, window: tuple) -> tuple[int, int]:
+    """``(offset, limit)`` -> ``[start, stop)``; ``offset=None`` means the tail."""
+    offset, limit = window
+    limit = max(0, min(int(limit), SNAPSHOT_MAX_SLICE))
+    if offset is None:
+        start = max(0, total - limit)
+    else:
+        start = max(0, min(int(offset), total))
+    return start, min(total, start + limit)
+
+
+def snapshot_namespace(
+    namespace: str,
+    workspace: str,
+    keys: Any,
+    *,
+    list_slices: Optional[Dict[str, tuple]] = None,
+) -> Optional[Dict[str, Any]]:
+    """Read whitelisted keys of an existing namespace, read-only.
+
+    Never creates the namespace and never takes the internal lock. Returns
+    ``None`` when shared data is not initialized or the namespace does not
+    exist (for example a workspace that was never loaded). Missing keys read
+    as ``None``.
+
+    List-valued keys (``history_messages``) come back as
+    ``{"total": n, "start": i, "items": [...]}``: ``list_slices`` maps the key
+    to ``(offset, limit)`` (``offset=None`` reads the last ``limit`` items,
+    ``limit`` is capped at ``SNAPSHOT_MAX_SLICE``); without a slice only the
+    length is read.
+
+    Raises:
+        ValueError: the namespace or a key is not whitelisted.
+    """
+    allowed = SNAPSHOT_KEYS.get(namespace)
+    if allowed is None:
+        raise ValueError(f"Namespace not readable by snapshot: {namespace}")
+    wanted = tuple(keys)
+    denied = [key for key in wanted if key not in allowed]
+    if denied:
+        raise ValueError(f"Keys not readable by snapshot: {denied}")
+    shared = _shared_dicts
+    if shared is None or workspace is None:
+        return None
+    final_namespace = f"{workspace}:{namespace}" if workspace else namespace
+    # One round trip; a missing namespace stays missing (``get`` creates nothing).
+    data = shared.get(final_namespace)
+    if data is None:
+        return None
+    slices = list_slices or {}
+    out: Dict[str, Any] = {}
+    for key in wanted:
+        value = data.get(key)
+        if key in SNAPSHOT_LIST_KEYS:
+            if value is None:
+                out[key] = {"total": 0, "start": 0, "items": []}
+                continue
+            total = len(value)
+            start, stop = _slice_bounds(total, slices.get(key, (total, 0)))
+            items = list(value[start:stop]) if stop > start else []
+            out[key] = {
+                "total": total,
+                "start": start,
+                "items": [_snapshot_value(item) for item in items],
+            }
+        else:
+            out[key] = _snapshot_value(value)
+    return out

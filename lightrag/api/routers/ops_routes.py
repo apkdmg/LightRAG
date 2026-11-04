@@ -22,10 +22,10 @@ import sys
 import threading
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Optional
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response
 from fastapi.routing import APIRoute
@@ -37,11 +37,27 @@ from lightrag.api.ops.context import (
     current_request_id,
     new_request_id,
 )
+from lightrag.api.ops.service import (
+    AUDIT_EVENT_KIND,
+    DEFAULT_THRESHOLDS,
+    EVENT_KINDS,
+    OpsBadRequest,
+    OpsDataUnavailable,
+    OpsNotFound,
+    OpsService,
+    SEARCH_MAX_LENGTH,
+)
+from lightrag.api.ops.snapshot import NamespaceReader
+from lightrag.api.ops.store import BACKLOG_STATUSES, Page
+from lightrag.kg import shared_storage
 
 logger = logging.getLogger("lightrag.api.ops")
 
 POSTGRES_KV_STORAGE = "PGKVStorage"
 _WORKERS_LIVE_TTL_S = 10.0
+DEFAULT_PAGE_SIZE = 50
+MAX_PAGE_SIZE = 200
+_DOC_STATUSES = (*BACKLOG_STATUSES, "processed", "preprocessed")
 
 _STATUS_CODES = {
     400: "bad_request",
@@ -193,8 +209,11 @@ _workers_live_lock = threading.Lock()
 def _count_gunicorn_workers() -> Optional[int]:
     """Live children of this worker's Gunicorn master, counted by the OS.
 
-    Host-local and cached briefly; the heartbeat table replaces it once
-    workers report themselves.
+    The master also owns the shared-state Manager process, which is not a
+    worker; when its PID is not known the count is unknown rather than one
+    too high (a dead worker would otherwise read as healthy). Host-local and
+    cached briefly; the heartbeat table replaces it once workers report
+    themselves.
     """
     now = time.monotonic()
     with _workers_live_lock:
@@ -204,12 +223,16 @@ def _count_gunicorn_workers() -> Optional[int]:
     try:
         import psutil
 
-        master = psutil.Process(os.getppid())
-        value = sum(
-            1
-            for child in master.children(recursive=False)
-            if child.status() != psutil.STATUS_ZOMBIE
-        )
+        manager = shared_storage.manager_pid()
+        if manager is None:
+            value = None
+        else:
+            master = psutil.Process(os.getppid())
+            value = sum(
+                1
+                for child in master.children(recursive=False)
+                if child.pid != manager and child.status() != psutil.STATUS_ZOMBIE
+            )
     except Exception:
         value = None
     with _workers_live_lock:
@@ -238,6 +261,96 @@ def is_operator(user: UserInfo) -> bool:
     return any(c and c.strip().lower() in accounts for c in candidates)
 
 
+def _service(request: Request) -> OpsService:
+    """This worker's ops service, or an unavailable one when ops did not start.
+
+    The unavailable service still answers every route (with empty data and
+    ``available: false``), so the console degrades instead of failing.
+    """
+    runtime = getattr(request.app.state, "ops", None)
+    service = getattr(runtime, "service", None)
+    if isinstance(service, OpsService):
+        return service
+    fallback = getattr(request.app.state, "ops_fallback_service", None)
+    if not isinstance(fallback, OpsService):
+        on_postgres = _kv_storage_name(_data_rag(request)) == POSTGRES_KV_STORAGE
+        fallback = OpsService(
+            store=None,
+            reader=NamespaceReader(),
+            app_state=request.app.state,
+            unavailable_reason="not_started" if on_postgres else "postgres_required",
+        )
+        request.app.state.ops_fallback_service = fallback
+    return fallback
+
+
+def _workers(request: Request) -> dict[str, Any]:
+    info = _server_info(request)
+    mode = process_mode()
+    return {
+        "mode": mode,
+        "expected": _expected_workers(mode, info.workers if info else None),
+        "live": 1 if mode == "uvicorn" else _count_gunicorn_workers(),
+    }
+
+
+def _page(page: int, page_size: int) -> Page:
+    return Page(limit=page_size, offset=(page - 1) * page_size)
+
+
+def _payload(
+    service: OpsService, body: dict[str, Any], *, needs_docs: bool = True
+) -> dict[str, Any]:
+    return {
+        "generated_at": _generated_at(),
+        **service.meta(needs_docs=needs_docs),
+        **body,
+    }
+
+
+async def _answer(
+    service: OpsService, call, empty: dict[str, Any], *, needs_docs: bool = True
+) -> Any:
+    """Run a service call and map its failures to the ops error shape.
+
+    Without a working store the route answers ``empty`` with
+    ``available: false`` rather than an error. ``needs_docs`` is False for
+    routes that read only the ops tables (KV, audit, usage events), which
+    work while doc status lives in another storage.
+    """
+    ready = service.docs_available if needs_docs else service.available
+    if not ready and empty is not None:
+        return _payload(service, empty, needs_docs=needs_docs)
+    try:
+        return _payload(service, await call(), needs_docs=needs_docs)
+    except OpsBadRequest as e:
+        return _err(400, e.code)
+    except OpsNotFound:
+        return _err(404, "not_found")
+    except OpsDataUnavailable:
+        return _err(503, "data_unavailable")
+
+
+def _empty_page(page: int, page_size: int, **extra: Any) -> dict[str, Any]:
+    return {"items": [], "page": page, "page_size": page_size, "total": 0, **extra}
+
+
+def _csv_set(value: Optional[str]) -> frozenset[str]:
+    if not value:
+        return frozenset()
+    return frozenset(p.strip() for p in value.split(",") if p.strip())
+
+
+def _parse_time(value: Optional[str], default: datetime) -> datetime:
+    if not value:
+        return default
+    try:
+        moment = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as e:
+        raise OpsBadRequest("invalid_time") from e
+    return moment if moment.tzinfo else moment.replace(tzinfo=timezone.utc)
+
+
 @router.get("/status")
 async def status(
     request: Request, user: UserInfo = Depends(require_admin)
@@ -249,11 +362,13 @@ async def status(
     mode = process_mode()
     expected = _expected_workers(mode, info.workers if info else None)
     workers_live = 1 if mode == "uvicorn" else _count_gunicorn_workers()
+    service = _service(request)
     payload: dict[str, Any] = {
         "generated_at": _generated_at(),
         "available": available,
         "features": {
-            "durable": False,
+            "durable": service.available,
+            "processing": service.docs_available,
             "runs": False,
             "logs": False,
             "probes": False,
@@ -266,6 +381,7 @@ async def status(
             "mode": mode,
             "expected_workers": expected,
             "workers_live": workers_live,
+            "manager": service.reader.state,
         },
         "operator": is_operator(user),
         "version": info.version if info else "",
@@ -273,3 +389,260 @@ async def status(
     if not available:
         payload["unavailable_reason"] = "postgres_required"
     return payload
+
+
+# -- Overview and processing (read-only) ----------------------------------------
+
+
+@router.get("/overview")
+async def overview(request: Request) -> dict[str, Any]:
+    """State, KPI tiles, attention list, top active jobs and recent markers."""
+    service = _service(request)
+    try:
+        body = await service.overview(_workers(request))
+    except OpsDataUnavailable:
+        return _err(503, "data_unavailable")
+    return {"generated_at": _generated_at(), **body}
+
+
+@router.get("/processing/summary")
+async def processing_summary(request: Request) -> dict[str, Any]:
+    service = _service(request)
+    return await _answer(
+        service,
+        service.summary,
+        {
+            "backlog": None,
+            "active": [],
+            "active_count": 0,
+            "stuck": {"runs": 0, "docs": 0, "reservations": 0},
+            "email_queue": None,
+            "pauses": {"count": 0, "by_slot_kind": {}, "capped": False},
+            "thresholds": dict(DEFAULT_THRESHOLDS),
+            "approximate": True,
+        },
+    )
+
+
+@router.get("/processing/active")
+async def processing_active(request: Request) -> dict[str, Any]:
+    """Live jobs; approximate until run tracking: in-flight docs + shared state."""
+    service = _service(request)
+    return await _answer(
+        service, service.active, {"runs": [], "approximate": True, "checked": 0}
+    )
+
+
+@router.get("/processing/stuck")
+async def processing_stuck(
+    request: Request,
+    doc_older_than_min: Optional[int] = Query(None, ge=1, le=10080),
+    page: int = Query(1, ge=1, le=10000),
+    page_size: int = Query(DEFAULT_PAGE_SIZE, ge=1, le=MAX_PAGE_SIZE),
+) -> dict[str, Any]:
+    service = _service(request)
+    return await _answer(
+        service,
+        lambda: service.stuck(doc_older_than_min, _page(page, page_size)),
+        {
+            "orphaned": [],
+            "hung": [],
+            "busy_without_run": [],
+            "reservations": [],
+            "stale_docs": _empty_page(page, page_size),
+            "thresholds": {
+                "doc_minutes": doc_older_than_min
+                or DEFAULT_THRESHOLDS["stale_doc_minutes"],
+                "hung_minutes": DEFAULT_THRESHOLDS["hung_minutes"],
+                "orphan_seconds": DEFAULT_THRESHOLDS["orphan_seconds"],
+            },
+            "checked_classes": [],
+        },
+    )
+
+
+@router.get("/processing/workspaces")
+async def processing_workspaces(
+    request: Request,
+    q: Optional[str] = Query(None, max_length=SEARCH_MAX_LENGTH),
+    has: Optional[str] = Query(None, max_length=64),
+    sort: str = Query("oldest", max_length=32),
+    dir: str = Query("asc", pattern="^(asc|desc)$"),
+    page: int = Query(1, ge=1, le=10000),
+    page_size: int = Query(DEFAULT_PAGE_SIZE, ge=1, le=MAX_PAGE_SIZE),
+) -> dict[str, Any]:
+    """Workspaces with backlog: server-side search, filters, sort and paging."""
+    service = _service(request)
+    return await _answer(
+        service,
+        lambda: service.workspaces(
+            q=q,
+            has=_csv_set(has),
+            sort=sort,
+            descending=dir == "desc",
+            page=_page(page, page_size),
+        ),
+        _empty_page(page, page_size, sort=sort, dir=dir),
+    )
+
+
+@router.get("/processing/failures")
+async def processing_failures(
+    request: Request,
+    window: str = Query("24h", max_length=8),
+    group: str = Query("error_kind", max_length=32),
+    include_cancelled: bool = False,
+) -> dict[str, Any]:
+    service = _service(request)
+    return await _answer(
+        service,
+        lambda: service.failures(window, group, include_cancelled),
+        {
+            "window": window,
+            "group": group,
+            "groups": [],
+            "durable": False,
+            "legacy": [],
+            "excluded": {"dup": 0, "cancelled": 0},
+        },
+    )
+
+
+@router.get("/processing/failures/docs")
+async def processing_failure_docs(
+    request: Request,
+    key: Optional[str] = Query(None, max_length=255),
+    group: str = Query("signature", max_length=32),
+    window: str = Query("24h", max_length=8),
+    page: int = Query(1, ge=1, le=10000),
+    page_size: int = Query(DEFAULT_PAGE_SIZE, ge=1, le=MAX_PAGE_SIZE),
+) -> dict[str, Any]:
+    service = _service(request)
+    return await _answer(
+        service,
+        lambda: service.failure_docs(key or "", group, window, _page(page, page_size)),
+        _empty_page(page, page_size),
+    )
+
+
+@router.get("/email-queue")
+async def email_queue(
+    request: Request,
+    page: int = Query(1, ge=1, le=10000),
+    page_size: int = Query(DEFAULT_PAGE_SIZE, ge=1, le=MAX_PAGE_SIZE),
+) -> dict[str, Any]:
+    """Waiting email re-syncs per workspace (counts only, never content)."""
+    service = _service(request)
+    return await _answer(
+        service,
+        lambda: service.email_queue(_page(page, page_size)),
+        {
+            "total": 0,
+            "workspaces": 0,
+            "bad": 0,
+            "longest_pending_s": None,
+            "scanned_at": None,
+            "items": [],
+            "page": page,
+            "page_size": page_size,
+            "total_items": 0,
+        },
+        needs_docs=False,
+    )
+
+
+@router.get("/pauses")
+async def pauses(
+    request: Request,
+    page: int = Query(1, ge=1, le=10000),
+    page_size: int = Query(DEFAULT_PAGE_SIZE, ge=1, le=MAX_PAGE_SIZE),
+) -> dict[str, Any]:
+    """Provider pauses by slot and kind (capped candidate set, approximate)."""
+    service = _service(request)
+    return await _answer(
+        service,
+        lambda: service.pauses(_page(page, page_size)),
+        {
+            "by_slot_kind": {},
+            "items": [],
+            "total": 0,
+            "checked": 0,
+            "capped": False,
+            "approximate": True,
+            "page": page,
+            "page_size": page_size,
+        },
+    )
+
+
+@router.get("/workspaces/{ws}")
+async def workspace_detail(request: Request, ws: str) -> dict[str, Any]:
+    """Workspace drawer. Never loads the workspace; idle ones show SQL counts."""
+    service = _service(request)
+    return await _answer(service, lambda: service.workspace(ws), None)
+
+
+@router.get("/workspaces/{ws}/feed")
+async def workspace_feed(
+    request: Request,
+    ws: str,
+    offset: Optional[int] = Query(None, ge=0),
+    limit: int = Query(200, ge=1, le=200),
+) -> dict[str, Any]:
+    """Redacted slice of the workspace's live pipeline messages."""
+    service = _service(request)
+    return await _answer(service, lambda: service.feed(ws, offset, limit), None)
+
+
+@router.get("/workspaces/{ws}/documents")
+async def workspace_documents(
+    request: Request,
+    ws: str,
+    status: Optional[str] = Query(None, max_length=32),
+    page: int = Query(1, ge=1, le=10000),
+    page_size: int = Query(DEFAULT_PAGE_SIZE, ge=1, le=MAX_PAGE_SIZE),
+) -> dict[str, Any]:
+    service = _service(request)
+    if status is not None and status not in _DOC_STATUSES:
+        return _err(400, "invalid_status")
+    return await _answer(
+        service,
+        lambda: service.documents(ws, status, _page(page, page_size)),
+        _empty_page(page, page_size),
+    )
+
+
+@router.get("/workspaces/{ws}/documents/{doc_id}")
+async def workspace_document(request: Request, ws: str, doc_id: str) -> dict[str, Any]:
+    """Document drawer: masked file name, stage timeline, its LLM calls."""
+    service = _service(request)
+    return await _answer(
+        service,
+        lambda: service.document(ws, doc_id),
+        {"doc": None, "failures": [], "calls": [], "calls_available": False},
+    )
+
+
+@router.get("/events")
+async def events(
+    request: Request,
+    from_: Optional[str] = Query(None, alias="from", max_length=40),
+    to: Optional[str] = Query(None, max_length=40),
+    kinds: Optional[str] = Query(None, max_length=256),
+) -> dict[str, Any]:
+    """Timeline markers: system events merged with ops actions, newest first."""
+    service = _service(request)
+    now = datetime.now(timezone.utc)
+
+    async def call() -> dict[str, Any]:
+        end = _parse_time(to, now)
+        start = _parse_time(from_, end - timedelta(hours=6))
+        wanted = sorted(_csv_set(kinds)) or None
+        return await service.events(start, end, wanted)
+
+    return await _answer(
+        service,
+        call,
+        {"items": [], "kinds": [*EVENT_KINDS, AUDIT_EVENT_KIND]},
+        needs_docs=False,
+    )
