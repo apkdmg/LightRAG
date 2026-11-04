@@ -47,6 +47,8 @@ from lightrag.exceptions import (
 from lightrag.kg.shared_storage import get_namespace_data, get_namespace_lock
 from lightrag.operate import merge_nodes_and_edges
 from lightrag.usage import document_usage_fields, emit_event, run_in_usage_scope
+from lightrag.api.ops.context import background_log_context
+from lightrag.api.ops.redact import mask_path, redact_traceback
 from lightrag.provider_rejection import (
     EXTRACT_ROLE,
     VISION_ROLE,
@@ -804,7 +806,7 @@ class _PipelineMixin:
                     duplicate_kind = attempt.get("duplicate_kind") or "filename"
                     logger.warning(
                         f"Duplicate document detected ({duplicate_kind}): "
-                        f"{doc_id} ({file_path})"
+                        f"{doc_id} ({mask_path(file_path)})"
                     )
 
                     # Create a new record with unique ID for this duplicate attempt
@@ -1018,7 +1020,15 @@ class _PipelineMixin:
         3. Split document content into chunks
         4. Process each chunk for entity and relation extraction
         5. Update the document status
+
+        The run processes documents enqueued by other requests too, so its
+        log lines carry this workspace but not the triggering request's ID.
         """
+        with background_log_context(self.workspace):
+            await self._process_enqueued_documents()
+
+    async def _process_enqueued_documents(self) -> None:
+        """Body of :meth:`apipeline_process_enqueue_documents`."""
         pipeline_status = await get_namespace_data(
             "pipeline_status", workspace=self.workspace
         )
@@ -1352,7 +1362,10 @@ class _PipelineMixin:
                         log_message = (
                             f"Deleted inconsistent entry: {doc_id} ({file_path})"
                         )
-                        logger.info(log_message)
+                        logger.info(
+                            f"Deleted inconsistent entry: {doc_id} "
+                            f"({mask_path(file_path)})"
+                        )
                         pipeline_status["latest_message"] = log_message
                         pipeline_status["history_messages"].append(log_message)
 
@@ -1772,11 +1785,16 @@ class _PipelineMixin:
                     current_file_number = ctx.processed_count
                     ctx.pipeline_status["cur_batch"] = ctx.processed_count
 
+                    # The status feed is the owner's own view and keeps the
+                    # file name; the server log gets the doc_id and a mask.
                     log_message = (
                         f"Extracting stage {current_file_number}/"
                         f"{ctx.total_files}: {file_path}"
                     )
-                    logger.info(log_message)
+                    logger.info(
+                        f"Extracting stage {current_file_number}/"
+                        f"{ctx.total_files}: {doc_id} ({mask_path(file_path)})"
+                    )
                     ctx.pipeline_status["history_messages"].append(log_message)
                     log_message = f"Processing d-id: {doc_id}"
                     logger.info(log_message)
@@ -2224,7 +2242,11 @@ class _PipelineMixin:
                             f"{current_file_number}/{ctx.total_files}: "
                             f"{file_path}"
                         )
-                        logger.info(log_message)
+                        logger.info(
+                            f"Completed processing file "
+                            f"{current_file_number}/{ctx.total_files}: "
+                            f"{doc_id} ({mask_path(file_path)})"
+                        )
                         ctx.pipeline_status["latest_message"] = log_message
                         ctx.pipeline_status["history_messages"].append(log_message)
 
@@ -2570,36 +2592,36 @@ class _PipelineMixin:
         flushes the LLM response cache, and writes a FAILED status row that
         preserves the failed chunks snapshot and processing-time metadata.
         """
+        # The pipeline status feed is the workspace owner's own view, so it
+        # keeps the file name; the server log gets the doc_id and a masked name.
+        progress = f"{current_file_number}/{total_files}"
+        log_ref = f"{doc_id} ({mask_path(file_path)})"
         if isinstance(error, PipelineCancelledException):
             if stage_label == "merge":
-                error_msg = (
-                    f"User cancelled during merge {current_file_number}/"
-                    f"{total_files}: {file_path}"
-                )
+                error_msg = f"User cancelled during merge {progress}: {file_path}"
+                log_msg = f"User cancelled during merge {progress}: {log_ref}"
             else:
-                error_msg = (
-                    f"User cancelled {current_file_number}/{total_files}: {file_path}"
-                )
-            logger.warning(error_msg)
+                error_msg = f"User cancelled {progress}: {file_path}"
+                log_msg = f"User cancelled {progress}: {log_ref}"
+            logger.warning(log_msg)
             async with pipeline_status_lock:
                 pipeline_status["latest_message"] = error_msg
                 pipeline_status["history_messages"].append(error_msg)
         else:
-            logger.error(traceback.format_exc())
+            error_trace = traceback.format_exc()
+            logger.error(error_trace)
             if stage_label == "merge":
-                error_msg = (
-                    f"Merging stage failed in document "
-                    f"{current_file_number}/{total_files}: {file_path}"
-                )
+                error_msg = f"Merging stage failed in document {progress}: {file_path}"
+                log_msg = f"Merging stage failed in document {progress}: {log_ref}"
             else:
-                error_msg = (
-                    f"Failed to extract document "
-                    f"{current_file_number}/{total_files}: {file_path}"
-                )
-            logger.error(error_msg)
+                error_msg = f"Failed to extract document {progress}: {file_path}"
+                log_msg = f"Failed to extract document {progress}: {log_ref}"
+            logger.error(log_msg)
             async with pipeline_status_lock:
                 pipeline_status["latest_message"] = error_msg
-                pipeline_status["history_messages"].append(traceback.format_exc())
+                pipeline_status["history_messages"].append(
+                    redact_traceback(error_trace)
+                )
                 pipeline_status["history_messages"].append(error_msg)
 
         for task in pending_tasks:
@@ -2665,7 +2687,8 @@ class _PipelineMixin:
             p = Path(source_path)
             if not (p.exists() and p.is_file() and p.suffix.lower() == ".docx"):
                 raise ValueError(
-                    f"Native parser does not support pending file: {file_path}"
+                    "Native parser does not support pending file: "
+                    f"{mask_path(file_path)}"
                 )
 
             # Lazy imports keep this module import-cheap and avoid pulling
@@ -2742,7 +2765,9 @@ class _PipelineMixin:
                 # pre-created (empty) dirs would persist.
                 if parsed_dir.exists():
                     shutil.rmtree(parsed_dir, ignore_errors=True)
-                raise ValueError(f"DOCX parser returned empty content for {file_path}")
+                raise ValueError(
+                    f"DOCX parser returned empty content for {mask_path(file_path)}"
+                )
 
             missing_paraid_count = int(
                 parse_warnings.get("missing_paraid_count", 0) or 0
@@ -2788,7 +2813,8 @@ class _PipelineMixin:
             )
             await archive_docx_source_after_full_docs_sync(str(p))
             logger.info(
-                f"[parse_native] pending_parse completed for {file_path} "
+                f"[parse_native] pending_parse completed for {doc_id} "
+                f"({mask_path(file_path)}) "
                 f"via native_parser/docx"
             )
             result: dict[str, Any] = {
@@ -2852,7 +2878,9 @@ class _PipelineMixin:
             )
         )
         if not source_file_path.is_file():
-            raise FileNotFoundError(f"MinerU source file not found: {source_file_path}")
+            raise FileNotFoundError(
+                f"MinerU source file not found: {mask_path(str(source_file_path))}"
+            )
 
         # Canonicalize defensively so direct callers (tests, CLI) may pass
         # absolute paths or hint-bearing names.
@@ -2967,7 +2995,7 @@ class _PipelineMixin:
         )
         if not source_file_path.is_file():
             raise FileNotFoundError(
-                f"Docling source file not found: {source_file_path}"
+                f"Docling source file not found: {mask_path(str(source_file_path))}"
             )
 
         document_name = normalize_document_file_path(file_path)
@@ -3020,8 +3048,8 @@ class _PipelineMixin:
         ir = ir_builder.normalize_from_workdir(raw_dir, document_name=document_name)
         if not ir.blocks:
             raise ValueError(
-                f"Docling IR builder produced zero blocks for {file_path} "
-                f"(raw_dir={raw_dir})"
+                f"Docling IR builder produced zero blocks for {doc_id} "
+                f"({mask_path(file_path)})"
             )
         parsed_data = write_sidecar(
             ir,
@@ -3182,7 +3210,10 @@ class _PipelineMixin:
         archived = await archive_source_after_full_docs_sync(source_path)
         archive_msg = f"; archived to {archived}" if archived else ""
         warning = f"Duplicate content skipped after parsing: {file_path}{archive_msg}"
-        logger.warning(warning)
+        logger.warning(
+            f"Duplicate content skipped after parsing: {doc_id} "
+            f"({mask_path(file_path)}){'; archived' if archived else ''}"
+        )
         if pipeline_status is not None and pipeline_status_lock is not None:
             async with pipeline_status_lock:
                 pipeline_status["latest_message"] = warning
@@ -3851,7 +3882,7 @@ class _PipelineMixin:
             except Exception as enrich_err:
                 logger.warning(
                     f"[analyze_multimodal] surrounding enrichment failed for "
-                    f"d-id: {doc_id}, file: {file_path}: {enrich_err}"
+                    f"d-id: {doc_id}, file: {mask_path(file_path)}: {enrich_err}"
                 )
 
         try:
@@ -4192,7 +4223,8 @@ class _PipelineMixin:
                         # whole worker — record the skip and move on.
                         logger.warning(
                             f"[analyze_multimodal] table/{item_id}: missing "
-                            f"table content; skipping analysis ({file_path})"
+                            f"table content; skipping analysis "
+                            f"({mask_path(file_path)})"
                         )
                         return (
                             _skipped_result("missing table content"),

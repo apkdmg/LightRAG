@@ -19,7 +19,8 @@
       "switchToLight": "Switch to light theme",
       "switchToDark": "Switch to dark theme"
     },
-    "insights": "Insights"
+    "insights": "Insights",
+    "operations": "Operations"
   },
   "providerSettings": {
     "title": "LLM Providers",
@@ -1311,6 +1312,180 @@
       "cancel": "Cancel",
       "save": "Save",
       "saved": "Settings saved"
+    }
+  },
+  "operations": {
+    "title": "Operations",
+    "tabsLabel": "Operations sections",
+    "tab": {
+      "overview": "Overview",
+      "processing": "Processing",
+      "logs": "Logs",
+      "health": "Health",
+      "performance": "Performance",
+      "activity": "Activity"
+    },
+    "updated": "Updated {{time}}",
+    "stale": "Stale · updated {{age}} ago",
+    "stillLoading": "Still loading · {{seconds}} s",
+    "refresh": "Refresh",
+    "pauseAuto": "Auto",
+    "resumeAuto": "Resume",
+    "pauseAutoHint": "Pause automatic refresh and live animations",
+    "resumeAutoHint": "Resume automatic refresh",
+    "reduceMotion": "Reduce motion",
+    "reduceMotionBySystem": "Your system setting already reduces motion",
+    "version": "v{{version}}",
+    "openInsights": "Open Token Insights",
+    "process": {
+      "uvicorn": "uvicorn · 1 process",
+      "gunicorn_one": "gunicorn · {{count}} worker",
+      "gunicorn_other": "gunicorn · {{count}} workers",
+      "gunicornLive": "gunicorn · {{live}}/{{expected}} workers",
+      "unknown": "Process mode unknown"
+    },
+    "unavailable": {
+      "title": "Operations data is not available on this server",
+      "body": "The Operations views need PostgreSQL KV storage (LIGHTRAG_KV_STORAGE=PGKVStorage). This server uses a different KV storage, so the views will stay empty. The server itself is not affected."
+    },
+    "state": {
+      "ok": "OK",
+      "warning": "Warning",
+      "serious": "Serious",
+      "critical": "Critical",
+      "unknown": "Unknown",
+      "running": "Running",
+      "paused": "Paused",
+      "maintenance": "Maintenance"
+    },
+    "run": {
+      "running": {
+        "label": "Running",
+        "explain": "The run is making progress."
+      },
+      "paused": {
+        "label": "Paused",
+        "explain": "The LLM provider rejected requests (for example budget or rate limit). The run resumes when the pause clears."
+      },
+      "hung": {
+        "label": "Hung",
+        "explain": "The worker is alive but no document has made progress for longer than the hung threshold."
+      },
+      "orphaned": {
+        "label": "Orphaned",
+        "explain": "The worker that owned this run has exited. Busy stays set until it is released."
+      },
+      "busy_without_run": {
+        "label": "Busy without a run",
+        "explain": "The workspace is marked busy but no live run owns it, for example after an upgrade or a crash."
+      },
+      "reservation": {
+        "label": "Stranded reservation",
+        "explain": "A scan or enqueue reservation has no live owner and blocks email drains. Restart the container to clear it."
+      },
+      "stale_doc": {
+        "label": "Stale document",
+        "explain": "The document has been in progress for longer than the stale-document threshold."
+      },
+      "unresponsive": {
+        "label": "Unresponsive",
+        "explain": "The worker process exists but has stopped sending heartbeats."
+      },
+      "unknown": {
+        "label": "Unknown",
+        "explain": "The state of this run could not be determined."
+      }
+    },
+    "error": {
+      "forbidden": "Admin access required. Your session may lack the admin role.",
+      "unauthorized": "Your session has ended. Sign in again.",
+      "not_found": "Not found. The server may be running an older version.",
+      "conflict": "The state changed in the meantime. Refresh and try again.",
+      "rate_limited": "Too many requests. Wait a moment and try again.",
+      "unavailable": "The service is unavailable. A dependency may be down.",
+      "server": "The server hit an error.",
+      "bad_request": "The server rejected the request.",
+      "timeout": "The request timed out.",
+      "network": "Cannot reach the server.",
+      "aborted": "The request was cancelled.",
+      "unknown": "Something went wrong.",
+      "ref": "Ref:",
+      "copyRef": "Copy request ID",
+      "refCopied": "Request ID copied",
+      "refCopyFailed": "Could not copy the request ID",
+      "retry": "Retry",
+      "signInAgain": "Sign in again"
+    },
+    "refusal": {
+      "in_progress_by": "Another admin is already acting on this workspace.",
+      "lock_unavailable": "The workspace lock could not be taken within 2 seconds. If it stays held, restart the container.",
+      "refused_busy": "Refused: the pipeline is busy.",
+      "refused_paused": "Refused: a provider pause is active.",
+      "not_operator": "Only operators can do this.",
+      "not_busy": "Nothing to cancel: the pipeline is not busy.",
+      "nothing_pending": "Nothing is waiting in the email queue.",
+      "owner_alive": "Refused: the worker that owns the run is still alive.",
+      "cas_mismatch": "The run changed since you looked. Refresh and try again.",
+      "single_process": "Not available when the server runs as a single process.",
+      "rate_limited": "Too soon. Wait a minute and try again.",
+      "feature_disabled": "This action is turned off on this server."
+    },
+    "system": {
+      "title": "This server",
+      "checked": "Checked {{time}}",
+      "mode": "Process mode",
+      "workers": "Workers",
+      "workersLive": "{{live}} of {{expected}} reporting",
+      "workersPending": "Reported once worker heartbeats are available",
+      "storage": "Operations data",
+      "storageOk": "PostgreSQL available",
+      "storageMissing": "Not available (needs PostgreSQL KV storage)",
+      "access": "Your access",
+      "operator": "Admin and operator",
+      "adminOnly": "Admin (operator actions restricted)",
+      "version": "Version",
+      "features": "Features"
+    },
+    "feature": {
+      "durable": "Durable operations storage",
+      "runs": "Run tracking",
+      "logs": "Log viewer",
+      "probes": "Dependency probes",
+      "alerts": "Alerts",
+      "insights": "Token Insights recording",
+      "release_busy": "Release stale busy",
+      "gpu": "GPU metrics",
+      "on": "On",
+      "off": "Off",
+      "later": "Not available yet",
+      "multiWorkerOnly": "Multi-worker only"
+    },
+    "later": {
+      "note": "This section arrives in a later release.",
+      "overview": {
+        "title": "System overview",
+        "body": "The overall state, key numbers, a needs-attention list, the last 6 hours of processing and a dependency summary will appear here."
+      },
+      "processing": {
+        "title": "Processing across workspaces",
+        "body": "Active runs, stuck runs and documents, the backlog by workspace, failure analysis, the email re-sync queue and provider pauses will appear here. Until then, the Documents tab shows the pipeline of your own workspace."
+      },
+      "logs": {
+        "title": "Logs",
+        "body": "A searchable view of WARNING and ERROR log lines, redacted when they are written, will appear here. Error messages already show a Ref: request ID that matches the server log line."
+      },
+      "health": {
+        "title": "Health",
+        "body": "Dependency checks (PostgreSQL, the graph and vector stores, vLLM, Docling, SMTP and sign-in), a topology map and worker heartbeats will appear here. Until then, the status indicator at the bottom right shows this server's configuration and queues."
+      },
+      "performance": {
+        "title": "Performance",
+        "body": "LLM, embedding and rerank latency, HTTP routes, throughput and concurrency will appear here. Token use and cost stay in Token Insights."
+      },
+      "activity": {
+        "title": "Activity",
+        "body": "Alerts, the audit log of admin actions, system events and incident export will appear here."
+      }
     }
   }
 }

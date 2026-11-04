@@ -7,6 +7,7 @@ import traceback
 from fastapi import APIRouter, Depends, Query, HTTPException, Request
 from pydantic import BaseModel, Field
 
+from lightrag.api.ops.redact import text_ref
 from lightrag.utils import logger
 from ..utils_api import get_combined_auth_dependency
 
@@ -170,7 +171,7 @@ def create_graph_routes(rag, api_key: Optional[str] = None):
         try:
             return await rag.chunk_entity_relation_graph.search_labels(q, limit)
         except Exception as e:
-            logger.error(f"Error searching labels with query '{q}': {str(e)}")
+            logger.error(f"Error searching labels (query length {len(q)}): {str(e)}")
             logger.error(traceback.format_exc())
             raise HTTPException(
                 status_code=500, detail=f"Error searching labels: {str(e)}"
@@ -209,7 +210,9 @@ def create_graph_routes(rag, api_key: Optional[str] = None):
                 max_nodes=max_nodes,
             )
         except Exception as e:
-            logger.error(f"Error getting knowledge graph for label '{label}': {str(e)}")
+            logger.error(
+                f"Error getting knowledge graph for label ({text_ref(label)}): {str(e)}"
+            )
             logger.error(traceback.format_exc())
             raise HTTPException(
                 status_code=500, detail=f"Error getting knowledge graph: {str(e)}"
@@ -233,7 +236,9 @@ def create_graph_routes(rag, api_key: Optional[str] = None):
             exists = await rag.chunk_entity_relation_graph.has_node(name)
             return {"exists": exists}
         except Exception as e:
-            logger.error(f"Error checking entity existence for '{name}': {str(e)}")
+            logger.error(
+                f"Error checking entity existence for ({text_ref(name)}): {str(e)}"
+            )
             logger.error(traceback.format_exc())
             raise HTTPException(
                 status_code=500, detail=f"Error checking entity existence: {str(e)}"
@@ -419,11 +424,13 @@ def create_graph_routes(rag, api_key: Optional[str] = None):
             }
         except ValueError as ve:
             logger.error(
-                f"Validation error updating entity '{request.entity_name}': {str(ve)}"
+                f"Validation error updating entity ({text_ref(request.entity_name)}): {str(ve)}"
             )
             raise HTTPException(status_code=400, detail=str(ve))
         except Exception as e:
-            logger.error(f"Error updating entity '{request.entity_name}': {str(e)}")
+            logger.error(
+                f"Error updating entity ({text_ref(request.entity_name)}): {str(e)}"
+            )
             logger.error(traceback.format_exc())
             raise HTTPException(
                 status_code=500, detail=f"Error updating entity: {str(e)}"
@@ -452,12 +459,12 @@ def create_graph_routes(rag, api_key: Optional[str] = None):
             }
         except ValueError as ve:
             logger.error(
-                f"Validation error updating relation between '{request.source_id}' and '{request.target_id}': {str(ve)}"
+                f"Validation error updating relation between ({text_ref(request.source_id)}) and ({text_ref(request.target_id)}): {str(ve)}"
             )
             raise HTTPException(status_code=400, detail=str(ve))
         except Exception as e:
             logger.error(
-                f"Error updating relation between '{request.source_id}' and '{request.target_id}': {str(e)}"
+                f"Error updating relation between ({text_ref(request.source_id)}) and ({text_ref(request.target_id)}): {str(e)}"
             )
             logger.error(traceback.format_exc())
             raise HTTPException(
@@ -527,11 +534,13 @@ def create_graph_routes(rag, api_key: Optional[str] = None):
             }
         except ValueError as ve:
             logger.error(
-                f"Validation error creating entity '{request.entity_name}': {str(ve)}"
+                f"Validation error creating entity ({text_ref(request.entity_name)}): {str(ve)}"
             )
             raise HTTPException(status_code=400, detail=str(ve))
         except Exception as e:
-            logger.error(f"Error creating entity '{request.entity_name}': {str(e)}")
+            logger.error(
+                f"Error creating entity ({text_ref(request.entity_name)}): {str(e)}"
+            )
             logger.error(traceback.format_exc())
             raise HTTPException(
                 status_code=500, detail=f"Error creating entity: {str(e)}"
@@ -614,12 +623,12 @@ def create_graph_routes(rag, api_key: Optional[str] = None):
             }
         except ValueError as ve:
             logger.error(
-                f"Validation error creating relation between '{request.source_entity}' and '{request.target_entity}': {str(ve)}"
+                f"Validation error creating relation between ({text_ref(request.source_entity)}) and ({text_ref(request.target_entity)}): {str(ve)}"
             )
             raise HTTPException(status_code=400, detail=str(ve))
         except Exception as e:
             logger.error(
-                f"Error creating relation between '{request.source_entity}' and '{request.target_entity}': {str(e)}"
+                f"Error creating relation between ({text_ref(request.source_entity)}) and ({text_ref(request.target_entity)}): {str(e)}"
             )
             logger.error(traceback.format_exc())
             raise HTTPException(
@@ -695,12 +704,12 @@ def create_graph_routes(rag, api_key: Optional[str] = None):
             }
         except ValueError as ve:
             logger.error(
-                f"Validation error merging entities {request.entities_to_change} into '{request.entity_to_change_into}': {str(ve)}"
+                f"Validation error merging {len(request.entities_to_change)} entities into ({text_ref(request.entity_to_change_into)}): {str(ve)}"
             )
             raise HTTPException(status_code=400, detail=str(ve))
         except Exception as e:
             logger.error(
-                f"Error merging entities {request.entities_to_change} into '{request.entity_to_change_into}': {str(e)}"
+                f"Error merging {len(request.entities_to_change)} entities into ({text_ref(request.entity_to_change_into)}): {str(e)}"
             )
             logger.error(traceback.format_exc())
             raise HTTPException(

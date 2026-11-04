@@ -189,6 +189,11 @@ def main():
                 if global_args.log_level
                 else os.getenv("LOG_LEVEL", "info")
             )
+            # The module-level logconfig_dict was built at import time, before
+            # the level was known; rebuild it so LOG_LEVEL is honoured.
+            gunicorn_config.logconfig_dict = gunicorn_config.build_logconfig_dict(
+                gunicorn_config.loglevel
+            )
 
             # Timeout configuration prioritizes command line arguments
             gunicorn_config.timeout = (

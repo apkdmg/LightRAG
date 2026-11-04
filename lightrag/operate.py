@@ -58,6 +58,7 @@ from lightrag.base import (
 from lightrag.chunk_schema import strip_internal_multimodal_markup_for_extraction
 from lightrag.prompt import PROMPTS, resolve_entity_extraction_prompt_profile
 from lightrag.usage import run_in_usage_scope
+from lightrag.api.ops.redact import text_ref
 from lightrag.constants import (
     GRAPH_FIELD_SEP,
     DEFAULT_MAX_ENTITY_TOKENS,
@@ -522,7 +523,7 @@ def _handle_single_entity_extraction(
 
         if not entity_description.strip():
             logger.warning(
-                f"Entity extraction error: empty description for entity '{entity_name}' of type '{entity_type}'"
+                f"Entity extraction error: empty description for entity ({text_ref(entity_name)}) of type '{entity_type}'"
             )
             return None
 
@@ -738,7 +739,7 @@ async def _process_json_extraction_result(
                 for char in ["'", "(", ")", "<", ">", "|", "/", "\\"]
             ):
                 logger.warning(
-                    f"{chunk_key}: Invalid entity type '{entity_type}' for entity '{entity_name}'"
+                    f"{chunk_key}: Invalid entity type '{entity_type}' for entity ({text_ref(entity_name)})"
                 )
                 continue
 
@@ -749,7 +750,7 @@ async def _process_json_extraction_result(
             )
             if not entity_description.strip():
                 logger.warning(
-                    f"{chunk_key}: Empty description for entity '{entity_name}'"
+                    f"{chunk_key}: Empty description for entity ({text_ref(entity_name)})"
                 )
                 continue
 
@@ -1192,7 +1193,10 @@ async def _get_cached_extraction_results(
             if llm_cache_list:
                 all_cache_ids.update(llm_cache_list)
         else:
-            logger.warning(f"Chunk data is invalid or None: {chunk_data}")
+            logger.warning(
+                "Chunk data is invalid or None "
+                f"(type={type(chunk_data).__name__}, {text_ref(chunk_data)})"
+            )
 
     if not all_cache_ids:
         logger.warning(f"No LLM cache IDs found for {len(chunk_ids)} chunk IDs")
@@ -1554,13 +1558,14 @@ async def _rebuild_single_entity(
 
     if not all_entity_data:
         logger.warning(
-            f"No entity data found for `{entity_name}`, trying to rebuild from relationships"
+            f"No entity data found for entity ({text_ref(entity_name)}), "
+            "trying to rebuild from relationships"
         )
 
         # Get all edges connected to this entity
         edges = await knowledge_graph_inst.get_node_edges(entity_name)
         if not edges:
-            logger.warning(f"No relations attached to entity `{entity_name}`")
+            logger.warning(f"No relations attached to entity ({text_ref(entity_name)})")
             return
 
         # Collect relationship data to extract entity information
@@ -1640,7 +1645,7 @@ async def _rebuild_single_entity(
             f"...{file_path_placeholder}...({limit_method} {max_file_paths}/{original_count})"
         )
         logger.info(
-            f"Limited `{entity_name}`: file_path {original_count} -> {max_file_paths} ({limit_method})"
+            f"Limited ({text_ref(entity_name)}): file_path {original_count} -> {max_file_paths} ({limit_method})"
         )
 
     # Remove duplicates while preserving order
@@ -1756,7 +1761,9 @@ async def _rebuild_single_relationship(
                     )
 
     if not all_relationship_data:
-        logger.warning(f"No relation data found for `{src}-{tgt}`")
+        logger.warning(
+            f"No relation data found for ({text_ref(src)} ~ {text_ref(tgt)})"
+        )
         return
 
     # Merge descriptions and keywords
@@ -1799,7 +1806,7 @@ async def _rebuild_single_relationship(
             f"...{file_path_placeholder}...({limit_method} {max_file_paths}/{original_count})"
         )
         logger.info(
-            f"Limited `{src}`~`{tgt}`: file_path {original_count} -> {max_file_paths} ({limit_method})"
+            f"Limited ({text_ref(src)} ~ {text_ref(tgt)}): file_path {original_count} -> {max_file_paths} ({limit_method})"
         )
 
     # Remove duplicates while preserving order
@@ -2094,16 +2101,16 @@ async def _merge_nodes_then_upsert(
         ):
             if already_node:
                 logger.info(
-                    f"Skipped `{entity_name}`: KEEP old chunks {already_source_ids}/{len(full_source_ids)}"
+                    f"Skipped ({text_ref(entity_name)}): KEEP old chunks {already_source_ids}/{len(full_source_ids)}"
                 )
                 existing_node_data = dict(already_node)
                 return existing_node_data
             else:
                 logger.error(
-                    f"Internal Error: already_node missing for `{entity_name}`"
+                    f"Internal Error: already_node missing for ({text_ref(entity_name)})"
                 )
                 raise ValueError(
-                    f"Internal Error: already_node missing for `{entity_name}`"
+                    f"Internal Error: already_node missing for ({text_ref(entity_name)})"
                 )
 
         # 6.1 Finalize source_id
@@ -2140,7 +2147,8 @@ async def _merge_nodes_then_upsert(
         if not description_list:
             fallback_description = f"Entity {entity_name}"
             logger.warning(
-                f"Entity `{entity_name}` has no description; fallback to `{fallback_description}`"
+                f"Entity ({text_ref(entity_name)}) has no description; "
+                "falling back to its name"
             )
             description_list = [fallback_description]
 
@@ -2214,7 +2222,7 @@ async def _merge_nodes_then_upsert(
                 file_paths_list.append(f"...{file_path_placeholder}...(KEEP Old)")
 
             logger.info(
-                f"Limited `{entity_name}`: file_path {original_count_str} -> {max_file_paths} ({limit_method})"
+                f"Limited ({text_ref(entity_name)}): file_path {original_count_str} -> {max_file_paths} ({limit_method})"
             )
         # Finalize file_path
         file_path = GRAPH_FIELD_SEP.join(file_paths_list)
@@ -2439,16 +2447,16 @@ async def _merge_edges_then_upsert(
         ):
             if already_edge:
                 logger.info(
-                    f"Skipped `{src_id}`~`{tgt_id}`: KEEP old chunks  {already_source_ids}/{len(full_source_ids)}"
+                    f"Skipped ({text_ref(src_id)} ~ {text_ref(tgt_id)}): KEEP old chunks  {already_source_ids}/{len(full_source_ids)}"
                 )
                 existing_edge_data = dict(already_edge)
                 return existing_edge_data
             else:
                 logger.error(
-                    f"Internal Error: already_node missing for `{src_id}`~`{tgt_id}`"
+                    f"Internal Error: already_node missing for ({text_ref(src_id)} ~ {text_ref(tgt_id)})"
                 )
                 raise ValueError(
-                    f"Internal Error: already_node missing for `{src_id}`~`{tgt_id}`"
+                    f"Internal Error: already_node missing for ({text_ref(src_id)} ~ {text_ref(tgt_id)})"
                 )
 
         # 6.1 Finalize source_id
@@ -2496,8 +2504,11 @@ async def _merge_edges_then_upsert(
         # Combine already_description with sorted new descriptions
         description_list = already_description + sorted_descriptions
         if not description_list:
-            logger.error(f"Relation {src_id}~{tgt_id} has no description")
-            raise ValueError(f"Relation {src_id}~{tgt_id} has no description")
+            # Entity names are personal data; the failure path logs the
+            # traceback, so the exception text must not carry them either.
+            relation_ref = f"({text_ref(src_id)} ~ {text_ref(tgt_id)})"
+            logger.error(f"Relation {relation_ref} has no description")
+            raise ValueError(f"Relation {relation_ref} has no description")
 
         # Check for cancellation before LLM summary
         if pipeline_status is not None and pipeline_status_lock is not None:
@@ -2567,7 +2578,7 @@ async def _merge_edges_then_upsert(
                 file_paths_list.append(f"...{file_path_placeholder}...(KEEP Old)")
 
             logger.info(
-                f"Limited `{src_id}`~`{tgt_id}`: file_path {original_count_str} -> {max_file_paths} ({limit_method})"
+                f"Limited ({text_ref(src_id)} ~ {text_ref(tgt_id)}): file_path {original_count_str} -> {max_file_paths} ({limit_method})"
             )
         # Finalize file_path
         file_path = GRAPH_FIELD_SEP.join(file_paths_list)
@@ -3801,7 +3812,9 @@ async def kg_query(
         logger.warning("high_level_keywords is empty")
     if hl_keywords == [] and ll_keywords == []:
         if len(query) < 50:
-            logger.warning(f"Forced low_level_keywords to origin query: {query}")
+            logger.warning(
+                f"Forced low_level_keywords to the original query (len={len(query)})"
+            )
             ll_keywords = [query]
         else:
             return QueryResult(content=PROMPTS["fail_response"])
@@ -4407,7 +4420,10 @@ async def _perform_kg_search(
                         "order": i + 1,  # 1-based order in vector search results
                     }
                 else:
-                    logger.warning(f"Vector chunk missing chunk_id: {chunk}")
+                    logger.warning(
+                        "Vector chunk missing chunk_id "
+                        f"(len={len(str(chunk.get('content') or ''))})"
+                    )
 
     # Round-robin merge entities
     final_entities = []
@@ -5062,7 +5078,7 @@ async def _get_node_data(
     query_embedding=None,
 ):
     logger.info(
-        f"Query nodes: {query} (top_k:{query_param.top_k}, cosine:{entities_vdb.cosine_better_than_threshold})"
+        f"Query nodes: ({text_ref(query)}) (top_k:{query_param.top_k}, cosine:{entities_vdb.cosine_better_than_threshold})"
     )
 
     results = await entities_vdb.query(
@@ -5412,7 +5428,9 @@ async def _find_most_related_entities_from_relationships(
     for entity_name in entity_names:
         node = nodes_dict.get(entity_name)
         if node is None:
-            logger.warning(f"Node '{entity_name}' not found in batch retrieval.")
+            logger.warning(
+                f"Node ({text_ref(entity_name)}) not found in batch retrieval."
+            )
             continue
         # Combine the node data with the entity name, no rank needed
         combined = {**node, "entity_name": entity_name}

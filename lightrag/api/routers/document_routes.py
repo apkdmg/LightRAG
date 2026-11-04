@@ -44,6 +44,8 @@ from lightrag.utils import (
     generate_track_id,
     move_file_to_parsed_dir,
 )
+from lightrag.api.ops.context import bind_log_workspace
+from lightrag.api.ops.redact import mask_path
 from lightrag.api.utils_api import get_combined_auth_dependency
 from ..config import global_args
 
@@ -943,7 +945,9 @@ def validate_file_path_security(file_path_str: str, base_dir: Path) -> Optional[
         return candidate_path
 
     except (OSError, ValueError, Exception) as e:
-        logger.warning(f"Invalid file path detected: {file_path_str} - {str(e)}")
+        logger.warning(
+            f"Invalid file path detected: {mask_path(file_path_str)} - {str(e)}"
+        )
         return None
 
 
@@ -1645,7 +1649,7 @@ async def pipeline_enqueue_file(
             ]
             await rag.apipeline_enqueue_error_documents(error_files, track_id)
             logger.error(
-                f"[File Extraction]Invalid filename hint in {file_path.name}: {e}"
+                f"[File Extraction]Invalid filename hint in {mask_path(file_path.name)}: {e}"
             )
             return False, track_id
 
@@ -1668,11 +1672,11 @@ async def pipeline_enqueue_file(
                         await move_file_to_parsed_dir(file_path)
                     except Exception as move_error:
                         logger.error(
-                            f"Failed to move duplicate file {file_path.name} to {PARSED_DIR_NAME} directory: {move_error}"
+                            f"Failed to move duplicate file {mask_path(file_path.name)} to {PARSED_DIR_NAME} directory: {move_error}"
                         )
                     return False, track_id
                 logger.info(
-                    f"[File Extraction]Deferred {file_path.name} to {extraction_engine} parser"
+                    f"[File Extraction]Deferred {mask_path(file_path.name)} to {extraction_engine} parser"
                 )
                 return True, track_id
             except Exception as e:
@@ -1686,7 +1690,7 @@ async def pipeline_enqueue_file(
                 ]
                 await rag.apipeline_enqueue_error_documents(error_files, track_id)
                 logger.error(
-                    f"[File Extraction]Error enqueuing {file_path.name} for {extraction_engine}: {str(e)}"
+                    f"[File Extraction]Error enqueuing {mask_path(file_path.name)} for {extraction_engine}: {str(e)}"
                 )
                 return False, track_id
 
@@ -1705,7 +1709,7 @@ async def pipeline_enqueue_file(
             ]
             await rag.apipeline_enqueue_error_documents(error_files, track_id)
             logger.error(
-                f"[File Extraction]Permission denied reading file: {file_path.name}"
+                f"[File Extraction]Permission denied reading file: {mask_path(file_path.name)}"
             )
             return False, track_id
         except FileNotFoundError as e:
@@ -1718,7 +1722,9 @@ async def pipeline_enqueue_file(
                 }
             ]
             await rag.apipeline_enqueue_error_documents(error_files, track_id)
-            logger.error(f"[File Extraction]File not found: {file_path.name}")
+            logger.error(
+                f"[File Extraction]File not found: {mask_path(file_path.name)}"
+            )
             return False, track_id
         except Exception as e:
             error_files = [
@@ -1731,7 +1737,7 @@ async def pipeline_enqueue_file(
             ]
             await rag.apipeline_enqueue_error_documents(error_files, track_id)
             logger.error(
-                f"[File Extraction]Error reading file {file_path.name}: {str(e)}"
+                f"[File Extraction]Error reading file {mask_path(file_path.name)}: {str(e)}"
             )
             return False, track_id
 
@@ -1794,7 +1800,7 @@ async def pipeline_enqueue_file(
                                 error_files, track_id
                             )
                             logger.error(
-                                f"[File Extraction]Empty content in file: {file_path.name}"
+                                f"[File Extraction]Empty content in file: {mask_path(file_path.name)}"
                             )
                             return False, track_id
 
@@ -1812,7 +1818,7 @@ async def pipeline_enqueue_file(
                                 error_files, track_id
                             )
                             logger.error(
-                                f"[File Extraction]File {file_path.name} appears to contain binary data representation instead of text"
+                                f"[File Extraction]File {mask_path(file_path.name)} appears to contain binary data representation instead of text"
                             )
                             return False, track_id
 
@@ -1829,7 +1835,7 @@ async def pipeline_enqueue_file(
                             error_files, track_id
                         )
                         logger.error(
-                            f"[File Extraction]File {file_path.name} is not valid UTF-8 encoded text. Please convert it to UTF-8 before processing."
+                            f"[File Extraction]File {mask_path(file_path.name)} is not valid UTF-8 encoded text. Please convert it to UTF-8 before processing."
                         )
                         return False, track_id
 
@@ -1853,7 +1859,7 @@ async def pipeline_enqueue_file(
                             error_files, track_id
                         )
                         logger.error(
-                            f"[File Extraction]Error processing PDF {file_path.name}: {str(e)}"
+                            f"[File Extraction]Error processing PDF {mask_path(file_path.name)}: {str(e)}"
                         )
                         return False, track_id
 
@@ -1873,7 +1879,7 @@ async def pipeline_enqueue_file(
                             error_files, track_id
                         )
                         logger.error(
-                            f"[File Extraction]Error processing DOCX {file_path.name}: {str(e)}"
+                            f"[File Extraction]Error processing DOCX {mask_path(file_path.name)}: {str(e)}"
                         )
                         return False, track_id
 
@@ -1893,7 +1899,7 @@ async def pipeline_enqueue_file(
                             error_files, track_id
                         )
                         logger.error(
-                            f"[File Extraction]Error processing PPTX {file_path.name}: {str(e)}"
+                            f"[File Extraction]Error processing PPTX {mask_path(file_path.name)}: {str(e)}"
                         )
                         return False, track_id
 
@@ -1913,7 +1919,7 @@ async def pipeline_enqueue_file(
                             error_files, track_id
                         )
                         logger.error(
-                            f"[File Extraction]Error processing XLSX {file_path.name}: {str(e)}"
+                            f"[File Extraction]Error processing XLSX {mask_path(file_path.name)}: {str(e)}"
                         )
                         return False, track_id
 
@@ -1928,7 +1934,7 @@ async def pipeline_enqueue_file(
                     ]
                     await rag.apipeline_enqueue_error_documents(error_files, track_id)
                     logger.error(
-                        f"[File Extraction]Unsupported file type: {file_path.name} (extension {ext})"
+                        f"[File Extraction]Unsupported file type: {mask_path(file_path.name)} (extension {ext})"
                     )
                     return False, track_id
 
@@ -1943,7 +1949,7 @@ async def pipeline_enqueue_file(
             ]
             await rag.apipeline_enqueue_error_documents(error_files, track_id)
             logger.error(
-                f"[File Extraction]Unexpected error during {file_path.name} extracting: {str(e)}"
+                f"[File Extraction]Unexpected error during {mask_path(file_path.name)} extracting: {str(e)}"
             )
             return False, track_id
 
@@ -1961,7 +1967,7 @@ async def pipeline_enqueue_file(
                 ]
                 await rag.apipeline_enqueue_error_documents(error_files, track_id)
                 logger.warning(
-                    f"[File Extraction]File contains only whitespace characters: {file_path.name}"
+                    f"[File Extraction]File contains only whitespace characters: {mask_path(file_path.name)}"
                 )
                 return False, track_id
 
@@ -1981,12 +1987,12 @@ async def pipeline_enqueue_file(
                         await move_file_to_parsed_dir(file_path)
                     except Exception as move_error:
                         logger.error(
-                            f"Failed to move duplicate file {file_path.name} to {PARSED_DIR_NAME} directory: {move_error}"
+                            f"Failed to move duplicate file {mask_path(file_path.name)} to {PARSED_DIR_NAME} directory: {move_error}"
                         )
                     return False, track_id
 
                 logger.info(
-                    f"Successfully extracted and enqueued file: {file_path.name}"
+                    f"Successfully extracted and enqueued file: {mask_path(file_path.name)}"
                 )
 
                 # Move file to __parsed__ directory after enqueuing (LR2-PRD: parsed output dir)
@@ -1994,7 +2000,7 @@ async def pipeline_enqueue_file(
                     await move_file_to_parsed_dir(file_path)
                 except Exception as move_error:
                     logger.error(
-                        f"Failed to move file {file_path.name} to {PARSED_DIR_NAME} directory: {move_error}"
+                        f"Failed to move file {mask_path(file_path.name)} to {PARSED_DIR_NAME} directory: {move_error}"
                     )
                     # Don't affect the main function's success status
 
@@ -2010,7 +2016,9 @@ async def pipeline_enqueue_file(
                     }
                 ]
                 await rag.apipeline_enqueue_error_documents(error_files, track_id)
-                logger.error(f"Error enqueueing document {file_path.name}: {str(e)}")
+                logger.error(
+                    f"Error enqueueing document {mask_path(file_path.name)}: {str(e)}"
+                )
                 return False, track_id
         else:
             error_files = [
@@ -2022,7 +2030,7 @@ async def pipeline_enqueue_file(
                 }
             ]
             await rag.apipeline_enqueue_error_documents(error_files, track_id)
-            logger.error(f"No content extracted from file: {file_path.name}")
+            logger.error(f"No content extracted from file: {mask_path(file_path.name)}")
             return False, track_id
 
     except Exception as e:
@@ -2041,7 +2049,7 @@ async def pipeline_enqueue_file(
             }
         ]
         await rag.apipeline_enqueue_error_documents(error_files, track_id)
-        logger.error(f"Enqueuing file {file_path.name} error: {str(e)}")
+        logger.error(f"Enqueuing file {mask_path(file_path.name)} error: {str(e)}")
         logger.error(traceback.format_exc())
         return False, track_id
     finally:
@@ -2049,7 +2057,7 @@ async def pipeline_enqueue_file(
             try:
                 file_path.unlink()
             except Exception as e:
-                logger.error(f"Error deleting file {file_path}: {str(e)}")
+                logger.error(f"Error deleting file {mask_path(file_path)}: {str(e)}")
 
 
 async def pipeline_index_file(rag: LightRAG, file_path: Path, track_id: str = None):
@@ -2066,7 +2074,7 @@ async def pipeline_index_file(rag: LightRAG, file_path: Path, track_id: str = No
             await rag.apipeline_process_enqueue_documents()
 
     except Exception as e:
-        logger.error(f"Error indexing file {file_path.name}: {str(e)}")
+        logger.error(f"Error indexing file {mask_path(file_path.name)}: {str(e)}")
         logger.error(traceback.format_exc())
 
 
@@ -2227,7 +2235,7 @@ async def run_scanning_process(
                         await move_file_to_parsed_dir(duplicate)
                     except Exception as move_error:
                         logger.error(
-                            f"Failed to move duplicate scan file {duplicate.name} to {PARSED_DIR_NAME}: {move_error}"
+                            f"Failed to move duplicate scan file {mask_path(duplicate.name)} to {PARSED_DIR_NAME}: {move_error}"
                         )
 
             # Partition unique_files into:
@@ -2279,7 +2287,7 @@ async def run_scanning_process(
                         await move_file_to_parsed_dir(file_path)
                     except Exception as move_error:
                         logger.error(
-                            f"Failed to move already processed file {filename} to {PARSED_DIR_NAME}: {move_error}"
+                            f"Failed to move already processed file {mask_path(filename)} to {PARSED_DIR_NAME}: {move_error}"
                         )
                 elif existing_doc_data:
                     # FAILED rows recorded by apipeline_enqueue_error_documents
@@ -2300,7 +2308,7 @@ async def run_scanning_process(
                                 logger.error(
                                     "Failed to delete stale failed-extraction "
                                     f"doc_status stub {existing_doc_id} "
-                                    f"({filename}): {delete_error}"
+                                    f"({mask_path(filename)}): {delete_error}"
                                 )
                                 # Fall through to resume — at worst the row
                                 # remains preserved (current behaviour) rather
@@ -2309,14 +2317,14 @@ async def run_scanning_process(
                                 continue
                             logger.info(
                                 "Retrying previously failed extraction; "
-                                f"removed stale doc_status stub: {filename} "
+                                f"removed stale doc_status stub: {mask_path(filename)} "
                                 f"(doc_id: {existing_doc_id})"
                             )
                             new_files.append(file_path)
                             continue
                     logger.info(
                         "Resuming previously unfinished file from scan: "
-                        f"{filename} (Status: {status_value})"
+                        f"{mask_path(filename)} (Status: {status_value})"
                     )
                     resume_files.append(file_path)
                 else:
@@ -2432,7 +2440,7 @@ async def background_delete_documents(
             {
                 # Job name can not be changed, it's verified in adelete_by_doc_id()
                 "job_name": f"Deleting {total_docs} Documents",
-                "job_start": datetime.now().isoformat(),
+                "job_start": datetime.now(timezone.utc).isoformat(),
                 "docs": total_docs,
                 "batchs": total_docs,
                 "cur_batch": 0,
@@ -2623,6 +2631,7 @@ def create_document_routes(
         from ..dependencies import resolve_workspace_from_request
 
         workspace = await resolve_workspace_from_request(http_request)
+        bind_log_workspace(workspace)
         return await workspace_manager.get_instance(workspace)
 
     async def resolve_doc_manager(http_request):
@@ -2635,6 +2644,7 @@ def create_document_routes(
         from ..dependencies import resolve_workspace_from_request
 
         workspace = await resolve_workspace_from_request(http_request)
+        bind_log_workspace(workspace)
         cached = _workspace_doc_managers.get(workspace)
         # A deleted workspace's input directory is gone; start afresh.
         if cached is None or not cached.input_dir.exists():
@@ -2895,7 +2905,7 @@ def create_document_routes(
                 else:
                     # If size not available, we'll check during streaming
                     logger.debug(
-                        f"File size not available in UploadFile for {safe_filename}, will check during streaming"
+                        f"File size not available in UploadFile for {mask_path(safe_filename)}, will check during streaming"
                     )
 
             file_path = doc_manager.input_dir / safe_filename
@@ -2968,7 +2978,7 @@ def create_document_routes(
                     file_path.unlink()
                 except Exception as cleanup_error:
                     logger.error(
-                        f"Error cleaning up oversized file {safe_filename}: {cleanup_error}"
+                        f"Error cleaning up oversized file {mask_path(safe_filename)}: {cleanup_error}"
                     )
 
                 raise HTTPException(
@@ -3007,7 +3017,9 @@ def create_document_routes(
             # Re-raise HTTP exceptions (400, 413, etc.)
             raise
         except Exception as e:
-            logger.error(f"Error /documents/upload: {file.filename}: {str(e)}")
+            logger.error(
+                f"Error /documents/upload: {mask_path(file.filename)}: {str(e)}"
+            )
             logger.error(traceback.format_exc())
             raise HTTPException(status_code=500, detail=str(e))
         finally:
@@ -3294,7 +3306,7 @@ def create_document_routes(
             pipeline_status.update(
                 {
                     "job_name": "Clearing Documents",
-                    "job_start": datetime.now().isoformat(),
+                    "job_start": datetime.now(timezone.utc).isoformat(),
                     "docs": 0,
                     "batchs": 0,
                     "cur_batch": 0,
@@ -3393,7 +3405,9 @@ def create_document_routes(
                         file_path.unlink()
                         deleted_files_count += 1
                     except Exception as e:
-                        logger.error(f"Error deleting file {file_path}: {str(e)}")
+                        logger.error(
+                            f"Error deleting file {mask_path(file_path)}: {str(e)}"
+                        )
                         file_errors_count += 1
 
             # Log file deletion results

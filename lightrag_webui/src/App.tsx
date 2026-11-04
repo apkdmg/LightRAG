@@ -6,6 +6,8 @@ import StatusIndicator from '@/components/status/StatusIndicator'
 import { SiteInfo, webuiPrefix } from '@/lib/constants'
 import { useBackendState, useAuthStore } from '@/stores/state'
 import { useSettingsStore } from '@/stores/settings'
+import { useAdminCapability } from '@/hooks/useAdminCapability'
+import { hasOpsMarker } from '@/features/Operations/hashState'
 import { getAuthStatus } from '@/api/lightrag'
 import SiteHeader from '@/features/SiteHeader'
 import { InvalidApiKeyError, RequireApiKeError } from '@/api/lightrag'
@@ -21,12 +23,16 @@ import { Tabs, TabsContent } from '@/components/ui/Tabs'
 
 // Charts and animation libraries load only when an admin opens the tab.
 const TokenInsights = lazy(() => import('@/features/TokenInsights'))
+const Operations = lazy(() => import('@/features/Operations'))
+
+const ADMIN_TABS = ['insights', 'operations']
 
 function App() {
   const message = useBackendState.use.message()
   const enableHealthCheck = useSettingsStore.use.enableHealthCheck()
   const currentTab = useSettingsStore.use.currentTab()
-  const isAdmin = useAuthStore((state) => state.role === 'admin')
+  // true / false, or null while an SSO session without a known role asks the server.
+  const isAdmin = useAdminCapability()
   const [apiKeyAlertOpen, setApiKeyAlertOpen] = useState(false)
   const [initializing, setInitializing] = useState(true) // Add initializing state
   const versionCheckRef = useRef(false); // Prevent duplicate calls in Vite dev mode
@@ -156,16 +162,20 @@ function App() {
     checkVersion();
   }, []); // Empty dependency array ensures it only runs once on mount
 
-  // Links from alert emails open the Insights tab directly.
+  // Links from alert emails open the Insights or Operations tab directly.
   useEffect(() => {
-    if (isAdmin && window.location.hash.includes('insights=1')) {
+    if (isAdmin !== true) return
+    if (hasOpsMarker(window.location.hash)) {
+      useSettingsStore.getState().setCurrentTab('operations')
+    } else if (window.location.hash.includes('insights=1')) {
       useSettingsStore.getState().setCurrentTab('insights')
     }
   }, [isAdmin])
 
   // The remembered tab may belong to an admin who has logged out on this browser.
+  // Only a definite "no" moves the user; while the server is still being asked, wait.
   useEffect(() => {
-    if (currentTab === 'insights' && !isAdmin) {
+    if (ADMIN_TABS.includes(currentTab) && isAdmin === false) {
       useSettingsStore.getState().setCurrentTab('documents')
     }
   }, [currentTab, isAdmin])
@@ -221,7 +231,7 @@ function App() {
           // Main content after initialization
           <main className="flex h-screen w-screen overflow-hidden">
             <Tabs
-              defaultValue={currentTab}
+              value={currentTab}
               className="!m-0 flex grow flex-col !p-0 overflow-hidden"
               onValueChange={handleTabChange}
             >
@@ -247,6 +257,16 @@ function App() {
                     {currentTab === 'insights' && (
                       <Suspense fallback={null}>
                         <TokenInsights />
+                      </Suspense>
+                    )}
+                  </TabsContent>
+                )}
+                {isAdmin && (
+                  <TabsContent value="operations" className="absolute top-0 right-0 bottom-0 left-0 overflow-hidden">
+                    {/* Mounted only while current: nothing polls from a hidden tab. */}
+                    {currentTab === 'operations' && (
+                      <Suspense fallback={null}>
+                        <Operations />
                       </Suspense>
                     )}
                   </TabsContent>

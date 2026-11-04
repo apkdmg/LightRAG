@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional
 from uuid import uuid4
 
+from lightrag.api.ops.context import background_log_context
 from lightrag.utils import logger
 
 _SUBDIR = ".email_resync_queue"
@@ -157,6 +158,11 @@ class DeferredResyncQueue:
 
     # -- draining --------------------------------------------------------
     async def _drain(self, workspace: str) -> None:
+        # The drainer outlives the request that queued the first email.
+        with background_log_context(workspace):
+            await self._drain_loop(workspace)
+
+    async def _drain_loop(self, workspace: str) -> None:
         backoff = self._min_backoff
         directory = self._dir(workspace)
         while not self._closed:

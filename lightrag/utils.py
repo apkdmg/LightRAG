@@ -354,19 +354,38 @@ statistic_data = {"llm_call": 0, "llm_cache": 0, "embed_call": 0}
 
 
 class LightragPathFilter(logging.Filter):
-    """Filter for lightrag logger to filter out frequent path access logs"""
+    """Drop access-log lines for successful polling requests.
 
-    def __init__(self):
-        super().__init__()
-        # Define paths to be filtered
-        self.filtered_paths = [
+    The query string is ignored when matching. Exact paths cover the WebUI's
+    frequent GET/POST polls; prefixes cover the admin dashboards' polling,
+    which is GET only, so their POST actions stay in the access log.
+    """
+
+    # Successful GET or POST requests to exactly these paths are dropped.
+    EXACT_PATHS = frozenset(
+        {
             "/documents",
             "/documents/paginated",
             "/health",
             "/webui/",
             "/documents/pipeline_status",
-        ]
-        # self.filtered_paths = ["/health", "/webui/"]
+        }
+    )
+    # Successful GET requests under these prefixes are dropped.
+    GET_PREFIXES = ("/admin/ops/", "/admin/insights/live")
+
+    def __init__(self):
+        super().__init__()
+        self.filtered_paths = list(self.EXACT_PATHS)
+
+    @staticmethod
+    def _strip_query(path: str) -> str:
+        cut = len(path)
+        for sep in ("?", "#"):
+            idx = path.find(sep)
+            if idx != -1:
+                cut = min(cut, idx)
+        return path[:cut]
 
     def filter(self, record):
         try:
@@ -381,18 +400,34 @@ class LightragPathFilter(logging.Filter):
             path = record.args[2]
             status = record.args[4]
 
-            # Filter out successful GET/POST requests to filtered paths
-            if (
-                (method == "GET" or method == "POST")
-                and (status == 200 or status == 304)
-                and path in self.filtered_paths
-            ):
+            if status not in (200, 304) or not isinstance(path, str):
+                return True
+            path = self._strip_query(path)
+            if method in ("GET", "POST") and path in self.EXACT_PATHS:
+                return False
+            if method == "GET" and any(prefix in path for prefix in self.GET_PREFIXES):
                 return False
 
             return True
         except Exception:
             # In case of any error, let the message through
             return True
+
+
+def attach_log_hygiene(handler: logging.Handler) -> logging.Handler:
+    """Add the redaction and correlation filters to a text log handler.
+
+    Imported lazily: :mod:`lightrag.api.ops` is stdlib-only, but this module is
+    imported by everything and must not pay for it at import time.
+    """
+    from lightrag.api.ops.context import ContextFilter
+    from lightrag.api.ops.redact import RedactFilter
+
+    if not any(isinstance(f, RedactFilter) for f in handler.filters):
+        handler.addFilter(RedactFilter())
+    if not any(isinstance(f, ContextFilter) for f in handler.filters):
+        handler.addFilter(ContextFilter())
+    return handler
 
 
 def setup_logger(
@@ -411,11 +446,15 @@ def setup_logger(
         log_file_path: Path to the log file. If None and file logging is enabled, defaults to lightrag.log in LOG_DIR or cwd
         enable_file_logging: Whether to enable logging to a file (defaults to True)
     """
-    # Configure formatters
-    detailed_formatter = logging.Formatter(
-        "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    from lightrag.api.ops.context import (
+        CONSOLE_LOG_FORMAT,
+        DETAILED_LOG_FORMAT,
+        ContextFormatter,
     )
-    simple_formatter = logging.Formatter("%(levelname)s: %(message)s")
+
+    # Configure formatters
+    detailed_formatter = ContextFormatter(DETAILED_LOG_FORMAT)
+    simple_formatter = ContextFormatter(CONSOLE_LOG_FORMAT)
 
     logger_instance = logging.getLogger(logger_name)
     logger_instance.setLevel(level)
@@ -426,6 +465,7 @@ def setup_logger(
     console_handler = SafeStreamHandler()
     console_handler.setFormatter(simple_formatter)
     console_handler.setLevel(level)
+    attach_log_hygiene(console_handler)
     logger_instance.addHandler(console_handler)
 
     # Add file handler by default unless explicitly disabled
@@ -435,8 +475,8 @@ def setup_logger(
             log_dir = os.getenv("LOG_DIR", os.getcwd())
             log_file_path = os.path.abspath(os.path.join(log_dir, DEFAULT_LOG_FILENAME))
 
-        # Ensure log directory exists
-        os.makedirs(os.path.dirname(log_file_path), exist_ok=True)
+        # Ensure log directory exists (owner-only when we create it)
+        os.makedirs(os.path.dirname(log_file_path), mode=0o700, exist_ok=True)
 
         # Get log file max size and backup count from environment variables
         log_max_bytes = get_env_value("LOG_MAX_BYTES", DEFAULT_LOG_MAX_BYTES, int)
@@ -454,6 +494,7 @@ def setup_logger(
             )
             file_handler.setFormatter(detailed_formatter)
             file_handler.setLevel(level)
+            attach_log_hygiene(file_handler)
             logger_instance.addHandler(file_handler)
         except PermissionError as e:
             logger.warning(f"Could not create log file at {log_file_path}: {str(e)}")

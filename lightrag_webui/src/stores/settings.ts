@@ -6,7 +6,12 @@ import { Message, QueryRequest } from '@/api/lightrag'
 
 type Theme = 'dark' | 'light' | 'system'
 type Language = 'en' | 'zh' | 'fr' | 'ar' | 'zh_TW' | 'ru' | 'ja' | 'de' | 'uk' | 'ko' | 'vi'
-type Tab = 'documents' | 'knowledge-graph' | 'retrieval' | 'api' | 'providers' | 'insights'
+export const TABS = ['documents', 'knowledge-graph', 'retrieval', 'api', 'providers', 'insights', 'operations'] as const
+export type Tab = (typeof TABS)[number]
+
+/** A remembered tab this build no longer has (or never had) falls back to Documents. */
+export const sanitizeTab = (tab: unknown): Tab =>
+  typeof tab === 'string' && (TABS as readonly string[]).includes(tab) ? (tab as Tab) : 'documents'
 
 // The shared API key is kept in sessionStorage only: it is never written to
 // localStorage, so it does not outlive the browser tab and is not left behind
@@ -398,7 +403,14 @@ const useSettingsStoreBase = create<SettingsState>()(
           delete state.apiKey
         }
         return state
-      }
+      },
+      // Runs on every load, not only on a version bump: a tab saved by a build
+      // that this one does not know must not leave the content area blank.
+      merge: (persisted: any, current) => ({
+        ...current,
+        ...(persisted ?? {}),
+        currentTab: sanitizeTab(persisted?.currentTab ?? current.currentTab)
+      })
     }
   )
 )

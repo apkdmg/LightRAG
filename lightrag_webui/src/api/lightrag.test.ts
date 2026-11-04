@@ -240,3 +240,43 @@ describe('getDocumentsPaginated', () => {
     })
   })
 })
+
+describe('toApiError', () => {
+  test('keeps the message format and attaches status, detail and request id', async () => {
+    const { errorMessage } = await import('@/lib/utils')
+    const err = apiModule.toApiError(
+      {
+        status: 500,
+        statusText: 'Internal Server Error',
+        data: { detail: 'Internal Server Error', request_id: 'body-id' },
+        headers: { 'x-request-id': '3c9e41d0' }
+      },
+      '/documents/upload'
+    )
+    expect(err).toBeInstanceOf(Error)
+    expect(err.message).toBe('500 Internal Server Error\n{"detail":"Internal Server Error","request_id":"body-id"}\n/documents/upload')
+    expect(err.status).toBe(500)
+    expect(err.detail).toBe('Internal Server Error')
+    // The response header wins over the body copy.
+    expect(err.requestId).toBe('3c9e41d0')
+    // Toasts built with errorMessage() name the request so support can find the log line.
+    expect(errorMessage(err)).toBe(`${err.message}\nRef: 3c9e41d0`)
+  })
+
+  test('reads the header through AxiosHeaders-style get() and falls back to the body id', () => {
+    const viaGet = apiModule.toApiError({ status: 403, statusText: 'Forbidden', data: { detail: 'Admin only' }, headers: { get: (k: string) => (k === 'x-request-id' ? 'hdr' : undefined) } })
+    expect(viaGet.requestId).toBe('hdr')
+    expect(viaGet.detail).toBe('Admin only')
+    const viaBody = apiModule.toApiError({ status: 500, data: { detail: 'x', request_id: 'body-only' }, headers: {} })
+    expect(viaBody.requestId).toBe('body-only')
+    const none = apiModule.toApiError({ status: 502, statusText: 'Bad Gateway', data: '<html>proxy</html>' })
+    expect(none.requestId).toBeNull()
+    expect(none.detail).toBeNull()
+  })
+
+  test('errorMessage leaves errors without a request id unchanged', async () => {
+    const { errorMessage } = await import('@/lib/utils')
+    expect(errorMessage(new Error('Authentication required'))).toBe('Authentication required')
+    expect(errorMessage('plain')).toBe('plain')
+  })
+})

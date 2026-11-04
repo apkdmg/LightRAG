@@ -60,6 +60,15 @@ from lightrag.api.routers.openai_api import create_openai_routes
 from lightrag.api.routers.apikey_routes import create_apikey_routes
 from lightrag.api.routers.admin_routes import create_admin_routes
 from lightrag.api.insights.middleware import UsageContextMiddleware
+from lightrag.api.ops.context import (
+    CONSOLE_LOG_FORMAT,
+    DETAILED_LOG_FORMAT,
+    RequestIdMiddleware,
+    ServerErrorBoundary,
+)
+from lightrag.api.ops.redact import text_ref
+from lightrag.api.routers.ops_routes import configure_ops
+from lightrag.api.routers.ops_routes import router as ops_router
 from lightrag.api.insights.runtime import start_insights as _start_insights
 from lightrag.api.insights.runtime import stop_insights as _stop_insights
 from lightrag.api.routers.insights_routes import router as insights_router
@@ -75,7 +84,11 @@ from lightrag.kg.shared_storage import (
 )
 from fastapi.security import OAuth2PasswordRequestForm
 from lightrag.api.auth import auth_handler, _is_admin_user
-from lightrag.api.security_headers import SecurityHeadersMiddleware, build_webui_csp
+from lightrag.api.security_headers import (
+    BASELINE_SECURITY_HEADERS,
+    SecurityHeadersMiddleware,
+    build_webui_csp,
+)
 from lightrag.api.login_throttle import LoginThrottle
 from lightrag.api.workspace_registry import (
     WorkspaceOwnershipError,
@@ -687,19 +700,29 @@ def create_app(args):
             "the session cookie. Set CORS_ORIGINS to explicit origins if a "
             "WebUI hosted on another origin must authenticate with cookies."
         )
+    # Middleware is listed innermost first; each add_middleware wraps the
+    # stack built so far. The error boundary sits just outside the router so
+    # an unhandled exception still gets CORS, security headers and a request
+    # ID; RequestIdMiddleware is outermost so every inner layer and every log
+    # line of the request sees the ID.
+    app.add_middleware(ServerErrorBoundary)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=cors_origins,
         allow_credentials=cors_allow_credentials,
         allow_methods=["*"],
         allow_headers=["*"],
-        expose_headers=[
-            "X-New-Token"
-        ],  # Expose token renewal header for cross-origin requests
+        # Token renewal and request correlation headers for cross-origin use
+        expose_headers=["X-New-Token", "X-Request-ID"],
     )
     # Baseline security headers on every response (nosniff, framing, referrer).
     app.add_middleware(SecurityHeadersMiddleware)
     app.add_middleware(UsageContextMiddleware)
+    app.add_middleware(
+        RequestIdMiddleware,
+        trusted_proxies=os.getenv("OPS_TRUSTED_PROXIES", ""),
+        error_headers=BASELINE_SECURITY_HEADERS,
+    )
 
     # Create combined auth dependency for all endpoints
     combined_auth = get_combined_auth_dependency(api_key)
@@ -726,9 +749,11 @@ def create_app(args):
         else:
             sanitized = re.sub(r"[^a-zA-Z0-9_]", "_", workspace)
             if sanitized != workspace:
-                logger.warning(
-                    f"Workspace header '{workspace}' contains invalid characters. "
-                    f"Sanitized to '{sanitized}'."
+                # Unauthenticated callers reach this (/health): never log the
+                # raw header, and never at a level that lands in the ops logs.
+                logger.debug(
+                    "LIGHTRAG-WORKSPACE header contained invalid characters "
+                    f"and was sanitized ({text_ref(workspace)})"
                 )
                 workspace = sanitized
 
@@ -1920,6 +1945,15 @@ def create_app(args):
     logger.info("Email ingestion routes enabled")
 
     app.include_router(insights_router)
+    # Operations console API (admin only). Always mounted; it reports what is
+    # available instead of disappearing when a feature cannot run.
+    configure_ops(
+        app,
+        rag=rag,
+        workers=getattr(args, "workers", None),
+        version=api_version_display,
+    )
+    app.include_router(ops_router)
 
     # Admin routes for multi-tenancy management
     if args.enable_multi_tenancy:
@@ -2739,7 +2773,8 @@ def configure_logging():
     log_file_path = os.path.abspath(os.path.join(log_dir, DEFAULT_LOG_FILENAME))
 
     print(f"\nLightRAG log file: {log_file_path}\n")
-    os.makedirs(os.path.dirname(log_dir), exist_ok=True)
+    # The log directory itself (not its parent); owner-only when created here.
+    os.makedirs(log_dir, mode=0o700, exist_ok=True)
 
     # Get log file max size and backup count from environment variables
     log_max_bytes = get_env_value("LOG_MAX_BYTES", DEFAULT_LOG_MAX_BYTES, int)
@@ -2751,10 +2786,12 @@ def configure_logging():
             "disable_existing_loggers": False,
             "formatters": {
                 "default": {
-                    "format": "%(levelname)s: %(message)s",
+                    "()": "lightrag.api.ops.context.ContextFormatter",
+                    "fmt": CONSOLE_LOG_FORMAT,
                 },
                 "detailed": {
-                    "format": "%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+                    "()": "lightrag.api.ops.context.ContextFormatter",
+                    "fmt": DETAILED_LOG_FORMAT,
                 },
             },
             "handlers": {
@@ -2762,6 +2799,7 @@ def configure_logging():
                     "formatter": "default",
                     "class": "logging.StreamHandler",
                     "stream": "ext://sys.stderr",
+                    "filters": ["redact", "context"],
                 },
                 "file": {
                     "formatter": "detailed",
@@ -2770,6 +2808,7 @@ def configure_logging():
                     "maxBytes": log_max_bytes,
                     "backupCount": log_backup_count,
                     "encoding": "utf-8",
+                    "filters": ["redact", "context"],
                 },
             },
             "loggers": {
@@ -2790,6 +2829,7 @@ def configure_logging():
                     "level": "INFO",
                     "propagate": False,
                 },
+                # lightrag.api.* child loggers propagate here: one handler pair.
                 "lightrag": {
                     "handlers": ["console", "file"],
                     "level": "INFO",
@@ -2800,6 +2840,12 @@ def configure_logging():
             "filters": {
                 "path_filter": {
                     "()": "lightrag.utils.LightragPathFilter",
+                },
+                "redact": {
+                    "()": "lightrag.api.ops.redact.RedactFilter",
+                },
+                "context": {
+                    "()": "lightrag.api.ops.context.ContextFilter",
                 },
             },
         }

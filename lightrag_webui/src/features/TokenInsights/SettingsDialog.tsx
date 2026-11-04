@@ -3,6 +3,7 @@ import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from '@/components/ui/Dialog'
 import Input from '@/components/ui/Input'
+import { errorMessage } from '@/lib/utils'
 import { insightsApi } from './api'
 
 type PriceRow = { model: string; prompt: string; completion: string }
@@ -29,7 +30,7 @@ export default function SettingsDialog({ open, onClose, onSaved, knownModels, ba
       setStart(s.budget?.start ?? '')
       setLimit(s.rate_limit_tpm?.toString() ?? '')
       setRate(s.myr_rate?.toString() ?? '')
-    }).catch((e) => toast.error(e?.message))
+    }).catch((e) => toast.error(errorMessage(e)))
   }, [open, knownModels])
 
   const save = async () => {
@@ -47,7 +48,7 @@ export default function SettingsDialog({ open, onClose, onSaved, knownModels, ba
       onSaved()
       onClose()
     } catch (e: any) {
-      toast.error(e?.response?.data?.detail?.toString() || e?.message)
+      toast.error(e?.response?.data?.detail?.toString() || errorMessage(e))
     } finally {
       setSaving(false)
     }
@@ -58,7 +59,7 @@ export default function SettingsDialog({ open, onClose, onSaved, knownModels, ba
       toast.success(t('insights.settings.backfillStarted'))
       onSaved()
     } catch (e: any) {
-      toast.error(e?.message)
+      toast.error(errorMessage(e))
     }
   }
   const field = 'text-muted-foreground flex flex-col gap-0.5 text-xs'

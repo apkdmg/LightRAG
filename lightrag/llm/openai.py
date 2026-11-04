@@ -390,8 +390,9 @@ async def openai_complete_if_cache(
 
     logger.debug("===== Entering func of LLM =====")
     logger.debug(f"Model: {model}   Base URL: {base_url}")
-    logger.debug(f"Client Configs: {client_configs}")
-    logger.debug(f"Additional kwargs: {kwargs}")
+    # Keys only: values can hold API keys, headers and prompt content.
+    logger.debug(f"Client config keys: {sorted((client_configs or {}).keys())}")
+    logger.debug(f"Additional kwargs keys: {sorted(kwargs.keys())}")
     logger.debug(f"Num of history messages: {len(history_messages)}")
     verbose_debug(f"System prompt: {system_prompt}")
     verbose_debug(f"Query: {prompt}")
@@ -469,7 +470,8 @@ async def openai_complete_if_cache(
             extra_parts.append(f"Request URL: {req.url}")
         extra = ("\n" + "\n".join(extra_parts)) if extra_parts else ""
         logger.error(
-            f"OpenAI API Call Failed,\nModel: {model},\nParams: {kwargs}, Got: {e}{extra}"
+            f"OpenAI API Call Failed,\nModel: {model},\n"
+            f"Param keys: {sorted(kwargs.keys())}, Got: {e}{extra}"
         )
         try:
             await openai_async_client.close()

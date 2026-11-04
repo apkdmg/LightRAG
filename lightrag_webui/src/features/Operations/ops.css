@@ -1,0 +1,138 @@
+/*
+ * Operations console tokens (spec §2.2, §2.12). Scoped to .ops-root with
+ * .dark overrides, following insights.css. Status colours always come with an
+ * icon and a label; the *-fg tokens keep text at >= 4.5:1 on their soft fill
+ * in both themes.
+ */
+.ops-root {
+  --ops-ok: #2f8a4d;
+  --ops-ok-soft: #e3f2e7;
+  --ops-warn: #a86a00;
+  --ops-warn-soft: #fbefd6;
+  --ops-serious: #c2541a;
+  --ops-serious-soft: #fbe5d8;
+  --ops-crit: #c0322b;
+  --ops-crit-soft: #fadedb;
+  --ops-info: #2a6bb3;
+  --ops-info-soft: #e0ebf8;
+  --ops-unknown: #6b726c;
+  --ops-unknown-soft: #ecefeb;
+  --ops-paused: #6c5bb5;
+  --ops-paused-soft: #ebe7f8;
+  /* Stale text switches colour instead of dimming, so muted text stays AA. */
+  --ops-stale-fg: #5f6660;
+  --ops-flash: #fbefd6;
+
+  --ops-dur-fast: 150ms;
+  --ops-dur-base: 200ms;
+  --ops-dur-panel: 240ms;
+  --ops-dur-value: 300ms;
+  --ops-dur-ring: 900ms;
+  --ops-dur-breathe: 2000ms;
+  --ops-skeleton-cycles: 2;
+  --ops-loop-cap: 5000ms;
+  --ops-ease-out: cubic-bezier(0, 0, 0.58, 1);
+  --ops-ease-in: cubic-bezier(0.42, 0, 1, 1);
+  --ops-ease-loop: ease-in-out;
+  --ops-ease-flow: linear;
+}
+.dark .ops-root {
+  --ops-ok: #5fc27e;
+  --ops-ok-soft: #173022;
+  --ops-warn: #e2a93b;
+  --ops-warn-soft: #33270f;
+  --ops-serious: #ec8a52;
+  --ops-serious-soft: #3a2216;
+  --ops-crit: #f0726a;
+  --ops-crit-soft: #3c1b19;
+  --ops-info: #78aef0;
+  --ops-info-soft: #17263a;
+  --ops-unknown: #9aa29a;
+  --ops-unknown-soft: #232724;
+  --ops-paused: #a99bf0;
+  --ops-paused-soft: #262040;
+  --ops-stale-fg: #a3aaa3;
+  --ops-flash: #33270f;
+}
+
+/* Status chips: fill + text colour per tone, icon and label always present. */
+.ops-chip {
+  transition:
+    background-color var(--ops-dur-base) var(--ops-ease-out),
+    color var(--ops-dur-base) var(--ops-ease-out),
+    border-color var(--ops-dur-base) var(--ops-ease-out);
+}
+.ops-tone-ok { color: var(--ops-ok); background: var(--ops-ok-soft); border-color: color-mix(in srgb, var(--ops-ok) 35%, transparent); }
+.ops-tone-warn { color: var(--ops-warn); background: var(--ops-warn-soft); border-color: color-mix(in srgb, var(--ops-warn) 35%, transparent); }
+.ops-tone-serious { color: var(--ops-serious); background: var(--ops-serious-soft); border-color: color-mix(in srgb, var(--ops-serious) 35%, transparent); }
+.ops-tone-crit { color: var(--ops-crit); background: var(--ops-crit-soft); border-color: color-mix(in srgb, var(--ops-crit) 35%, transparent); }
+.ops-tone-info { color: var(--ops-info); background: var(--ops-info-soft); border-color: color-mix(in srgb, var(--ops-info) 35%, transparent); }
+.ops-tone-unknown { color: var(--ops-unknown); background: var(--ops-unknown-soft); border-color: color-mix(in srgb, var(--ops-unknown) 35%, transparent); }
+.ops-tone-paused { color: var(--ops-paused); background: var(--ops-paused-soft); border-color: color-mix(in srgb, var(--ops-paused) 35%, transparent); }
+
+/* Tab / Seg switch: the incoming panel fades in. Page load and deep links do not fade. */
+@keyframes ops-fade-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+.ops-fade-in { animation: ops-fade-in var(--ops-dur-fast) var(--ops-ease-out); }
+
+/* Skeleton: two pulses (4 s, under the 5 s cap of WCAG 2.2.2), then still. */
+@keyframes ops-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.5; }
+}
+.ops-skeleton { animation: ops-pulse var(--ops-dur-breathe) var(--ops-ease-loop) var(--ops-skeleton-cycles); }
+
+/* Refresh hairline: an indeterminate sweep for at most 5 s, then a static bar with text. */
+@keyframes ops-sweep {
+  from { transform: translateX(-100%); }
+  to { transform: translateX(250%); }
+}
+.ops-hairline {
+  position: absolute;
+  inset: 0 0 auto 0;
+  height: 2px;
+  overflow: hidden;
+  pointer-events: none;
+}
+.ops-hairline > i {
+  display: block;
+  width: 40%;
+  height: 100%;
+  background: var(--ops-info);
+  animation: ops-sweep 1s var(--ops-ease-flow) 5;
+}
+.ops-hairline[data-static] > i { animation: none; width: 100%; opacity: 0.4; transform: none; }
+
+/* "⏸ auto" and stale panels stop every loop. */
+.ops-root[data-paused] .ops-loop,
+.ops-stale .ops-loop { animation: none; }
+
+/*
+ * Reduced motion: the OS setting or the page toggle ([data-motion="reduced"]
+ * on .ops-root, data-ops-motion on <html> for Radix portals). Animations stop
+ * and transitions become instant, except the 150 ms fades the fallback column
+ * of §2.12 promises (.ops-fade).
+ */
+@media (prefers-reduced-motion: reduce) {
+  .ops-root *,
+  .ops-portal,
+  .ops-portal * {
+    animation: none !important;
+    transition-duration: 0ms !important;
+  }
+  .ops-root .ops-fade { transition: opacity var(--ops-dur-fast) linear !important; }
+}
+.ops-root[data-motion="reduced"] *,
+html[data-ops-motion="reduced"] .ops-portal,
+html[data-ops-motion="reduced"] .ops-portal * {
+  animation: none !important;
+  transition-duration: 0ms !important;
+}
+.ops-root[data-motion="reduced"] .ops-fade { transition: opacity var(--ops-dur-fast) linear !important; }
+/* Under reduced motion the hairline is a static bar at 40 % opacity. */
+@media (prefers-reduced-motion: reduce) {
+  .ops-root .ops-hairline > i { width: 100%; opacity: 0.4; transform: none; }
+}
+.ops-root[data-motion="reduced"] .ops-hairline > i { width: 100%; opacity: 0.4; transform: none; }
