@@ -453,6 +453,30 @@ def test_exports_are_rate_limited_per_actor():
     assert codes == [200] * 5 + [429]
 
 
+def test_export_limit_is_host_wide_across_workers():
+    """Two Gunicorn workers share the ops KV: 5 exports a minute per actor
+    in total, whichever worker answers, and across identity case."""
+    store = seeded_store()
+    first, _ = _app(store)
+    second, _ = _app(store)
+    codes = [_export(TestClient(first)).status_code for _ in range(3)]
+    codes += [_export(TestClient(second)).status_code for _ in range(3)]
+    assert codes == [200] * 5 + [429]
+    assert store.kv["ratelimit:export:root"]["n"] == 6
+
+
+def test_export_limit_falls_back_to_the_process_when_the_store_fails():
+    app, store = _app()
+
+    async def broken(*args):
+        raise ConnectionError("down")
+
+    store.rate_hit = broken
+    client = TestClient(app)
+    codes = [_export(client).status_code for _ in range(6)]
+    assert codes == [200] * 5 + [429]
+
+
 def test_export_routes_depend_on_operator_and_live_admin():
     route = next(
         r for r in ops_routes.router.routes if r.path == "/admin/ops/logs/export"

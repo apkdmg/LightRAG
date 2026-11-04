@@ -17,9 +17,10 @@ For the Operations console each drain attempt is recorded in KV
 ``resync:<workspace>`` (attempts, last result class and reason, last attempt,
 last success, backoff deadline) and each applied batch is an ``email_batch``
 run. A backoff sleep runs in 5 s slices and ends early when KV
-``kick:<workspace>`` was written after it started (by any process). All of it
-goes through :mod:`lightrag.api.ops.runs` and is a no-op with run tracking
-off.
+``kick:<workspace>`` ("drain now" in the console) was written after the drain
+attempt before it started, by any process; :meth:`DeferredResyncQueue.kick`
+wakes this process's drainer at once. All of the KV traffic goes through
+:mod:`lightrag.api.ops.runs` and is a no-op with run tracking off.
 """
 
 from __future__ import annotations
@@ -88,6 +89,10 @@ class DeferredResyncQueue:
         self._drains: dict[str, deque[tuple[float, str]]] = {}
         self._states: dict[str, dict[str, Any]] = {}
         self._busy_reasons: dict[str, Optional[str]] = {}
+        # "Drain now" from the console, for drainers in this process: the
+        # time of the last kick, and an event that wakes a backoff sleep.
+        self._local_kicks: dict[str, float] = {}
+        self._kick_events: dict[str, asyncio.Event] = {}
 
     # -- paths -----------------------------------------------------------
     @property
@@ -169,6 +174,24 @@ class DeferredResyncQueue:
             return
         self._drainers[workspace] = asyncio.create_task(self._drain(workspace))
 
+    def has_drainer(self, workspace: str) -> bool:
+        """Whether this process is draining ``workspace`` now."""
+        task = self._drainers.get(workspace)
+        return task is not None and not task.done()
+
+    def kick(self, workspace: str) -> bool:
+        """End this process's backoff for ``workspace`` now ("drain now").
+
+        Other processes see the same request through KV ``kick:<ws>``. Never
+        takes the queue's ``flock`` and never touches queued or ``.bad``
+        files. Returns whether this process has a drainer for it.
+        """
+        self._local_kicks[workspace] = time.time()
+        event = self._kick_events.get(workspace)
+        if event is not None:
+            event.set()
+        return self.has_drainer(workspace)
+
     def active_drainers(self) -> list[str]:
         """Workspaces this process is draining now (read-only, for heartbeats)."""
         return sorted(w for w, task in self._drainers.items() if not task.done())
@@ -227,6 +250,8 @@ class DeferredResyncQueue:
                 progressed = False
                 attempted = False
                 result: tuple[str, Optional[str], Optional[str]] = ("ok", None, None)
+                # A kick that arrives while this attempt runs still counts.
+                attempt_started = time.time()
                 lock_fd = _try_flock(directory)
                 if lock_fd is not None:
                     attempted = True
@@ -261,10 +286,14 @@ class DeferredResyncQueue:
                 if attempted:
                     # Another process holding the flock records its own drain.
                     self._record_drain(workspace, *result, backoff_until=deadline)
-                await self._backoff_sleep(workspace, backoff)
-                backoff = min(backoff * 2, self._max_backoff)
+                if await self._backoff_sleep(workspace, backoff, since=attempt_started):
+                    # Asked to retry now: the next wait starts from the minimum.
+                    backoff = self._min_backoff
+                else:
+                    backoff = min(backoff * 2, self._max_backoff)
         finally:
             self._states.pop(workspace, None)
+            self._kick_events.pop(workspace, None)
 
     def _record_drain(
         self,
@@ -315,23 +344,49 @@ class DeferredResyncQueue:
             }
         ops_runs.resync_result(workspace, patch)
 
-    async def _backoff_sleep(self, workspace: str, seconds: float) -> None:
-        """Sleep ``seconds`` in slices; a newer ``kick:<ws>`` ends it early."""
+    async def _kicked_since(self, workspace: str, since: float) -> bool:
+        """A "drain now" newer than ``since``, from this or any process."""
+        if self._local_kicks.get(workspace, 0.0) > since:
+            return True
+        kicked = await ops_runs.kick_at(workspace)
+        return kicked is not None and kicked > since
+
+    async def _backoff_sleep(
+        self, workspace: str, seconds: float, *, since: Optional[float] = None
+    ) -> bool:
+        """Sleep ``seconds`` in slices; a kick newer than ``since`` (default:
+        the start of the sleep) ends it early. Checked before the first slice
+        and after each one; a kick in this process wakes it at once.
+
+        Returns whether a kick ended the sleep.
+        """
         started = time.time()
+        since = started if since is None else since
         deadline = started + seconds
         self._states[workspace] = {"state": "backoff", "backoff_until": deadline}
+        event = self._kick_events.setdefault(workspace, asyncio.Event())
+        event.clear()
         try:
+            if await self._kicked_since(workspace, since):
+                logger.info("Queued email re-sync kicked; retrying now")
+                return True
             while not self._closed:
                 remaining = deadline - time.time()
                 if remaining <= 0:
-                    return
-                await asyncio.sleep(min(_KICK_SLICE_SECONDS, remaining))
-                if time.time() >= deadline:
-                    return
-                kicked = await ops_runs.kick_at(workspace)
-                if kicked is not None and kicked > started:
+                    return False
+                try:
+                    await asyncio.wait_for(
+                        event.wait(), timeout=min(_KICK_SLICE_SECONDS, remaining)
+                    )
+                except asyncio.TimeoutError:
+                    pass
+                event.clear()
+                if await self._kicked_since(workspace, since):
                     logger.info("Queued email re-sync kicked; retrying now")
-                    return
+                    return True
+                if time.time() >= deadline:
+                    return False
+            return False
         finally:
             self._states[workspace] = {"state": "draining", "backoff_until": None}
 

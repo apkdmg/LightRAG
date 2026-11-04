@@ -29,6 +29,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from pydantic import SecretStr
 
 from lightrag.api.dependencies import UserInfo, require_admin
+from lightrag.api.ops.audit import admin_audit
 from lightrag.api.provider_alerts import _ROLE_SLOTS, email_system_provider_change
 from lightrag.api.routers.provider_routes import (
     ProviderSlotInput,
@@ -481,25 +482,33 @@ def create_system_provider_routes() -> APIRouter:
 
         app_state = request.app.state
         env_settings = app_state.env_role_llm_settings
-        before = {name: _in_use(request, SLOT_ROLES[name][0]) for name in provided}
-        config = store.get(SYSTEM_RECORD_ID) or WorkspaceProviderConfig()
-        for name, incoming in provided.items():
-            setattr(config, name, _build_slot(name, incoming, config, env_settings))
-        config.updated_at = datetime.now(timezone.utc).isoformat()
-        config.updated_by = user.username
-        try:
-            store.set(SYSTEM_RECORD_ID, config)
-        except WorkspaceProviderError as e:
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(e)
-            )
+        # Audited by slot name only: never base URLs, models or keys.
+        async with admin_audit(
+            request,
+            user,
+            "system_provider_set",
+            params={"slots": sorted(provided)},
+        ) as audit:
+            before = {name: _in_use(request, SLOT_ROLES[name][0]) for name in provided}
+            config = store.get(SYSTEM_RECORD_ID) or WorkspaceProviderConfig()
+            for name, incoming in provided.items():
+                setattr(config, name, _build_slot(name, incoming, config, env_settings))
+            config.updated_at = datetime.now(timezone.utc).isoformat()
+            config.updated_by = user.username
+            try:
+                store.set(SYSTEM_RECORD_ID, config)
+            except WorkspaceProviderError as e:
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(e)
+                )
 
-        await reconcile_loaded_instances(
-            app_state.default_rag, app_state.workspace_manager, store, env_settings
-        )
-        resumed = await _resume_paused(request, set(provided))
-        _record_change(user.username, before, request)
-        return {**await _view(request), "resumed": resumed}
+            await reconcile_loaded_instances(
+                app_state.default_rag, app_state.workspace_manager, store, env_settings
+            )
+            resumed = await _resume_paused(request, set(provided))
+            audit.result_params["resumed"] = resumed
+            _record_change(user.username, before, request)
+            return {**await _view(request), "resumed": resumed}
 
     @router.delete("")
     async def clear_server_default(
@@ -516,16 +525,23 @@ def create_system_provider_routes() -> APIRouter:
         store = _get_store(request)
         app_state = request.app.state
         slots = set(SLOT_ROLES) if slot == "all" else {slot}
-        before = {name: _in_use(request, SLOT_ROLES[name][0]) for name in slots}
-        store.delete(SYSTEM_RECORD_ID, which=slot)
-        await reconcile_loaded_instances(
-            app_state.default_rag,
-            app_state.workspace_manager,
-            store,
-            app_state.env_role_llm_settings,
-        )
-        resumed = await _resume_paused(request, slots)
-        _record_change(user.username, before, request)
-        return {**await _view(request), "resumed": resumed}
+        async with admin_audit(
+            request,
+            user,
+            "system_provider_clear",
+            params={"slots": sorted(slots)},
+        ) as audit:
+            before = {name: _in_use(request, SLOT_ROLES[name][0]) for name in slots}
+            store.delete(SYSTEM_RECORD_ID, which=slot)
+            await reconcile_loaded_instances(
+                app_state.default_rag,
+                app_state.workspace_manager,
+                store,
+                app_state.env_role_llm_settings,
+            )
+            resumed = await _resume_paused(request, slots)
+            audit.result_params["resumed"] = resumed
+            _record_change(user.username, before, request)
+            return {**await _view(request), "resumed": resumed}
 
     return router

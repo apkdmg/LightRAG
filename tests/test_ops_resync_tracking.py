@@ -192,3 +192,57 @@ async def test_heartbeat_reports_drainer_backoff(tmp_path):
         assert drainer["backoff_until"].endswith("+00:00")
     finally:
         task.cancel()
+
+
+async def test_a_kick_during_the_attempt_still_counts(tmp_path, tracker, store):
+    """A "drain now" that lands while the attempt runs is checked before the
+    first backoff slice, so it is not lost."""
+    _seed(tmp_path)
+    queue = _queue(tmp_path, min_backoff=60.0, max_backoff=60.0)
+    calls = []
+
+    async def apply(rag, workspace, paths):
+        calls.append(time.monotonic())
+        if len(calls) == 1:
+            store.kv["kick:space1"] = {"at": time.time()}
+            return False
+        for path in paths:
+            path.unlink()
+        return True
+
+    queue._apply_batch = apply
+    queue.ensure_draining("space1")
+    await asyncio.wait_for(queue._drainers["space1"], timeout=3)
+    assert len(calls) == 2 and calls[1] - calls[0] < 2
+
+
+async def test_a_local_kick_wakes_the_drainer_at_once(tmp_path):
+    """Without run tracking (no KV), "drain now" in this process still works,
+    and does not wait for the next 5 s slice."""
+    runs.install(None)
+    _seed(tmp_path)
+    bad = tmp_path / ".email_resync_queue" / "space1" / "x.bad"
+    bad.write_text("unreadable")
+    queue = _queue(tmp_path, min_backoff=60.0, max_backoff=60.0)
+    calls = []
+
+    async def apply(rag, workspace, paths):
+        calls.append(time.monotonic())
+        if len(calls) == 1:
+            return False
+        for path in paths:
+            path.unlink()
+        return True
+
+    queue._apply_batch = apply
+    assert not queue.kick("space1")  # no drainer yet
+    queue.ensure_draining("space1")
+    await asyncio.sleep(0.1)
+    assert queue.has_drainer("space1")
+    assert queue.pending_count("space1") == 1  # .bad files are not pending
+    started = time.monotonic()
+    assert queue.kick("space1")
+    await asyncio.wait_for(queue._drainers["space1"], timeout=2)
+    assert time.monotonic() - started < 1.0
+    assert len(calls) == 2
+    assert bad.exists()

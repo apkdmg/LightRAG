@@ -60,6 +60,7 @@ from lightrag.api.ops.service import OpsService  # noqa: E402
 from lightrag.api.ops.snapshot import NamespaceReader  # noqa: E402
 from lightrag.api.ops.store import (  # noqa: E402
     LOG_COLUMNS,
+    AuditFilter,
     LogFilter,
     MemoryOpsStore,
     Page,
@@ -824,6 +825,16 @@ async def _explain(conn, sql: str, args: tuple, generic: bool) -> list[str]:
     raw = await conn.fetchval(f"EXPLAIN (FORMAT JSON) EXECUTE {name}{params}")
     await conn.execute(f"DEALLOCATE {name}")
     return _seq_scans(json.loads(raw) if isinstance(raw, str) else raw)
+
+
+def _sum_key(node: object, key: str) -> int:
+    """Sum of ``key`` over every node of an EXPLAIN (FORMAT JSON) plan."""
+    if isinstance(node, list):
+        return sum(_sum_key(n, key) for n in node)
+    if isinstance(node, dict):
+        own = int(node.get(key) or 0)
+        return own + sum(_sum_key(v, key) for v in node.values())
+    return 0
 
 
 async def _median_ms(call, runs: int = 7) -> float:
@@ -1687,3 +1698,162 @@ async def test_vllm_and_llm_queue_history_match_memory_store(pg):
     assert "lightrag_ops_probes" not in _seq_scans(
         json.loads(plan) if isinstance(plan, str) else plan
     ), plan
+
+
+# -- PR-7: the audit keyset and the action KV helpers --------------------------------
+
+
+AUDIT_ROWS = int(os.getenv("OPS_IT_AUDIT_ROWS", "300000"))
+
+
+async def test_audit_paging_never_seq_scans_and_matches_memory(pg):
+    """The Audit section pages ``LIGHTRAG_OPS_AUDIT`` (400 days of rows) on
+    the ``(ts, id)`` keyset through ``idx_ops_audit_ts`` or, with an actor,
+    ``idx_ops_audit_actor``; never a sequential scan."""
+    await _reset(pg)
+    async with pg.dedicated_connection() as conn:
+        await conn.execute(
+            """INSERT INTO lightrag_ops_audit (ts, actor, auth_kind, action,
+                workspace, target, params, reason, phase, outcome)
+            SELECT now() - make_interval(secs => g * 120), 'admin' || (g % 7),
+                'sso', (ARRAY['cancel','run','reveal','log_search',
+                'documents_mutation'])[1 + g % 5], 'ws' || (g % 3000),
+                'ws' || (g % 3000), '{}'::jsonb, 'ticket',
+                CASE WHEN g % 2 = 0 THEN 'intent' ELSE 'result' END, 'ok'
+            FROM generate_series(1, $1::int) AS g""",
+            AUDIT_ROWS,
+        )
+        # A rare action, spread over the whole 400 days.
+        await conn.execute(
+            """INSERT INTO lightrag_ops_audit (ts, actor, auth_kind, action,
+                workspace, target, params, reason, phase, outcome)
+            SELECT now() - make_interval(days => g * 6), 'admin1', 'sso',
+                'release_busy', 'ws7', 'ws7', '{}'::jsonb, 'ticket', 'result',
+                'released'
+            FROM generate_series(1, 60) AS g"""
+        )
+        await conn.execute("ANALYZE lightrag_ops_audit")
+    end = datetime.now(timezone.utc)
+    capture = _Capture(pg)
+    filters = [
+        AuditFilter(start=end - timedelta(days=30), end=end),
+        AuditFilter(start=end - timedelta(days=400), end=end, actor="admin3"),
+        AuditFilter(start=end - timedelta(days=30), end=end, action="reveal"),
+        AuditFilter(
+            start=end - timedelta(days=400), end=end, actor="admin1", phase="result"
+        ),
+    ]
+    for f in filters:
+        page = await capture.audit_page(f, None, 51)
+        assert len(page) == 51
+        assert all(page[i]["ts"] >= page[i + 1]["ts"] for i in range(50))
+        cursor = (page[-1]["ts"], int(page[-1]["id"]))
+        older = await capture.audit_page(f, cursor, 51)
+        assert older and older[0]["ts"] <= page[-1]["ts"]
+        assert not {r["id"] for r in older} & {r["id"] for r in page}
+    # Selective filters without an actor (a rare action, one of 3000
+    # workspaces) over 400 days read their own index, not every row of the
+    # window through idx_ops_audit_ts.
+    selective = [
+        AuditFilter(start=end - timedelta(days=400), end=end, action="release_busy"),
+        AuditFilter(start=end - timedelta(days=400), end=end, workspace="ws1234"),
+    ]
+    for f in selective:
+        page = await capture.audit_page(f, None, 51)
+        assert page and all(
+            page[i]["ts"] >= page[i + 1]["ts"] for i in range(len(page) - 1)
+        )
+    async with pg.dedicated_connection() as conn:
+        for sql, args in capture.statements:
+            for generic in (False, True):
+                scans = await _explain(conn, sql, args, generic)
+                assert "lightrag_ops_audit" not in scans, (sql, generic)
+        for sql, args in capture.statements[-len(selective) :]:
+            name = f"ops_q{next(_STATEMENTS)}"
+            await conn.execute("SET plan_cache_mode = auto")
+            await conn.execute(f"PREPARE {name} AS {sql}")
+            params = f"({', '.join(_literal(a) for a in args)})"
+            raw = await conn.fetchval(
+                f"EXPLAIN (ANALYZE, FORMAT JSON) EXECUTE {name}{params}"
+            )
+            await conn.execute(f"DEALLOCATE {name}")
+            plan = json.loads(raw) if isinstance(raw, str) else raw
+            removed = _sum_key(plan, "Rows Removed by Filter")
+            # Bounded by the matches, not by the table (AUDIT_ROWS rows).
+            assert removed < 1000, (sql, removed)
+    # Same answers as the memory store on a small set.
+    await _reset(pg)
+    memory = MemoryOpsStore()
+    ids = {"pg": [], "mem": []}
+    for i in range(12):
+        row = {
+            "actor": "root" if i % 2 else "khairil",
+            "auth_kind": "token",
+            "action": "cancel",
+            "workspace": "fsktm",
+            "target": "fsktm",
+            "params": {"n": i},
+            "reason": "r",
+            "phase": "result",
+            "outcome": "ok",
+        }
+        ids["pg"].append(await pg.audit_write(row))
+        ids["mem"].append(await memory.audit_write(row))
+    f = AuditFilter(start=end - timedelta(hours=1), end=end + timedelta(hours=1))
+    for store, key in ((pg, "pg"), (memory, "mem")):
+        page = await store.audit_page(f, None, 5)
+        assert [r["params"]["n"] for r in page] == [11, 10, 9, 8, 7]
+        rest = await store.audit_page(f, (page[-1]["ts"], int(page[-1]["id"])), 50)
+        assert [r["params"]["n"] for r in rest] == [6, 5, 4, 3, 2, 1, 0]
+        only = await store.audit_page(
+            AuditFilter(start=f.start, end=f.end, actor="root"), None, 50
+        )
+        assert [r["params"]["n"] for r in only] == [11, 9, 7, 5, 3, 1]
+    # Timeline markers: state changes only, never searches, exports or reveals.
+    for store in (pg, memory):
+        for action in ("log_search", "reveal", "audit_export"):
+            await store.audit_write(
+                {"actor": "root", "action": action, "phase": "result"}
+            )
+        markers = await store.audit_events(f.start, f.end, 100)
+        assert {r["action"] for r in markers} == {"cancel"}
+
+
+async def test_action_lease_rate_limit_and_kick_claim(pg):
+    await _reset(pg)
+    # Action lease: holder stored, conflict returns the holder, released by it.
+    taken, current = await pg.claim_action(
+        "action:fsktm", "h1", 60, {"actor": "khairil", "action": "run", "since": 1.0}
+    )
+    assert taken and current is None
+    taken, current = await pg.claim_action(
+        "action:fsktm", "h2", 60, {"actor": "root", "action": "cancel", "since": 2.0}
+    )
+    assert not taken and current["actor"] == "khairil" and current["holder"] == "h1"
+    await pg.release_action("action:fsktm", "h2")  # not the holder: kept
+    assert (await pg.kv_get("action:fsktm"))["holder"] == "h1"
+    await pg.release_action("action:fsktm", "h1")
+    assert await pg.kv_get("action:fsktm") is None
+    # An expired lease is taken over.
+    assert (await pg.claim_action("action:ws2", "h1", 0.5, {}))[0]
+    await asyncio.sleep(0.7)
+    assert (await pg.claim_action("action:ws2", "h2", 60, {}))[0]
+
+    # Fixed-window rate limit: refused hits count, a new window resets.
+    now = time.time()
+    results = [
+        await pg.rate_hit("ratelimit:actions:root", 3, 60, now) for _ in range(4)
+    ]
+    assert [allowed for allowed, _ in results] == [True, True, True, False]
+    assert 59 <= results[-1][1] <= 60
+    allowed, _ = await pg.rate_hit("ratelimit:actions:root", 3, 60, now + 61)
+    assert allowed
+
+    # Kick: written only when the stored one is older than the interval.
+    assert await pg.kv_put_if_older("kick:space1", {"at": now}, now - 60)
+    assert not await pg.kv_put_if_older("kick:space1", {"at": now + 1}, now + 1 - 60)
+    assert await pg.kv_put_if_older("kick:space1", {"at": now + 61}, now + 1)
+    assert (await pg.kv_get("kick:space1"))["at"] == now + 61
+    # A legacy non-object value is replaced.
+    await pg.kv_put("kick:space2", 5.0)
+    assert await pg.kv_put_if_older("kick:space2", {"at": now}, now - 60)

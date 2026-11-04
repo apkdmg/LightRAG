@@ -2,6 +2,8 @@ import type {
   ActiveRun,
   ActiveRuns,
   AttentionItem,
+  AuditPage,
+  AuditRow,
   DocFailure,
   DocFailureState,
   DocRow,
@@ -569,4 +571,49 @@ export function normalizeDocument(raw: unknown): DocumentDetail {
     calls: arr(d.calls),
     calls_available: typeof d.calls_available === 'boolean' ? d.calls_available : undefined
   } as DocumentDetail
+}
+
+/** An id as text: the audit table's bigint id may arrive as a number. */
+const idText = (v: unknown): string | null => (typeof v === 'number' && Number.isFinite(v) ? String(v) : str(v))
+
+/**
+ * One audit row (§3.5 LIGHTRAG_OPS_AUDIT). The target is the row's own
+ * `target`, else its workspace; a `params.target` from an older writer is
+ * accepted too. `params` itself is never shown (it may name fields).
+ */
+export function normalizeAuditRow(raw: unknown): AuditRow | null {
+  const r = obj(raw)
+  const id = idText(r.id)
+  const action = str(r.action)
+  if (!id || !action) return null
+  return {
+    id,
+    ts: str(r.ts),
+    actor: str(r.actor),
+    auth_kind: str(r.auth_kind),
+    impersonated_by: str(r.impersonated_by),
+    action,
+    workspace: str(r.workspace),
+    target: str(r.target) ?? str(obj(r.params).target),
+    reason: str(r.reason),
+    phase: str(r.phase),
+    outcome: str(r.outcome),
+    request_id: str(r.request_id)
+  }
+}
+
+/** GET /audit: offset pages or a keyset cursor, whichever the server sends. */
+export function normalizeAuditPage(raw: unknown): AuditPage {
+  const p = obj(raw)
+  const items = arr(p.items ?? p.rows)
+    .map(normalizeAuditRow)
+    .filter((r): r is AuditRow => r !== null)
+  return {
+    ...p,
+    items,
+    page: num(p.page),
+    page_size: num(p.page_size),
+    total: num(p.total),
+    next_before: idText(p.next_before)
+  } as AuditPage
 }
