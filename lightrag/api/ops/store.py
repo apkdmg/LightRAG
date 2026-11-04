@@ -961,6 +961,15 @@ class PostgresOpsStore(OpsStore):
         from lightrag.kg.postgres_impl import ClientManager
 
         self._db = await ClientManager.get_client(self._vector_storage)
+        # Workers starting together against an empty database would race on
+        # CREATE ... IF NOT EXISTS; take turns (released before the reads).
+        async with self._db.ddl_lock():
+            await self._create_tables()
+        await self._refresh_tables(force=True)
+        self.doc_status_ready = TABLE_DOC_STATUS in self._tables
+        self.ready = True
+
+    async def _create_tables(self) -> None:
         for statement in (
             f"""CREATE TABLE IF NOT EXISTS {TABLE_KV} (
                 key VARCHAR(512) PRIMARY KEY,
@@ -1174,9 +1183,6 @@ class PostgresOpsStore(OpsStore):
             f"CREATE INDEX IF NOT EXISTS idx_ops_alerts_fp ON {TABLE_ALERTS} (fingerprint, id DESC)",
         ):
             await self._db.execute(statement)
-        await self._refresh_tables(force=True)
-        self.doc_status_ready = TABLE_DOC_STATUS in self._tables
-        self.ready = True
 
     async def finalize(self) -> None:
         self.ready = False
