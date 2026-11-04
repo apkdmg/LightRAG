@@ -49,6 +49,8 @@ LIVE_KEYS = (
     "owner_worker_id",
     "owner_pid",
     "heartbeat_at",
+    "scan_owner_worker_id",
+    "scan_started_at",
 )
 PAUSE_KEYS = ("provider_rejection",)
 

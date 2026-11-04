@@ -118,3 +118,20 @@ export const utcTitle = (at: string | number | null | undefined): string | undef
   if (Number.isNaN(d.getTime())) return undefined
   return `${d.toISOString().slice(0, 19).replace('T', ' ')} UTC`
 }
+
+/**
+ * A timestamp in a list that spans days (run history): "12:04:31" today,
+ * "11-01 09:14" on another day of the same year, "2025-12-30 09:14" before.
+ * Local time; `now` decides what "today" is.
+ */
+export const fmtStamp = (at: string | number | null | undefined, now: number = Date.now()) => {
+  if (at === null || at === undefined || at === '') return DASH
+  const d = new Date(at)
+  if (Number.isNaN(d.getTime())) return DASH
+  const today = new Date(now)
+  const pad = (v: number) => String(v).padStart(2, '0')
+  const hm = `${pad(d.getHours())}:${pad(d.getMinutes())}`
+  if (d.getFullYear() === today.getFullYear() && d.getMonth() === today.getMonth() && d.getDate() === today.getDate()) return fmtClock(d.getTime())
+  const md = `${pad(d.getMonth() + 1)}-${pad(d.getDate())}`
+  return d.getFullYear() === today.getFullYear() ? `${md} ${hm}` : `${d.getFullYear()}-${md} ${hm}`
+}

@@ -209,6 +209,12 @@ _DOC_STATUS_METADATA_CARRY_OVER_KEYS: tuple[str, ...] = (
     "parsing_start_time",
     "parse_stage_skipped",
     "analyzing_start_time",
+    # Classified current failure (Operations console run tracking): stage,
+    # error_kind, http_status, attempt, first_failed_at, last_run_id, model.
+    # Carried across FAILED -> PENDING -> ... so the next failure can count
+    # its attempt; dropped when the document reaches PROCESSED
+    # (``_upsert_doc_status_transition``). Last, as the dialog shows it last.
+    "failure",
 )
 
 

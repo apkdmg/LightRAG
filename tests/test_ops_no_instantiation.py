@@ -14,11 +14,13 @@ from fastapi.testclient import TestClient
 from lightrag.api.workspace_manager import WorkspaceManager
 from lightrag.kg import shared_storage
 from tests.ops_fixtures import (
+    RUN_ID,
     WORKER_ID,
     FakeRegistry,
     build_app,
     ops_routes,
     seed_health,
+    seed_runs,
     seeded_store,
     shared_state,
 )
@@ -68,10 +70,12 @@ def _concrete(path: str) -> str:
         .replace("{doc_id}", "doc-aaaa0007")
         .replace("{dep}", "postgres")
         .replace("{worker_id}", WORKER_ID)
+        .replace("{run_id}", RUN_ID)
     )
 
 
-def test_every_get_answers_without_instantiating(guarded):
+@pytest.mark.parametrize("tracking", [False, True], ids=["legacy", "run_tracking"])
+def test_every_get_answers_without_instantiating(guarded, tracking):
     manager = WorkspaceManager(instance_factory=_forbidden("instance_factory"))
     store = seeded_store()
     app = build_app(
@@ -81,6 +85,9 @@ def test_every_get_answers_without_instantiating(guarded):
     )
     # Probe results and heartbeats, so the Health and Workers GETs read data.
     seed_health(app, store)
+    # Durable runs and failures, read by the same routes with tracking on.
+    seed_runs(store)
+    app.state.ops.service.run_tracking = tracking
     client = TestClient(app, raise_server_exceptions=True)
     gets = [r for r in ops_routes.router.routes if "GET" in r.methods]
     assert len(gets) >= 20

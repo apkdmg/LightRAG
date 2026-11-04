@@ -12,6 +12,14 @@ files ``0600`` in ``0700`` directories (the same trust boundary as the
 workspace's other stored content). One file per bundle: a newer re-sync of the
 same email replaces a queued older one, so the latest version wins. A per-
 workspace ``flock`` keeps multiple server processes from draining twice.
+
+For the Operations console each drain attempt is recorded in KV
+``resync:<workspace>`` (attempts, last result class and reason, last attempt,
+last success, backoff deadline) and each applied batch is an ``email_batch``
+run. A backoff sleep runs in 5 s slices and ends early when KV
+``kick:<workspace>`` was written after it started (by any process). All of it
+goes through :mod:`lightrag.api.ops.runs` and is a no-op with run tracking
+off.
 """
 
 from __future__ import annotations
@@ -23,11 +31,15 @@ import json
 import os
 import re
 import time
+from collections import deque
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional
 from uuid import uuid4
 
+from lightrag.api.ops import runs as ops_runs
+from lightrag.api.ops.classify import classify_failure
 from lightrag.api.ops.context import background_log_context
+from lightrag.api.ops.redact import redact
 from lightrag.utils import logger
 
 _SUBDIR = ".email_resync_queue"
@@ -36,6 +48,11 @@ _SAFE_WORKSPACE = re.compile(r"[A-Za-z0-9_.\-]{1,128}")
 _RECORD_VERSION = 2
 # Version 2 added ``keep_paths``; version 1 records still apply after an upgrade.
 _READABLE_VERSIONS = (1, 2)
+# Backoff sleeps are cut into slices; a kick is checked between slices.
+_KICK_SLICE_SECONDS = 5.0
+# Window of the drain outcome counts in KV ``resync:<ws>.drains_1h``.
+_DRAIN_WINDOW_SECONDS = 3600.0
+_DRAIN_CLASSES = ("ok", "slot_busy", "error")
 
 GetRag = Callable[[str], Awaitable[Any]]
 
@@ -65,6 +82,12 @@ class DeferredResyncQueue:
         self._drainers: dict[str, asyncio.Task] = {}
         self._background: set[asyncio.Task] = set()
         self._closed = False
+        # Per-workspace drain bookkeeping for the Operations console.
+        self._attempts: dict[str, int] = {}
+        # Drain outcomes of the last hour per workspace, for the console.
+        self._drains: dict[str, deque[tuple[float, str]]] = {}
+        self._states: dict[str, dict[str, Any]] = {}
+        self._busy_reasons: dict[str, Optional[str]] = {}
 
     # -- paths -----------------------------------------------------------
     @property
@@ -150,6 +173,20 @@ class DeferredResyncQueue:
         """Workspaces this process is draining now (read-only, for heartbeats)."""
         return sorted(w for w, task in self._drainers.items() if not task.done())
 
+    def drainer_states(self) -> list[dict[str, Any]]:
+        """Live drainers with their state and backoff deadline (heartbeats)."""
+        out = []
+        for workspace in self.active_drainers():
+            state = self._states.get(workspace) or {}
+            out.append(
+                {
+                    "workspace": workspace,
+                    "state": state.get("state") or "draining",
+                    "backoff_until": state.get("backoff_until"),
+                }
+            )
+        return out
+
     async def start(self) -> None:
         """Resume draining anything left over from a previous run."""
         if not self._base.exists():
@@ -181,29 +218,122 @@ class DeferredResyncQueue:
     async def _drain_loop(self, workspace: str) -> None:
         backoff = self._min_backoff
         directory = self._dir(workspace)
-        while not self._closed:
-            paths = sorted(directory.glob("*.json"), key=_mtime)
-            if not paths:
-                return
-            progressed = False
-            lock_fd = _try_flock(directory)
-            if lock_fd is not None:
-                try:
-                    rag = await self._get_rag(workspace)
-                    progressed = await self._apply_batch(
-                        rag, workspace, paths[: self._batch_size]
-                    )
-                except asyncio.CancelledError:
-                    raise
-                except Exception as e:
-                    logger.error(f"Queued email re-sync drain failed: {e}")
-                finally:
-                    _release_flock(lock_fd)
-            if progressed:
-                backoff = self._min_backoff
-                continue
-            await asyncio.sleep(backoff)
-            backoff = min(backoff * 2, self._max_backoff)
+        self._states[workspace] = {"state": "draining", "backoff_until": None}
+        try:
+            while not self._closed:
+                paths = sorted(directory.glob("*.json"), key=_mtime)
+                if not paths:
+                    return
+                progressed = False
+                attempted = False
+                result: tuple[str, Optional[str], Optional[str]] = ("ok", None, None)
+                lock_fd = _try_flock(directory)
+                if lock_fd is not None:
+                    attempted = True
+                    try:
+                        rag = await self._get_rag(workspace)
+                        progressed = await self._apply_batch(
+                            rag, workspace, paths[: self._batch_size]
+                        )
+                        if not progressed:
+                            # The destructive slot was busy (no exception).
+                            result = (
+                                "slot_busy",
+                                self._busy_reasons.pop(workspace, None),
+                                None,
+                            )
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as e:
+                        logger.error(f"Queued email re-sync drain failed: {e}")
+                        result = (
+                            "error",
+                            f"{type(e).__name__}: {e}",
+                            classify_failure(e).error_kind,
+                        )
+                    finally:
+                        _release_flock(lock_fd)
+                if progressed:
+                    self._record_drain(workspace, "ok")
+                    backoff = self._min_backoff
+                    continue
+                deadline = time.time() + backoff
+                if attempted:
+                    # Another process holding the flock records its own drain.
+                    self._record_drain(workspace, *result, backoff_until=deadline)
+                await self._backoff_sleep(workspace, backoff)
+                backoff = min(backoff * 2, self._max_backoff)
+        finally:
+            self._states.pop(workspace, None)
+
+    def _record_drain(
+        self,
+        workspace: str,
+        result_class: str,
+        reason: Optional[str] = None,
+        error_kind: Optional[str] = None,
+        *,
+        backoff_until: Optional[float] = None,
+    ) -> None:
+        """KV ``resync:<ws>`` for the console; attempts reset on success.
+
+        ``drains_1h`` counts this process's drain outcomes of the last hour
+        (a workspace's queue is drained by the process holding its flock).
+        """
+        now = time.time()
+        history = self._drains.setdefault(workspace, deque())
+        history.append((now, result_class))
+        while history and history[0][0] < now - _DRAIN_WINDOW_SECONDS:
+            history.popleft()
+        drains: dict[str, Any] = {name: 0 for name in _DRAIN_CLASSES}
+        for _, name in history:
+            drains[name] = drains.get(name, 0) + 1
+        drains["window_s"] = int(_DRAIN_WINDOW_SECONDS)
+        if result_class == "ok":
+            self._attempts.pop(workspace, None)
+            patch: dict[str, Any] = {
+                "attempts": 0,
+                "last_result_class": "ok",
+                "reason": None,
+                "error_kind": None,
+                "last_attempt_at": now,
+                "last_ok_at": now,
+                "backoff_until": None,
+                "drains_1h": drains,
+            }
+        else:
+            attempts = self._attempts.get(workspace, 0) + 1
+            self._attempts[workspace] = attempts
+            patch = {
+                "attempts": attempts,
+                "last_result_class": result_class,
+                "reason": redact(reason, 200) or None if reason else None,
+                "error_kind": error_kind,
+                "last_attempt_at": now,
+                "backoff_until": backoff_until,
+                "drains_1h": drains,
+            }
+        ops_runs.resync_result(workspace, patch)
+
+    async def _backoff_sleep(self, workspace: str, seconds: float) -> None:
+        """Sleep ``seconds`` in slices; a newer ``kick:<ws>`` ends it early."""
+        started = time.time()
+        deadline = started + seconds
+        self._states[workspace] = {"state": "backoff", "backoff_until": deadline}
+        try:
+            while not self._closed:
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    return
+                await asyncio.sleep(min(_KICK_SLICE_SECONDS, remaining))
+                if time.time() >= deadline:
+                    return
+                kicked = await ops_runs.kick_at(workspace)
+                if kicked is not None and kicked > started:
+                    logger.info("Queued email re-sync kicked; retrying now")
+                    return
+        finally:
+            self._states[workspace] = {"state": "draining", "backoff_until": None}
 
     async def _apply_batch(self, rag: Any, workspace: str, paths: list[Path]) -> bool:
         """Sync each queued bundle: delete what changed, then enqueue the new.
@@ -226,74 +356,99 @@ class DeferredResyncQueue:
         from lightrag.base import DocStatus
         from lightrag.parser_routing import resolve_chunk_options
 
-        acquired, _reason = await _acquire_destructive_busy(rag)
+        acquired, reason = await _acquire_destructive_busy(
+            rag, run_kind="email_batch", trigger="resync"
+        )
         if not acquired:
+            self._busy_reasons[workspace] = reason
             return False
 
         loaded: list[tuple[Path, dict, Any]] = []
+        # The batch's run outlives the slot: it ends after the enqueue below.
+        run_id: Optional[str] = None
+        outcome = "failed"
         try:
-            all_docs = await rag.doc_status.get_docs_by_statuses(list(DocStatus))
-            records = [(p, r) for p in paths if (r := _load_record(p)) is not None]
-            plans = {}
-            for path, record in records:
-                stored = await _stored_bundle_state(
-                    rag, all_docs, f"{record['prefix_base']}__"
-                )
-                plans[path] = plan_bundle_sync(
-                    stored,
-                    [(content, fp) for content, fp in record["components"]],
-                    record["keep_paths"],
-                )
-            deletes = sum(len(plan.delete_ids) for plan in plans.values())
-            if deletes:
-                await _mark_deletion_job(
-                    rag, f"queue ({len(records)} re-synced emails)", deletes
-                )
-            for path, record in records:
+            try:
+                all_docs = await rag.doc_status.get_docs_by_statuses(list(DocStatus))
+                records = [(p, r) for p in paths if (r := _load_record(p)) is not None]
+                plans = {}
+                for path, record in records:
+                    stored = await _stored_bundle_state(
+                        rag, all_docs, f"{record['prefix_base']}__"
+                    )
+                    plans[path] = plan_bundle_sync(
+                        stored,
+                        [(content, fp) for content, fp in record["components"]],
+                        record["keep_paths"],
+                    )
+                deletes = sum(len(plan.delete_ids) for plan in plans.values())
+                deleting_run = None
+                if deletes:
+                    deleting_run = await _mark_deletion_job(
+                        rag, f"queue ({len(records)} re-synced emails)", deletes
+                    )
+                for path, record in records:
+                    prefix_base = record["prefix_base"]
+                    lock = await _get_bundle_lock(f"{rag.workspace}:{prefix_base}")
+                    async with lock:
+                        for did in plans[path].delete_ids:
+                            res = await rag.adelete_by_doc_id(
+                                did, delete_llm_cache=False
+                            )
+                            status = getattr(res, "status", None)
+                            if status not in ("success", "not_found"):
+                                logger.warning(
+                                    f"[{prefix_base}] delete {did}: {status} "
+                                    f"{getattr(res, 'message', '')}"
+                                )
+                                ops_runs.progress(
+                                    deleting_run, failed=1, stage="delete"
+                                )
+                            else:
+                                ops_runs.progress(deleting_run, done=1, stage="delete")
+                    loaded.append((path, record, plans[path]))
+            finally:
+                run_id = await _release_destructive_busy(rag, finish=False)
+
+            chunk_opts = resolve_chunk_options(rag.addon_params)
+            for path, record, plan in loaded:
                 prefix_base = record["prefix_base"]
                 lock = await _get_bundle_lock(f"{rag.workspace}:{prefix_base}")
                 async with lock:
-                    for did in plans[path].delete_ids:
-                        res = await rag.adelete_by_doc_id(did, delete_llm_cache=False)
-                        status = getattr(res, "status", None)
-                        if status not in ("success", "not_found"):
-                            logger.warning(
-                                f"[{prefix_base}] delete {did}: {status} "
-                                f"{getattr(res, 'message', '')}"
-                            )
-                loaded.append((path, record, plans[path]))
-        finally:
-            await _release_destructive_busy(rag)
+                    if plan.insert:
+                        await rag.apipeline_enqueue_documents(
+                            [content for content, _ in plan.insert],
+                            file_paths=[fp for _, fp in plan.insert],
+                            track_id=record["track_id"],
+                            chunk_options=chunk_opts,
+                        )
+                    # Each applied email is progress (no hung report while
+                    # a long batch enqueues).
+                    ops_runs.progress(run_id, stage="enqueue")
+                    # A newer re-sync may have replaced the file meanwhile; keep it.
+                    current = _load_record(path)
+                    if current is not None and current.get("id") == record["id"]:
+                        path.unlink(missing_ok=True)
+                if plan.unchanged:
+                    logger.info(f"[{prefix_base}] Queued email re-sync unchanged")
+                else:
+                    logger.info(f"[{prefix_base}] Queued email re-sync applied")
 
-        chunk_opts = resolve_chunk_options(rag.addon_params)
-        for path, record, plan in loaded:
-            prefix_base = record["prefix_base"]
-            lock = await _get_bundle_lock(f"{rag.workspace}:{prefix_base}")
-            async with lock:
-                if plan.insert:
-                    await rag.apipeline_enqueue_documents(
-                        [content for content, _ in plan.insert],
-                        file_paths=[fp for _, fp in plan.insert],
-                        track_id=record["track_id"],
-                        chunk_options=chunk_opts,
+            if loaded:
+                # Run the pipeline even when nothing was enqueued: while this
+                # batch held the destructive slot, other processing requests
+                # (startup resume, uploads) were told "request queued" and wait
+                # for it. Its run is labelled as started by the re-sync.
+                with ops_runs.run_origin(trigger="resync"):
+                    task = asyncio.create_task(
+                        rag.apipeline_process_enqueue_documents()
                     )
-                # A newer re-sync may have replaced the file meanwhile; keep it.
-                current = _load_record(path)
-                if current is not None and current.get("id") == record["id"]:
-                    path.unlink(missing_ok=True)
-            if plan.unchanged:
-                logger.info(f"[{prefix_base}] Queued email re-sync unchanged")
-            else:
-                logger.info(f"[{prefix_base}] Queued email re-sync applied")
-
-        if loaded:
-            # Run the pipeline even when nothing was enqueued: while this batch
-            # held the destructive slot, other processing requests (startup
-            # resume, uploads) were told "request queued" and wait for it.
-            task = asyncio.create_task(rag.apipeline_process_enqueue_documents())
-            self._background.add(task)
-            task.add_done_callback(self._background.discard)
-        return True
+                self._background.add(task)
+                task.add_done_callback(self._background.discard)
+            outcome = "succeeded"
+            return True
+        finally:
+            ops_runs.finish(run_id, outcome, docs_done=len(loaded))
 
 
 def _mtime(path: Path) -> float:

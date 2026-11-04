@@ -43,6 +43,7 @@ from lightrag.api.ops.service import (
     AUDIT_EVENT_KIND,
     DEFAULT_THRESHOLDS,
     EVENT_KINDS,
+    RUN_EVENT_KIND,
     OpsBadRequest,
     OpsDataUnavailable,
     OpsNotFound,
@@ -388,7 +389,7 @@ async def status(
         "features": {
             "durable": service.available,
             "processing": service.docs_available,
-            "runs": False,
+            "runs": service.durable_runs,
             "logs": False,
             "probes": service.probes is not None,
             "heartbeats": service.heartbeat is not None,
@@ -446,7 +447,8 @@ async def processing_summary(request: Request) -> dict[str, Any]:
 
 @router.get("/processing/active")
 async def processing_active(request: Request) -> dict[str, Any]:
-    """Live jobs; approximate until run tracking: in-flight docs + shared state."""
+    """Running runs with live flags; without run tracking, in-flight documents
+    plus shared state (approximate)."""
     service = _service(request)
     return await _answer(
         service, service.active, {"runs": [], "approximate": True, "checked": 0}
@@ -474,9 +476,15 @@ async def processing_stuck(
                 "doc_minutes": doc_older_than_min
                 or DEFAULT_THRESHOLDS["stale_doc_minutes"],
                 "hung_minutes": DEFAULT_THRESHOLDS["hung_minutes"],
+                "hung_serious_minutes": DEFAULT_THRESHOLDS["hung_serious_minutes"],
                 "orphan_seconds": DEFAULT_THRESHOLDS["orphan_seconds"],
+                "reservation_minutes": DEFAULT_THRESHOLDS["reservation_minutes"],
+                "busy_without_run_minutes": DEFAULT_THRESHOLDS[
+                    "busy_without_run_minutes"
+                ],
             },
             "checked_classes": [],
+            "durable": False,
         },
     )
 
@@ -536,11 +544,16 @@ async def processing_failure_docs(
     window: str = Query("24h", max_length=8),
     page: int = Query(1, ge=1, le=10000),
     page_size: int = Query(DEFAULT_PAGE_SIZE, ge=1, le=MAX_PAGE_SIZE),
+    source: Optional[str] = Query(None, max_length=16),
 ) -> dict[str, Any]:
+    """Documents of a failure group: classified (durable) groups, or message
+    signatures and workspaces of older failures (``source=legacy``)."""
     service = _service(request)
     return await _answer(
         service,
-        lambda: service.failure_docs(key or "", group, window, _page(page, page_size)),
+        lambda: service.failure_docs(
+            key or "", group, window, _page(page, page_size), source
+        ),
         _empty_page(page, page_size),
     )
 
@@ -663,7 +676,43 @@ async def events(
     return await _answer(
         service,
         call,
-        {"items": [], "kinds": [*EVENT_KINDS, AUDIT_EVENT_KIND]},
+        {"items": [], "kinds": [*EVENT_KINDS, AUDIT_EVENT_KIND, RUN_EVENT_KIND]},
+        needs_docs=False,
+    )
+
+
+# -- Run history ------------------------------------------------------------------
+
+
+@router.get("/runs")
+async def runs(
+    request: Request,
+    workspace: Optional[str] = Query(None, max_length=255),
+    kind: Optional[str] = Query(None, max_length=24),
+    status: Optional[str] = Query(None, max_length=16),
+    before: Optional[str] = Query(None, max_length=64),
+    limit: int = Query(DEFAULT_PAGE_SIZE, ge=1, le=MAX_PAGE_SIZE),
+) -> dict[str, Any]:
+    """Run history (30 days), newest first; ``next_before`` pages back."""
+    service = _service(request)
+    return await _answer(
+        service,
+        lambda: service.runs_page(
+            workspace=workspace, kind=kind, status=status, before=before, limit=limit
+        ),
+        {"items": [], "next_before": None, "limit": limit, "tracking": False},
+        needs_docs=False,
+    )
+
+
+@router.get("/runs/{run_id}")
+async def run_detail(request: Request, run_id: str) -> dict[str, Any]:
+    """Run drawer: the run, its failed documents (up to 200), live flags."""
+    service = _service(request)
+    return await _answer(
+        service,
+        lambda: service.run_detail(run_id),
+        {"run": None, "failures": [], "failures_capped": False, "log_count": None},
         needs_docs=False,
     )
 

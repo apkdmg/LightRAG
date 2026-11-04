@@ -2,7 +2,6 @@ import { useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { Seg } from '@/features/TokenInsights/ui'
 import { ProcessingSummary, opsApi } from './api'
-import ComingLater from './components/ComingLater'
 import { Panel } from './components/Panel'
 import { useOpsNav } from './context'
 import { fmtCount } from './format'
@@ -14,6 +13,7 @@ import BacklogView from './processing/BacklogView'
 import EmailQueueView from './processing/EmailQueueView'
 import FailuresView from './processing/FailuresView'
 import PausesView from './processing/PausesView'
+import RunsView from './processing/RunsView'
 import StuckView from './processing/StuckView'
 
 /** Backlog totals come from a 10 s server cache; 15 s keeps the bar honest without extra load. */
@@ -122,7 +122,7 @@ export default function ProcessingTab() {
         {sub === 'failures' ? <FailuresView /> : null}
         {sub === 'email' ? <EmailQueueView /> : null}
         {sub === 'pauses' ? <PausesView /> : null}
-        {sub === 'runs' ? <ComingLater title={t('operations.later.runs.title')} body={t('operations.later.runs.body')} /> : null}
+        {sub === 'runs' ? <RunsView /> : null}
       </div>
     </div>
   )

@@ -350,6 +350,8 @@ class Heartbeat:
         self.last_write_ok_at: Optional[float] = None
         self.beats = 0
         self.write_failures = 0
+        # Set by the ops runtime when run tracking runs in this process.
+        self.run_tracker: Any = None
         self._failing = False
         self._last_sample_at = 0.0
         self._last_host_at = 0.0
@@ -481,6 +483,16 @@ class Heartbeat:
 
     def _drainers(self) -> list[dict[str, Any]]:
         queue = getattr(self.app_state, "email_resync_queue", None)
+        states = getattr(queue, "drainer_states", None)
+        if callable(states):
+            return [
+                {
+                    "workspace": d["workspace"],
+                    "state": d.get("state") or "draining",
+                    "backoff_until": _iso(d.get("backoff_until")),
+                }
+                for d in states()[:MAX_DRAINERS]
+            ]
         active = getattr(queue, "active_drainers", None)
         if not callable(active):
             return []
@@ -519,6 +531,11 @@ class Heartbeat:
         except Exception:
             snapshot["recorder"] = None
         snapshot["log_sink"] = None
+        try:
+            tracker = self.run_tracker
+            snapshot["run_tracking"] = tracker.stats() if tracker is not None else None
+        except Exception:
+            snapshot["run_tracking"] = None
         try:
             snapshot["drainers"] = self._drainers()
         except Exception:

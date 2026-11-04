@@ -47,6 +47,7 @@ from fastapi import (
 from pydantic import BaseModel, Field
 
 from lightrag.api.dependencies import resolve_workspace_from_request
+from lightrag.api.ops import runs as ops_runs
 from lightrag.api.ops.context import bind_log_workspace
 from lightrag.api.ops.redact import mask_path, text_ref
 from lightrag.api.provider_alerts import is_own_alert_email
@@ -392,21 +393,26 @@ async def _stored_bundle_state(
     return state
 
 
-async def _mark_deletion_job(rag: Any, bundle_key: str, count: int) -> None:
+async def _mark_deletion_job(rag: Any, bundle_key: str, count: int) -> Optional[str]:
     """Set pipeline_status.job_name so adelete_by_doc_id's busy-join guard admits us.
 
     The guard requires the running job_name to start with "deleting" and contain
-    "document" (see lightrag.py adelete_by_doc_id).
+    "document" (see lightrag.py adelete_by_doc_id). Returns the run that holds
+    the destructive slot (None with run tracking off), so the caller can
+    report each deletion as progress.
     """
     from lightrag.kg.shared_storage import get_namespace_data, get_namespace_lock
 
     ps = await get_namespace_data("pipeline_status", workspace=rag.workspace)
     lock = get_namespace_lock("pipeline_status", workspace=rag.workspace)
     msg = f"Overwriting email bundle {bundle_key}"
+    job_name = f"Deleting email bundle {bundle_key} ({count} documents)"
     async with lock:
+        # The run that holds the destructive slot (None: tracking off).
+        run_id = ps.get("run_id")
         ps.update(
             {
-                "job_name": f"Deleting email bundle {bundle_key} ({count} documents)",
+                "job_name": job_name,
                 "job_start": datetime.now(timezone.utc).isoformat(),
                 "docs": count,
                 "batchs": count,
@@ -416,6 +422,10 @@ async def _mark_deletion_job(rag: Any, bundle_key: str, count: int) -> None:
         )
         if "history_messages" in ps:
             ps["history_messages"][:] = [msg]
+    ops_runs.progress(
+        run_id, docs_total=count, label=ops_runs.job_label(job_name), stage="delete"
+    )
+    return run_id
 
 
 # ============================================================================
@@ -1086,7 +1096,9 @@ class EmailIngestionService:
             reason: Optional[str] = None
             attempts = 3 if can_defer else 5
             for attempt in range(attempts):
-                acquired, reason = await _acquire_destructive_busy(rag)
+                acquired, reason = await _acquire_destructive_busy(
+                    rag, run_kind="email_delete", trigger="email"
+                )
                 if acquired:
                     break
                 await asyncio.sleep(_OVERWRITE_RETRY_BASE_SECONDS * (attempt + 1))
@@ -1096,11 +1108,15 @@ class EmailIngestionService:
                 raise RuntimeError(
                     f"Cannot overwrite email bundle {prefix_base}: {reason}"
                 )
+            delete_outcome = "failed"
             try:
                 # Plan again under the slot: the first snapshot may be stale.
                 plan = await self._plan_sync(prefix_base, components, keep_paths)
+                run_id = None
                 if plan.delete_ids:
-                    await _mark_deletion_job(rag, prefix_base, len(plan.delete_ids))
+                    run_id = await _mark_deletion_job(
+                        rag, prefix_base, len(plan.delete_ids)
+                    )
                 for did in plan.delete_ids:
                     res = await rag.adelete_by_doc_id(did, delete_llm_cache=False)
                     status = getattr(res, "status", None)
@@ -1109,8 +1125,12 @@ class EmailIngestionService:
                             f"[{prefix_base}] delete {did}: {status} "
                             f"{getattr(res, 'message', '')}"
                         )
+                        ops_runs.progress(run_id, failed=1, stage="delete")
+                    else:
+                        ops_runs.progress(run_id, done=1, stage="delete")
+                delete_outcome = "succeeded"
             finally:
-                await _release_destructive_busy(rag)
+                await _release_destructive_busy(rag, outcome=delete_outcome)
             if plan.unchanged:
                 return "unchanged", 0
 
@@ -1776,6 +1796,11 @@ is not ingested. The response is 200 with `status` set to `skipped`.
         The email content and attachments are processed and stored with linking
         metadata that preserves their relationships in the knowledge graph.
         """
+        # Operations console: when email last arrived (KV, at most once a
+        # minute per process; buffered, never blocks the request).
+        from lightrag.api.ops import runs as ops_runs
+
+        ops_runs.note_email_ingest()
         try:
             # Resolve the per-workspace LightRAG instance and run the email
             # ingestion service with native inline-image vision description.

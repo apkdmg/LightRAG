@@ -58,6 +58,7 @@ from lightrag.api.ops.store import (  # noqa: E402
     MemoryOpsStore,
     Page,
     PostgresOpsStore,
+    deleted_key,
     workspace_hash,
 )
 
@@ -178,6 +179,8 @@ async def _reset(store: PostgresOpsStore) -> None:
         await conn.execute("TRUNCATE lightrag_ops_kv")
         await conn.execute("TRUNCATE lightrag_ops_audit")
         await conn.execute("TRUNCATE lightrag_ops_probes")
+        await conn.execute("TRUNCATE lightrag_ops_runs")
+        await conn.execute("TRUNCATE lightrag_ops_doc_failures")
 
 
 # -- small dataset: Postgres and the memory store must agree ---------------------
@@ -304,9 +307,17 @@ async def test_postgres_matches_memory_store(pg):
             want = await memory.legacy_failures(24, group, include)
             assert norm(got["groups"]) == norm(want["groups"]), group
             assert got["cancelled"]["count"] == want["cancelled"]["count"]
-        key = (await pg.legacy_failures(24, group, False))["groups"][0]["key"]
+        top = (await pg.legacy_failures(24, group, False))["groups"][0]
+        key = top["key"]
         got = await pg.failure_docs(24, group, key, Page(5, 0))
         assert norm(got) == norm(await memory.failure_docs(24, group, key, Page(5, 0)))
+        # A drill lists exactly the rows its group counted (no classified ones).
+        assert got[1] == top["count"], group
+    # ws5 holds a classified failure (metadata.failure): its legacy drill
+    # leaves it out, as its legacy group count does.
+    groups = (await pg.legacy_failures(24, "workspace", False))["groups"]
+    counted = next((g["count"] for g in groups if g["key"] == "ws5"), 0)
+    assert (await pg.failure_docs(24, "workspace", "ws5", Page(50, 0)))[1] == counted
     got = await pg.failure_docs(24, "cancelled", "cancelled", Page(50, 0))
     assert norm(got) == norm(
         await memory.failure_docs(24, "cancelled", "cancelled", Page(50, 0))
@@ -550,6 +561,199 @@ async def test_forget_workspace(pg):
         "target": workspace_hash(ws),
         "actor": "admin",
     }
+
+
+# -- run tracking ---------------------------------------------------------------------
+
+
+def _run_row(run_id: str, ws: str, status: str, started: float, **extra) -> dict:
+    return {
+        "run_id": run_id,
+        "workspace": ws,
+        "kind": extra.pop("kind", "process"),
+        "trigger": "upload",
+        "status": status,
+        "worker_id": "0123456789abcdef0123456789abcdef",
+        "pid": 7,
+        "started_at": started,
+        "heartbeat_at": started + 10,
+        "progress_at": started + 5,
+        "finished_at": started + 20 if status != "running" else None,
+        "docs_total": 3,
+        "docs_done": 2,
+        "docs_failed": 1,
+        "stage": "extract",
+        "label": "x [3 files]",
+        "error_kind": None,
+        "error_summary": None,
+        "request_id": None,
+        **extra,
+    }
+
+
+async def test_run_tracking_matches_memory_store(pg):
+    await _reset(pg)
+    memory = MemoryOpsStore()
+    now = time.time()
+    ids = [f"{i:032x}" for i in range(1, 9)]
+    rows = [
+        _run_row(ids[0], "ws1", "running", now - 600),
+        _run_row(ids[1], "ws1", "succeeded", now - 3600, kind="delete"),
+        _run_row(ids[2], "ws2", "running", now - 900),
+        _run_row(ids[3], "ws2", "failed", now - 7200),
+        _run_row(ids[4], "ws3", "running", now - 300),
+        _run_row(ids[5], "ws3", "cancelled", now - 40 * 86400),
+    ]
+    failures = [
+        {
+            "ts": now - 60 * i,
+            "workspace": f"ws{1 + i % 3}",
+            "doc_id": f"doc-{i % 4}",
+            "track_id": None,
+            "run_id": ids[i % 3],
+            "stage": ("parse", "extract", "merge")[i % 3],
+            "error_kind": ("timeout", "rate_limited", "cancelled", "storage")[i % 4],
+            "http_status": 429 if i % 4 == 1 else None,
+            "exc_type": "x.Error",
+            "message": f"masked message {i}",
+            "attempt": 1 + i // 4,
+            "model": None if i % 5 == 0 else "gpt-4o-mini",
+        }
+        for i in range(12)
+    ]
+    for store in (pg, memory):
+        await store.runs_write(rows)
+        await store.doc_failures_write(failures)
+        # A late running write never reopens a finished run.
+        await store.runs_write([_run_row(ids[1], "ws1", "running", now - 3600)])
+        assert await store.runs_orphan(
+            [ids[2], ids[1]], {ids[2]: "host_gone", ids[1]: "pid_gone"}
+        ) == [ids[2]]
+        # finish() after orphaning: final status, was_orphaned kept.
+        await store.runs_write([_run_row(ids[2], "ws2", "succeeded", now - 900)])
+        # A NUL character never fails a write (Postgres text rejects it).
+        await store.runs_write(
+            [{**_run_row(ids[4], "ws3", "running", now - 300), "label": "a\x00b"}]
+        )
+
+    def norm(value):
+        if isinstance(value, list):
+            return [norm(v) for v in value]
+        if isinstance(value, tuple):
+            return tuple(norm(v) for v in value)
+        if isinstance(value, dict):
+            return {
+                k: norm(v)
+                for k, v in value.items()
+                if not k.endswith("_age_s")
+                and k != "id"
+                and not k.startswith("worker_")
+            }
+        if isinstance(value, datetime):
+            return value.astimezone(timezone.utc).replace(microsecond=0)
+        if isinstance(value, float):
+            return round(value, 3)
+        return value
+
+    got = await pg.run_get(ids[2])
+    assert got["status"] == "succeeded" and got["was_orphaned"] is True
+    # How the owner's death was confirmed, and the host its PID lived on.
+    assert got["orphaned_by"] == "host_gone"
+    assert got["run_host"] == (await memory.run_get(ids[2]))["run_host"]
+    assert (await pg.run_get(ids[1]))["status"] == "succeeded"
+    assert norm(await pg.running_runs(10)) == norm(await memory.running_runs(10))
+    for kwargs in (
+        {"workspace": None, "kind": None, "status": None},
+        {"workspace": "ws1", "kind": None, "status": None},
+        {"workspace": None, "kind": "delete", "status": "succeeded"},
+    ):
+        first = await pg.runs_page(**kwargs, before=None, limit=2)
+        mfirst = await memory.runs_page(**kwargs, before=None, limit=2)
+        assert norm(first) == norm(mfirst)
+        if first:
+            cursor = (first[-1]["started_at"], first[-1]["run_id"])
+            mcursor = (mfirst[-1]["started_at"], mfirst[-1]["run_id"])
+            assert norm(await pg.runs_page(**kwargs, before=cursor, limit=10)) == norm(
+                await memory.runs_page(**kwargs, before=mcursor, limit=10)
+            )
+    assert norm(await pg.last_runs(["ws1", "ws2", "nope"])) == norm(
+        await memory.last_runs(["ws1", "ws2", "nope"])
+    )
+    assert norm(await pg.run_failures(ids[0], 50)) == norm(
+        await memory.run_failures(ids[0], 50)
+    )
+    for group in ("error_kind", "stage", "model", "workspace"):
+        for include in (False, True):
+            got = await pg.failure_groups(24, group, include)
+            want = await memory.failure_groups(24, group, include)
+            assert norm(got) == norm(want), (group, include)
+        key = (await pg.failure_groups(24, group, False))["groups"][0]["key"]
+        assert norm(await pg.failure_group_docs(24, group, key, Page(3, 0))) == norm(
+            await memory.failure_group_docs(24, group, key, Page(3, 0))
+        )
+    assert norm(
+        await pg.failure_group_docs(24, "error_kind", "cancelled", Page(10, 0))
+    ) == norm(
+        await memory.failure_group_docs(24, "error_kind", "cancelled", Page(10, 0))
+    )
+    assert norm(await pg.failures_by_kind("ws1", 24)) == norm(
+        await memory.failures_by_kind("ws1", 24)
+    )
+    assert norm(await pg.doc_failures("ws2", "doc-1", 10)) == norm(
+        await memory.doc_failures("ws2", "doc-1", 10)
+    )
+    end = datetime.now(timezone.utc) + timedelta(minutes=1)
+    assert norm(await pg.run_events(end - timedelta(days=1), end, 10)) == norm(
+        await memory.run_events(end - timedelta(days=1), end, 10)
+    )
+
+    # Pauses: open ones only; merge_existing never creates keys.
+    await pg.kv_put("pause:ws1:extraction", {"workspace": "ws1", "cleared_at": None})
+    await pg.kv_put("pause:ws2:query", {"workspace": "ws2", "cleared_at": now})
+    await pg.kv_merge_existing(
+        {"pause:ws1:vision": {"cleared_at": now}, "pause:ws1:extraction": {"x": 1}}
+    )
+    assert [p["key"] for p in await pg.open_pauses(10)] == ["pause:ws1:extraction"]
+    assert await pg.kv_get("pause:ws1:vision") is None
+    # Counts are SQL aggregates; pages come from SQL, oldest first.
+    for i in range(3):
+        value = {
+            "workspace": f"p{i}",
+            "slot": "extraction",
+            "kind": "budget_exhausted",
+            "since": now - 100 + i,
+            "cleared_at": None,
+        }
+        await pg.kv_put(f"pause:p{i}:extraction", value)
+        await memory.kv_put(f"pause:p{i}:extraction", value)
+    await memory.kv_put(
+        "pause:ws1:extraction", {"workspace": "ws1", "cleared_at": None}
+    )
+    assert await pg.pause_counts() == await memory.pause_counts()
+    assert (await pg.pause_counts())["total"] == 4
+    for offset in (0, 2):
+        assert [p["key"] for p in await pg.pauses_page(2, offset)] == [
+            p["key"] for p in await memory.pauses_page(2, offset)
+        ]
+
+    # Retention and deletion.
+    await pg.runs_cleanup(30, 90)
+    assert await pg.run_get(ids[5]) is None
+    await pg.forget_workspace("ws1")
+    assert await pg.last_runs(["ws1"]) == {}
+    assert await pg.failures_by_kind("ws1", 24) == []
+    # A tombstone keeps other workers' buffered rows from coming back.
+    tombstone = await pg.kv_get(deleted_key("ws1"))
+    assert isinstance(tombstone["at"], float)
+
+    # The running-runs read can use the partial index.
+    async with pg.dedicated_connection() as conn:
+        await conn.execute("SET enable_seqscan = off")
+        plan = await conn.fetchval(
+            """EXPLAIN (FORMAT JSON) SELECT run_id FROM lightrag_ops_runs
+            WHERE status = 'running' ORDER BY heartbeat_at"""
+        )
+    assert "idx_ops_runs_running" in json.dumps(plan)
 
 
 # -- release scale ------------------------------------------------------------------

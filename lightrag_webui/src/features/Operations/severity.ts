@@ -89,20 +89,50 @@ export const isStale = (updatedAtMs: number | null | undefined, freshnessSeconds
   return now - updatedAtMs > 2 * freshnessSeconds * 1000
 }
 
-/** Run and stuck classes, each with a plain-language explanation (operations.run.<id>.*). */
-export const RUN_STATES = ['running', 'paused', 'hung', 'orphaned', 'busy_without_run', 'reservation', 'stale_doc', 'unresponsive'] as const
+/**
+ * Run and stuck classes, each with a plain-language explanation
+ * (operations.run.<id>.*): the live ones, the stuck classes, and the
+ * outcomes of a finished run (succeeded, failed, cancelled). These are the
+ * server's own state strings (OpsService._running_state and the stuck
+ * classes); a run whose owner stopped beating is `unresponsive`.
+ */
+export const RUN_STATES = [
+  'running',
+  'cancelling',
+  'paused',
+  'hung',
+  'orphaned',
+  'busy_without_run',
+  'reservation',
+  'stale_doc',
+  'unresponsive',
+  'succeeded',
+  'failed',
+  'cancelled'
+] as const
 export type RunState = (typeof RUN_STATES)[number]
 
 const RUN_LOOK: Record<RunState, OpsState> = {
   running: 'running',
+  // Still holding the workspace until the current document finishes.
+  cancelling: 'running',
   paused: 'paused',
   hung: 'serious',
   orphaned: 'critical',
   busy_without_run: 'critical',
   reservation: 'critical',
   stale_doc: 'warning',
-  unresponsive: 'serious'
+  unresponsive: 'serious',
+  succeeded: 'ok',
+  // A failed run is history, not an open incident: its documents are retried.
+  failed: 'serious',
+  // A user's soft cancel; the cancelled documents are retried by the next run.
+  cancelled: 'unknown'
 }
+
+/** States of a run that is still holding its workspace (the drawer polls faster, the dot may breathe). */
+export const isLiveRunState = (raw: string | null | undefined) =>
+  raw === 'running' || raw === 'cancelling' || raw === 'hung' || raw === 'unresponsive'
 
 export type RunLook = StateLook & { state: OpsState; explain: string }
 

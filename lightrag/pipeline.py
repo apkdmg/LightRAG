@@ -47,7 +47,8 @@ from lightrag.exceptions import (
 from lightrag.kg.shared_storage import get_namespace_data, get_namespace_lock
 from lightrag.operate import merge_nodes_and_edges
 from lightrag.usage import document_usage_fields, emit_event, run_in_usage_scope
-from lightrag.api.ops.context import background_log_context
+from lightrag.api.ops import runs as ops_runs
+from lightrag.api.ops.context import background_log_context, reset_run_id, set_run_id
 from lightrag.api.ops.redact import mask_path, redact_traceback
 from lightrag.provider_rejection import (
     EXTRACT_ROLE,
@@ -189,6 +190,13 @@ def _format_chunking_params(
     return ", ".join(pieces)
 
 
+def _duplicate_failure(stage: str, run_id: str | None = None) -> dict[str, Any]:
+    """``{"failure": ...}`` for a duplicate row (no failure history row is
+    written); empty when run tracking is off."""
+    failure = ops_runs.duplicate_failure(stage, run_id)
+    return {"failure": failure} if failure else {}
+
+
 @dataclass
 class _BatchRunContext:
     """Per-batch shared state for the parse/analyze/process worker pipeline.
@@ -211,6 +219,8 @@ class _BatchRunContext:
     processed_count: int = 0
     # Documents set aside this batch because the provider pause is active.
     paused_skips: int = 0
+    # Operations console run that owns this batch (None: tracking off).
+    run_id: str | None = None
 
 
 class _PipelineMixin:
@@ -842,6 +852,7 @@ class _PipelineMixin:
                             "duplicate_kind": duplicate_kind,
                             "original_doc_id": attempt.get("original_doc_id", doc_id),
                             "original_track_id": attempt.get("existing_track_id", ""),
+                            **_duplicate_failure("enqueue"),
                         },
                     }
 
@@ -1043,6 +1054,10 @@ class _PipelineMixin:
             )
             return
 
+        # Run tracking (Operations console): a pure ID, no I/O; the owner keys
+        # ride in the same busy update below and the run row is buffered after
+        # the lock is released. All of it is a no-op with tracking off.
+        run_id = ops_runs.new_run_id()
         async with pipeline_status_lock:
             # Ensure only one worker is processing documents
             if not pipeline_status.get("busy", False):
@@ -1067,6 +1082,7 @@ class _PipelineMixin:
                         "request_pending": False,  # Clear any previous request
                         "cancellation_requested": False,  # Initialize cancellation flag
                         "latest_message": "",
+                        **ops_runs.owner_fields(run_id),
                     }
                 )
                 # Cleaning history_messages without breaking it as a shared list object
@@ -1078,6 +1094,18 @@ class _PipelineMixin:
                     "Another process is already processing the document queue. Request queued."
                 )
                 return
+
+        ops_runs.start(
+            run_id,
+            workspace=ops_runs.workspace_of(self),
+            kind="process",
+            trigger=ops_runs.run_trigger_for(
+                getattr(doc, "track_id", None) for doc in to_process_docs.values()
+            ),
+        )
+        run_token = set_run_id(run_id) if run_id else None
+        run_outcome = "succeeded"
+        run_error: BaseException | None = None
 
         # Tracks whether the loop has already released ``busy`` under
         # the same critical section that observed request_pending=False.
@@ -1105,6 +1133,7 @@ class _PipelineMixin:
                         pipeline_status["history_messages"].append(log_message)
 
                         # Exit directly, skipping request_pending check
+                        run_outcome = "cancelled"
                         return
 
                 # A provider rejection paused ingestion: stop without
@@ -1114,9 +1143,15 @@ class _PipelineMixin:
                     pipeline_status, pipeline_status_lock
                 ):
                     async with pipeline_status_lock:
-                        pipeline_status["busy"] = False
-                        pipeline_status["request_pending"] = False
+                        pipeline_status.update(
+                            {
+                                "busy": False,
+                                "request_pending": False,
+                                **ops_runs.clear_fields(),
+                            }
+                        )
                     busy_released_in_loop = True
+                    run_outcome = "paused"
                     break
 
                 if not to_process_docs:
@@ -1163,22 +1198,35 @@ class _PipelineMixin:
                 pipeline_status["cur_batch"] = 0
                 pipeline_status["latest_message"] = log_message
                 pipeline_status["history_messages"].append(log_message)
+                heartbeat = ops_runs.progress(
+                    run_id,
+                    add_total=len(to_process_docs),
+                    stage="parse",
+                    heartbeat=True,
+                )
+                if heartbeat:
+                    pipeline_status.update(heartbeat)
 
                 paused_skips = await self._run_pipeline_batch(
                     to_process_docs,
                     pipeline_status=pipeline_status,
                     pipeline_status_lock=pipeline_status_lock,
+                    run_id=run_id,
                 )
 
                 # A probe document cleared the provider pause mid-batch:
                 # pick up the documents that were set aside meanwhile.
-                if paused_skips and not await self._provider_pause_blocks_run(
-                    pipeline_status, pipeline_status_lock
-                ):
-                    to_process_docs = await self.doc_status.get_docs_by_statuses(
-                        list(_INFLIGHT_DOC_STATUSES)
-                    )
-                    continue
+                if paused_skips:
+                    if not await self._provider_pause_blocks_run(
+                        pipeline_status, pipeline_status_lock
+                    ):
+                        to_process_docs = await self.doc_status.get_docs_by_statuses(
+                            list(_INFLIGHT_DOC_STATUSES)
+                        )
+                        continue
+                    # Documents were set aside for the pause: the run ends
+                    # paused, whichever exit it takes below.
+                    run_outcome = "paused"
 
                 # Atomic exit handoff: if request_pending was set during
                 # this batch (e.g. a concurrent enqueue while busy=True),
@@ -1201,22 +1249,31 @@ class _PipelineMixin:
                     list(_INFLIGHT_DOC_STATUSES)
                 )
 
+        except BaseException as e:
+            if isinstance(e, asyncio.CancelledError):
+                run_outcome = "cancelled"
+            else:
+                run_outcome, run_error = "failed", e
+            raise
         finally:
             log_message = "Enqueued document processing pipeline stopped"
             logger.info(log_message)
             # If the loop already released ``busy`` under the atomic exit
             # check, don't clobber it here — a concurrent enqueue may have
             # observed busy=False and started a new processing pass that
-            # has set busy=True for itself.  Cancellation flag and log
-            # bookkeeping are always safe to update.
+            # has set busy=True (and its own owner keys) for itself.
+            # Cancellation flag and log bookkeeping are always safe to update.
             async with pipeline_status_lock:
                 if not busy_released_in_loop:
-                    pipeline_status["busy"] = False
+                    pipeline_status.update({"busy": False, **ops_runs.clear_fields()})
                 pipeline_status["cancellation_requested"] = (
                     False  # Always reset cancellation flag
                 )
                 pipeline_status["latest_message"] = log_message
                 pipeline_status["history_messages"].append(log_message)
+            ops_runs.finish(run_id, run_outcome, error=run_error)
+            if run_token is not None:
+                reset_run_id(run_token)
 
     # ============================================================
     # Pipeline orchestration
@@ -1228,6 +1285,7 @@ class _PipelineMixin:
         *,
         pipeline_status: dict,
         pipeline_status_lock,
+        run_id: str | None = None,
     ) -> int:
         """Run one batch of pending documents through the parse → analyze →
         process queues.
@@ -1244,6 +1302,10 @@ class _PipelineMixin:
         pipeline_status["job_name"] = self._format_job_name(
             to_process_docs, total_files
         )
+        if run_id:
+            ops_runs.progress(
+                run_id, label=ops_runs.job_label(pipeline_status["job_name"])
+            )
 
         ctx = _BatchRunContext(
             pipeline_status=pipeline_status,
@@ -1255,6 +1317,7 @@ class _PipelineMixin:
             q_docling=asyncio.Queue(maxsize=self.queue_size_default),
             q_analyze=asyncio.Queue(maxsize=self.queue_size_default),
             q_process=asyncio.Queue(maxsize=self.queue_size_insert),
+            run_id=run_id,
         )
 
         workers: list[asyncio.Task] = []
@@ -1476,7 +1539,9 @@ class _PipelineMixin:
             if pipeline_status.get("request_pending", False):
                 pipeline_status["request_pending"] = False
                 return False
-            pipeline_status["busy"] = False
+            # Owner keys go with ``busy`` in the same update (no-op keys
+            # when run tracking is off).
+            pipeline_status.update({"busy": False, **ops_runs.clear_fields()})
             return True
 
     @staticmethod
@@ -1554,6 +1619,7 @@ class _PipelineMixin:
                     status_doc=status_doc_w,
                     file_path=file_path_w,
                 )
+                ops_runs.progress(ctx.run_id, stage="parse")
                 if engine == "mineru":
                     parsed_data_w = await self.parse_mineru(
                         doc_id_w, file_path_w, content_data_w
@@ -1607,19 +1673,30 @@ class _PipelineMixin:
                     content_data=content_data_w,
                     pipeline_status=ctx.pipeline_status,
                     pipeline_status_lock=ctx.pipeline_status_lock,
+                    run_id=ctx.run_id,
                 ):
+                    ops_runs.doc_done(ctx.run_id)
                     continue
 
                 await ctx.q_analyze.put((doc_id_w, status_doc_w, parsed_data_w))
             except Exception as e:
                 logger.error(f"Parse worker failed ({engine}): {e}")
                 try:
+                    failed_path_w = getattr(status_doc_w, "file_path", "unknown_source")
                     await self._upsert_doc_status_transition(
                         doc_id=doc_id_w,
                         status=DocStatus.FAILED,
                         status_doc=status_doc_w,
-                        file_path=getattr(status_doc_w, "file_path", "unknown_source"),
+                        file_path=failed_path_w,
                         extra_fields={"error_msg": str(e)},
+                        metadata_extra=self._failure_metadata(
+                            doc_id=doc_id_w,
+                            status_doc=status_doc_w,
+                            stage="parse",
+                            error=e,
+                            run_id=ctx.run_id,
+                            file_path=failed_path_w,
+                        ),
                     )
                 except Exception:
                     pass
@@ -1661,6 +1738,7 @@ class _PipelineMixin:
                     status_doc=status_doc_w,
                     file_path=file_path_w,
                 )
+                ops_runs.progress(ctx.run_id, stage="analyze")
                 analyzed = await run_in_usage_scope(
                     self.analyze_multimodal(
                         doc_id=doc_id_w,
@@ -1683,12 +1761,22 @@ class _PipelineMixin:
                     e, role=VISION_ROLE, doc_id=doc_id_w, ctx=ctx
                 )
                 try:
+                    failed_path_w = getattr(status_doc_w, "file_path", "unknown_source")
                     await self._upsert_doc_status_transition(
                         doc_id=doc_id_w,
                         status=DocStatus.FAILED,
                         status_doc=status_doc_w,
-                        file_path=getattr(status_doc_w, "file_path", "unknown_source"),
+                        file_path=failed_path_w,
                         extra_fields={"error_msg": str(e)},
+                        metadata_extra=self._failure_metadata(
+                            doc_id=doc_id_w,
+                            status_doc=status_doc_w,
+                            stage="analyze",
+                            error=e,
+                            run_id=ctx.run_id,
+                            file_path=failed_path_w,
+                            role=VISION_ROLE,
+                        ),
                     )
                 except Exception:
                     pass
@@ -1784,6 +1872,12 @@ class _PipelineMixin:
                     ctx.processed_count += 1
                     current_file_number = ctx.processed_count
                     ctx.pipeline_status["cur_batch"] = ctx.processed_count
+                    # Whole-value heartbeat key, at most every 5 s (no I/O).
+                    heartbeat = ops_runs.progress(
+                        ctx.run_id, stage="extract", heartbeat=True
+                    )
+                    if heartbeat:
+                        ctx.pipeline_status.update(heartbeat)
 
                     # The status feed is the owner's own view and keeps the
                     # file name; the server log gets the doc_id and a mask.
@@ -2182,6 +2276,7 @@ class _PipelineMixin:
                     },
                     pipeline_status=ctx.pipeline_status,
                     pipeline_status_lock=ctx.pipeline_status_lock,
+                    run_id=ctx.run_id,
                 )
 
             # Concurrency is controlled by keyed lock for individual
@@ -2197,6 +2292,7 @@ class _PipelineMixin:
                     # nodes/edges to merge — but we still need to flush the
                     # chunks_vdb / text_chunks writes (already done above)
                     # and reach PROCESSED.
+                    ops_runs.progress(ctx.run_id, stage="merge")
                     if not doc_process_opts.skip_kg:
                         await merge_nodes_and_edges(
                             chunk_results=chunk_results,
@@ -2249,6 +2345,11 @@ class _PipelineMixin:
                         )
                         ctx.pipeline_status["latest_message"] = log_message
                         ctx.pipeline_status["history_messages"].append(log_message)
+                        heartbeat = ops_runs.progress(
+                            ctx.run_id, done=1, heartbeat=True
+                        )
+                        if heartbeat:
+                            ctx.pipeline_status.update(heartbeat)
 
                 except Exception as e:
                     await self._pause_for_provider_rejection(
@@ -2271,6 +2372,7 @@ class _PipelineMixin:
                         },
                         pipeline_status=ctx.pipeline_status,
                         pipeline_status_lock=ctx.pipeline_status_lock,
+                        run_id=ctx.run_id,
                     )
 
     async def _purge_stale_extraction_if_resuming(
@@ -2389,9 +2491,53 @@ class _PipelineMixin:
                 status_doc, extra=metadata_extra
             ),
         }
+        if status == DocStatus.PROCESSED:
+            # A processed document has no current failure; the history stays
+            # in the Operations console's failure table.
+            payload["metadata"].pop("failure", None)
         if extra_fields:
             payload.update(extra_fields)
         await self.doc_status.upsert({doc_id: payload})
+
+    def _failure_metadata(
+        self,
+        *,
+        doc_id: str,
+        status_doc: DocProcessingStatus,
+        stage: str,
+        error: BaseException,
+        run_id: str | None,
+        file_path: str | None,
+        role: str | None = None,
+    ) -> dict[str, Any] | None:
+        """``metadata_extra`` carrying the classified ``failure`` for a FAILED
+        upsert, after buffering the failure's history row (Operations
+        console). ``None`` when run tracking is off. Never raises, never
+        awaits: classification and buffering are in-memory only.
+        """
+        previous = None
+        metadata = getattr(status_doc, "metadata", None)
+        if isinstance(metadata, dict):
+            previous = metadata.get("failure")
+        failure = ops_runs.doc_failure(
+            workspace=ops_runs.workspace_of(self),
+            doc_id=doc_id,
+            stage=stage,
+            error=error,
+            previous=previous,
+            run_id=run_id,
+            track_id=getattr(status_doc, "track_id", None),
+            model=(lambda: self._failure_model(role)) if role else None,
+            file_path=file_path,
+        )
+        return {"failure": failure} if failure else None
+
+    def _failure_model(self, role: str) -> str | None:
+        try:
+            model = self.get_llm_role_config(role).get("model")
+        except Exception:
+            return None
+        return model if isinstance(model, str) and model else None
 
     async def _raise_if_cancelled(
         self,
@@ -2448,12 +2594,16 @@ class _PipelineMixin:
                 return True
             # Replace the whole dict: nested mutation is not propagated by
             # Manager-backed shared state in multi-process mode.
+            retry_at = now + self._provider_retry_seconds()
             ctx.pipeline_status[PROVIDER_PAUSE_KEY] = {
                 **pause,
                 "probe_doc": doc_id,
-                "retry_at": now + self._provider_retry_seconds(),
+                "retry_at": retry_at,
             }
         logger.info(f"Provider pause: retrying the provider with {doc_id}")
+        ops_runs.pause_retry(
+            ops_runs.workspace_of(self), role=pause.get("role"), retry_at=retry_at
+        )
         return False
 
     async def _park_doc_for_provider_pause(
@@ -2480,6 +2630,11 @@ class _PipelineMixin:
         if pause:
             logger.info(log_message)
             emit_event("ingestion_resumed", workspace=self.workspace)
+            ops_runs.pause_cleared(
+                ops_runs.workspace_of(self),
+                role=pause.get("role") if isinstance(pause, dict) else None,
+                reason="provider_accepted",
+            )
 
     async def _pause_for_provider_rejection(
         self,
@@ -2504,14 +2659,18 @@ class _PipelineMixin:
             previous = ctx.pipeline_status.get(PROVIDER_PAUSE_KEY)
             report = previous is None or previous.get("probe_doc") == doc_id
             if report:
+                since = previous.get("since", now) if previous else now
                 ctx.pipeline_status[PROVIDER_PAUSE_KEY] = {
                     "role": role,
                     "kind": rejection.kind,
                     "status_code": rejection.status_code,
                     "message": rejection.message,
-                    "since": previous.get("since", now) if previous else now,
+                    "since": since,
                     "retry_at": now + retry_seconds,
                     "probe_doc": None,
+                    # The name the ops console files the pause under (the
+                    # storage's, e.g. "default" for the unnamed workspace).
+                    "ops_workspace": ops_runs.workspace_of(self),
                 }
                 retry_at = datetime.fromtimestamp(now + retry_seconds, timezone.utc)
                 log_message = (
@@ -2526,6 +2685,16 @@ class _PipelineMixin:
             return True
 
         logger.warning(log_message)
+        ops_runs.pause_set(
+            ops_runs.workspace_of(self),
+            role=role,
+            kind=rejection.kind,
+            status_code=rejection.status_code,
+            since=since,
+            retry_at=now + retry_seconds,
+            message=rejection.message,
+            previous_role=previous.get("role") if previous else None,
+        )
         self._schedule_provider_resume(retry_seconds)
         host = model = None
         try:
@@ -2585,6 +2754,7 @@ class _PipelineMixin:
         metadata_extra: dict[str, Any],
         pipeline_status: dict,
         pipeline_status_lock,
+        run_id: str | None = None,
     ) -> None:
         """Common epilogue for an extract / merge stage failure.
 
@@ -2635,6 +2805,15 @@ class _PipelineMixin:
                 logger.error(f"Failed to persist LLM cache: {persist_error}")
 
         failed_chunks_list, failed_chunks_count = failed_chunks_snapshot
+        failure = self._failure_metadata(
+            doc_id=doc_id,
+            status_doc=status_doc,
+            stage=stage_label,
+            error=error,
+            run_id=run_id,
+            file_path=file_path,
+            role=EXTRACT_ROLE,
+        )
         await self._upsert_doc_status_transition(
             doc_id=doc_id,
             status=DocStatus.FAILED,
@@ -2645,7 +2824,7 @@ class _PipelineMixin:
                 "chunks_count": failed_chunks_count,
                 "chunks_list": failed_chunks_list,
             },
-            metadata_extra=metadata_extra,
+            metadata_extra={**metadata_extra, **(failure or {})},
         )
 
     # ============================================================
@@ -3146,6 +3325,7 @@ class _PipelineMixin:
         content_data: dict[str, Any] | None = None,
         pipeline_status: dict | None = None,
         pipeline_status_lock: asyncio.Lock | None = None,
+        run_id: str | None = None,
     ) -> bool:
         """Mark post-parse content duplicates and stop further processing."""
         if not content_hash:
@@ -3189,6 +3369,7 @@ class _PipelineMixin:
                             "duplicate_kind": "content_hash",
                             "original_doc_id": original_doc_id,
                             "original_track_id": original_track_id,
+                            **_duplicate_failure("parse", run_id),
                         },
                     ),
                 }

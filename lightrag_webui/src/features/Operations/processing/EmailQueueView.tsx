@@ -1,12 +1,12 @@
 import { useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { cn } from '@/lib/utils'
-import { opsApi } from '../api'
 import OpsLink from '../components/OpsLink'
 import { Pager, Panel } from '../components/Panel'
 import { StatusChip } from '../components/StatusChip'
 import { useOpsNav } from '../context'
-import { ageSeconds, fmtAge, fmtClock, fmtCount, utcTitle } from '../format'
+import { EmailQueueItem, opsApi } from '../api'
+import { ageSeconds, fmtAge, fmtClock, fmtCount, shortId, utcTitle } from '../format'
 import { useOpsPoll } from '../poll'
 
 /** The queue is scanned once a minute by one leased process (§3.4). */
@@ -16,9 +16,48 @@ const EMAIL_SECONDS = 60
 const resultState = (cls: string | null | undefined) => (cls === 'ok' ? 'ok' : cls === 'slot_busy' ? 'paused' : cls ? 'warning' : 'unknown')
 
 /**
+ * The drainer column (§2.4 "worker 813 · draining", "worker 812 · backoff
+ * 40s"): the live drainer from heartbeats, else the backoff deadline the
+ * drainer recorded (KV resync:<ws>). The time left is measured against when
+ * the data was confirmed, so it does not drift between polls.
+ */
+export function DrainerText({ item, now }: { item: Omit<EmailQueueItem, 'workspace'>; now: number | null }) {
+  const { t } = useTranslation()
+  const d = item.drainer
+  const until = d?.backoff_until ?? item.backoff_until ?? null
+  const left = until && now !== null ? -(ageSeconds(until, now) ?? 0) : null
+  const parts: string[] = []
+  if (d) {
+    const who = typeof d.pid === 'number' ? t('operations.email.worker', { id: d.pid }) : d.worker_id ? t('operations.email.worker', { id: shortId(d.worker_id) }) : null
+    if (who) parts.push(who)
+    if (d.state && !(d.state === 'backoff' && left !== null && left > 0)) parts.push(t(`operations.workerDrawer.drainer.${d.state}`, { defaultValue: d.state }))
+  }
+  if (left !== null && left > 0) parts.push(t('operations.email.backoffLeft', { age: fmtAge(left) }))
+  if (!parts.length) return <>–</>
+  return <span title={utcTitle(until)}>{parts.join(' · ')}</span>
+}
+
+/** Drains of the last hour (FR-15): is the drainer making progress, or failing again and again? */
+function DrainsText({ drains }: { drains: EmailQueueItem['drains_1h'] }) {
+  const { t } = useTranslation()
+  if (!drains) return <>–</>
+  if (!drains.ok && !drains.failed && !drains.slot_busy) return <span className="text-muted-foreground">{t('operations.email.drainsNone')}</span>
+  return (
+    <span className="flex flex-wrap gap-x-1.5">
+      {drains.ok ? <span>{t('operations.email.drainsOk', { count: drains.ok })}</span> : null}
+      {drains.failed ? <span style={{ color: 'var(--ops-warn)' }}>{t('operations.email.drainsFailed', { count: drains.failed })}</span> : null}
+      {drains.slot_busy ? <span className="text-muted-foreground">{t('operations.email.drainsBusy', { count: drains.slot_busy })}</span> : null}
+    </span>
+  )
+}
+
+/**
  * The email re-sync queue (§2.4, FR-15): records per workspace, how long the
- * oldest has waited, `.bad` files and the drainer's last result. Contents are
- * never returned; the scanner counts files without opening them.
+ * oldest has waited, `.bad` files, the drainer (live, or its backoff
+ * deadline), attempts, the drains of the last hour (ok / failed / slot busy)
+ * and the last result, including `slot_busy` when the pipeline held the
+ * workspace. Contents are never returned; the scanner
+ * counts files without opening them.
  */
 export default function EmailQueueView() {
   const { t } = useTranslation()
@@ -49,14 +88,16 @@ export default function EmailQueueView() {
           {!data.scanned_at ? <p className="text-muted-foreground m-0 text-sm">{t('operations.email.notScanned')}</p> : null}
           {data.items.length ? (
             <div className="overflow-x-auto">
-              <table className="ops-stack w-full min-w-[820px] text-[13px]">
+              <table className="ops-stack w-full min-w-[1020px] text-[13px]">
                 <thead>
                   <tr className="text-muted-foreground border-b text-xs">
                     <th className="p-2 text-left font-medium">{col('workspace')}</th>
                     <th className="p-2 text-right font-medium">{col('pending')}</th>
                     <th className="p-2 text-left font-medium">{col('since')}</th>
                     <th className="p-2 text-right font-medium">{col('bad')}</th>
+                    <th className="p-2 text-left font-medium">{col('drainer')}</th>
                     <th className="p-2 text-right font-medium">{col('attempts')}</th>
+                    <th className="p-2 text-left font-medium">{col('drains')}</th>
                     <th className="p-2 text-left font-medium">{col('last')}</th>
                     <th className="p-2 text-left font-medium">{col('lastOk')}</th>
                   </tr>
@@ -84,8 +125,14 @@ export default function EmailQueueView() {
                         <td className="p-2 text-right tabular-nums" data-label={col('bad')}>
                           {typeof r.bad === 'number' && r.bad > 0 ? <StatusChip state="warning">{fmtCount(r.bad)}</StatusChip> : fmtCount(r.bad ?? 0)}
                         </td>
-                        <td className="p-2 text-right tabular-nums" data-label={col('attempts')}>
+                        <td className="p-2 text-xs" data-label={col('drainer')}>
+                          <DrainerText item={r} now={poll.updatedAt} />
+                        </td>
+                        <td className="p-2 text-right tabular-nums" data-label={col('attempts')} title={utcTitle(r.last_attempt_at)}>
                           {fmtCount(r.attempts ?? null)}
+                        </td>
+                        <td className="p-2 text-xs whitespace-nowrap" data-label={col('drains')}>
+                          <DrainsText drains={r.drains_1h} />
                         </td>
                         <td className="p-2" data-label={col('last')}>
                           {r.last_result_class ? (

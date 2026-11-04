@@ -139,10 +139,13 @@ describe('stuckRows', () => {
     expect(stuckRows(data, true).map((r) => r.cls)).toEqual(['orphaned', 'busy_without_run', 'reservation', 'hung', 'stale_doc'])
   })
 
-  test('a stale doc drills to its document, a run class to its workspace', () => {
+  test('a stale doc drills to its document, a run to its Run drawer, a workspace flag to the workspace', () => {
     const rows = stuckRows(data, true)
     expect(rows.find((r) => r.cls === 'stale_doc')?.drawer).toEqual({ kind: 'document', workspace: 'library', id: 'doc-77' })
-    expect(rows.find((r) => r.cls === 'hung')?.drawer).toEqual({ kind: 'workspace', id: 'hr' })
+    expect(rows.find((r) => r.cls === 'hung')?.drawer).toEqual({ kind: 'run', id: 'r2' })
+    expect(rows.find((r) => r.cls === 'orphaned')?.drawer).toEqual({ kind: 'run', id: 'r1' })
+    expect(rows.find((r) => r.cls === 'busy_without_run')?.drawer).toEqual({ kind: 'workspace', id: 'law' })
+    expect(rows.find((r) => r.cls === 'reservation')?.drawer).toEqual({ kind: 'workspace', id: 'space1' })
   })
 
   test('the PR-2 shape (stale docs only, empty run classes) renders', () => {

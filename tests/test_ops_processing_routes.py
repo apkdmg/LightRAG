@@ -215,7 +215,10 @@ def test_stuck_lists_stale_docs_with_thresholds(client):
     assert body["thresholds"] == {
         "doc_minutes": 60,
         "hung_minutes": 15,
+        "hung_serious_minutes": 45,
         "orphan_seconds": 60,
+        "reservation_minutes": 5,
+        "busy_without_run_minutes": 2,
     }
     [item] = body["stale_docs"]["items"]
     assert item["workspace"] == "fsktm" and item["doc_id"] == "doc-aaaa0002"

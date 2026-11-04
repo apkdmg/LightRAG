@@ -241,6 +241,20 @@ def on_exit(server):
     print("=" * 80)
 
 
+def child_exit(server, worker):
+    """
+    Executed in the master after a worker exited (crash, kill -9, restart).
+    Leaves a tiny marker the Operations console's reconcile reads to confirm
+    that the worker's runs lost their owner. Synchronous and never raises.
+    """
+    try:
+        from lightrag.api.ops.runs import write_exit_marker
+
+        write_exit_marker(log_dir, worker.pid)
+    except Exception:
+        pass
+
+
 def post_fork(server, worker):
     """
     Executed after a worker has been forked.

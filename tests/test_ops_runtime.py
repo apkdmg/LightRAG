@@ -198,3 +198,65 @@ async def test_processing_views_need_postgres_doc_status(monkeypatch):
     assert rt.service.available is True and rt.service.docs_available is False
     assert rt.service.unavailable_reason == "doc_status_not_postgres"
     await runtime.stop_ops(app)
+
+
+async def _ready_postgres(monkeypatch):
+    async def ready(self):
+        self.ready = self.doc_status_ready = True
+
+    async def nothing(self, *args, **kwargs):
+        return None
+
+    async def lease(self, name, holder, ttl_s):
+        return False
+
+    monkeypatch.setattr(PostgresOpsStore, "initialize", ready)
+    monkeypatch.setattr(PostgresOpsStore, "finalize", nothing)
+    monkeypatch.setattr(PostgresOpsStore, "try_lease", lease)
+    monkeypatch.setattr(PostgresOpsStore, "release_lease", nothing)
+    monkeypatch.setenv("OPS_INDEX_BUILD", "0")
+    monkeypatch.setenv("OPS_PROBES_ENABLED", "false")
+
+
+async def test_run_tracking_is_installed_per_worker(monkeypatch):
+    from lightrag.api.ops import runs
+
+    await _ready_postgres(monkeypatch)
+    app = _app()
+    rt = await runtime.start_ops(app, None, SimpleNamespace(kv_storage="PGKVStorage"))
+    try:
+        assert rt.run_tracker is not None and runs.tracker() is rt.run_tracker
+        assert rt.run_tracker.worker_id == rt.worker_id
+        assert rt.service.run_tracking is True and rt.service.durable_runs is True
+        assert rt.heartbeat.run_tracker is rt.run_tracker
+        assert runs.owner_fields("r1")["owner_worker_id"] == rt.worker_id
+    finally:
+        await runtime.stop_ops(app)
+    # Stopping uninstalls it: hooks are no-ops again.
+    assert runs.tracker() is None and runs.new_run_id() is None
+
+
+async def test_run_tracking_flag_off_makes_every_hook_a_noop(monkeypatch):
+    from lightrag.api.ops import runs
+
+    await _ready_postgres(monkeypatch)
+    monkeypatch.setenv("OPS_RUN_TRACKING", "false")
+    app = _app()
+    rt = await runtime.start_ops(app, None, SimpleNamespace(kv_storage="PGKVStorage"))
+    try:
+        assert rt.run_tracker is None and runs.tracker() is None
+        assert rt.service.run_tracking is False
+        assert runs.new_run_id() is None and runs.owner_fields("x") == {}
+    finally:
+        await runtime.stop_ops(app)
+
+
+async def test_run_tracking_needs_postgres():
+    from lightrag.api.ops import runs
+
+    app = _app()
+    rt = await runtime.start_ops(app, None, SimpleNamespace(kv_storage="JsonKVStorage"))
+    try:
+        assert rt.run_tracker is None and runs.tracker() is None
+    finally:
+        await runtime.stop_ops(app)

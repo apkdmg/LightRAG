@@ -5,6 +5,7 @@ import { ActiveRun } from '../api'
 import { useOpsNav } from '../context'
 import { ageSeconds, fmtAge, fmtClock, shortId, utcTitle } from '../format'
 import { TWEEN, useOpsMotion } from '../motion'
+import { runDrawerOf } from '../processing/runs'
 import { runLookOf } from '../severity'
 import OpsLink from './OpsLink'
 import ProgressBar from './ProgressBar'
@@ -30,6 +31,10 @@ function RunNote({ run }: { run: ActiveRun }) {
     )
   }
   if (typeof run.progress_age_s === 'number' && run.state !== 'running') notes.push(t('operations.active.lastProgress', { age: fmtAge(run.progress_age_s) }))
+  // Unresponsive is about the owner worker's heartbeat, not the run's own.
+  const beatAge = typeof run.worker_heartbeat_age_s === 'number' ? run.worker_heartbeat_age_s : run.heartbeat_age_s
+  if (run.state === 'unresponsive' && typeof beatAge === 'number') notes.push(t('operations.active.lastHeartbeat', { age: fmtAge(beatAge) }))
+  if (run.state === 'orphaned') notes.push(t('operations.active.ownerGone'))
   if (run.live?.cancellation_requested) notes.push(t('operations.active.cancelling'))
   if (run.live?.destructive_busy) notes.push(t('operations.active.destructive'))
   if (!notes.length) return null
@@ -41,7 +46,9 @@ function RunNote({ run }: { run: ActiveRun }) {
  * now"). Rows enter and leave with a fade and shift by FLIP (≤ 50 rows); the
  * running dot breathes only next to "Running" text. Elapsed time is measured
  * against when the data was confirmed (`now`), so it never drifts between
- * polls. Each row opens the workspace drawer; there are no action buttons.
+ * polls. A row opens its Run drawer (the workspace drawer for interim rows
+ * without a run id); the workspace cell opens the workspace. There are no
+ * action buttons.
  */
 export default function ActiveRunsTable({
   runs,
@@ -85,7 +92,9 @@ export default function ActiveRunsTable({
             {runs.map((run) => {
               const key = run.run_id ?? `ws:${run.workspace}`
               const elapsed = run.started_at ? ageSeconds(run.started_at, now ?? undefined) : null
-              const open = () => nav.openDrawer({ kind: 'workspace', id: run.workspace })
+              const drawer = runDrawerOf(run)
+              const open = () => nav.openDrawer(drawer)
+              const openWorkspace = () => nav.openDrawer({ kind: 'workspace', id: run.workspace })
               return (
                 <motion.tr
                   key={key}
@@ -109,7 +118,7 @@ export default function ActiveRunsTable({
                     </td>
                   ) : null}
                   <td className="p-2" data-label={col('workspace')}>
-                    <OpsLink to={{ ...nav.view, drawer: { kind: 'workspace', id: run.workspace } }} onNavigate={open} className="break-all underline-offset-2 hover:underline">
+                    <OpsLink to={{ ...nav.view, drawer: { kind: 'workspace', id: run.workspace } }} onNavigate={openWorkspace} className="break-all underline-offset-2 hover:underline">
                       {run.workspace}
                     </OpsLink>
                   </td>
@@ -123,7 +132,13 @@ export default function ActiveRunsTable({
                   ) : null}
                   {!compact ? (
                     <td className="max-w-[220px] truncate p-2" data-label={col('label')} title={run.label ?? undefined}>
-                      {run.label || '–'}
+                      {run.run_id ? (
+                        <OpsLink to={{ ...nav.view, drawer }} onNavigate={open} className="underline-offset-2 hover:underline">
+                          {run.label || t('operations.stuck.run', { id: shortId(run.run_id) })}
+                        </OpsLink>
+                      ) : (
+                        run.label || '–'
+                      )}
                     </td>
                   ) : null}
                   {!compact ? (
@@ -140,7 +155,19 @@ export default function ActiveRunsTable({
                     {fmtAge(elapsed)}
                   </td>
                   <td className="p-2" data-label={col('progress')}>
-                    <ProgressBar done={run.docs_done} total={run.docs_total} tone={barTone(run.state)} />
+                    <span className="flex flex-col items-end gap-0.5 md:items-start">
+                      <ProgressBar done={run.docs_done} total={run.docs_total} tone={barTone(run.state)} />
+                      {!compact && (run.stage || (typeof run.docs_failed === 'number' && run.docs_failed > 0)) ? (
+                        <span className="text-muted-foreground text-xs">
+                          {[
+                            run.stage ? t(`operations.stage.${run.stage}`, { defaultValue: run.stage }) : null,
+                            typeof run.docs_failed === 'number' && run.docs_failed > 0 ? t('operations.active.failedDocs', { count: run.docs_failed }) : null
+                          ]
+                            .filter(Boolean)
+                            .join(' · ')}
+                        </span>
+                      ) : null}
+                    </span>
                   </td>
                   {multiWorker && !compact ? (
                     <td className="p-2 font-mono text-xs" data-label={col('worker')}>

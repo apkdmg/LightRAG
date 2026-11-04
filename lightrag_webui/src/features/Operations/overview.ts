@@ -48,7 +48,7 @@ export const RULE_TARGETS: Record<string, HashTarget> = {
   http_5xx_rate_5m: { tab: 'performance', sub: 'http' },
   workers_below_expected: { tab: 'health', sub: 'workers' },
   worker_heartbeat: { tab: 'health', sub: 'workers' },
-  worker_unresponsive: { tab: 'health', sub: 'workers' },
+  worker_unresponsive: { tab: 'processing', sub: 'stuck' },
   dependency_down: { tab: 'health', sub: 'deps' },
   pg_probe: { tab: 'health', sub: 'deps', dep: 'postgres' },
   smtp_probe: { tab: 'health', sub: 'deps', dep: 'smtp' },
@@ -64,6 +64,7 @@ export const RULE_TARGETS: Record<string, HashTarget> = {
 export function attentionTarget(item: AttentionItem): HashTarget {
   if (item.target) return item.target
   const base = RULE_TARGETS[item.rule] ?? { tab: 'health', sub: 'deps' }
+  if (item.run_id) return { ...base, run_id: item.run_id, workspace: item.workspace ?? null }
   if (item.workspace) return { ...base, workspace: item.workspace }
   if (item.dep) return { ...base, dep: item.dep }
   if (item.worker_id) return { ...base, worker_id: item.worker_id }

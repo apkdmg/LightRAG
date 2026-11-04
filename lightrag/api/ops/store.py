@@ -4,9 +4,10 @@
 ``ClientManager`` pool, and only when the server runs on Postgres KV storage
 (``kv_storage == "PGKVStorage"``): ``LIGHTRAG_OPS_KV`` (small JSON values,
 renewable leases), ``LIGHTRAG_OPS_AUDIT``, the worker heartbeat tables
-(``LIGHTRAG_OPS_WORKERS``, ``LIGHTRAG_OPS_WORKER_SAMPLES``) and the dependency
-probe history (``LIGHTRAG_OPS_PROBES``); the other ops tables arrive with the
-features that write them. Indexes on the large existing tables are never built
+(``LIGHTRAG_OPS_WORKERS``, ``LIGHTRAG_OPS_WORKER_SAMPLES``), the dependency
+probe history (``LIGHTRAG_OPS_PROBES``) and run tracking
+(``LIGHTRAG_OPS_RUNS``, ``LIGHTRAG_OPS_DOC_FAILURES``); the other ops tables
+arrive with the features that write them. Indexes on the large existing tables are never built
 here: :mod:`lightrag.api.ops.indexes` builds them in the background.
 
 Rules every query follows:
@@ -53,6 +54,8 @@ WORKSPACE_ROW_TABLES = (
     "LIGHTRAG_OPS_RUNS",
 )
 TABLE_ALERTS = "LIGHTRAG_OPS_ALERTS"
+TABLE_RUNS = "LIGHTRAG_OPS_RUNS"
+TABLE_DOC_FAILURES = "LIGHTRAG_OPS_DOC_FAILURES"
 TABLE_WORKERS = "LIGHTRAG_OPS_WORKERS"
 TABLE_WORKER_SAMPLES = "LIGHTRAG_OPS_WORKER_SAMPLES"
 TABLE_PROBES = "LIGHTRAG_OPS_PROBES"
@@ -97,6 +100,39 @@ BACKLOG_SORTS = {
 BACKLOG_FILTERS = frozenset({"failed", "stuck", "email", "paused"})
 FAILURE_GROUPS = ("signature", "workspace")
 CANCELLED_GROUP_KEY = "cancelled"
+# Durable failure groupings (LIGHTRAG_OPS_DOC_FAILURES columns, whitelisted).
+DURABLE_GROUP_COLUMNS = {
+    "error_kind": "error_kind",
+    "stage": "stage",
+    "model": "COALESCE(model, '')",
+    "workspace": "workspace",
+}
+RUN_FINAL_STATUSES = ("succeeded", "failed", "cancelled", "paused")
+RUNS_PAGE_FILTER_KINDS = (
+    "process",
+    "email_batch",
+    "delete",
+    "clear",
+    "email_delete",
+    "scan",
+    "startup_resume",
+    "admin",
+)
+RUNS_PAGE_FILTER_STATUSES = ("running", *RUN_FINAL_STATUSES, "orphaned")
+ORPHAN_SUMMARY = "The process that owned this run exited"
+# How an owner's death was confirmed (``orphaned_by``).
+ORPHAN_REASONS = (
+    "pid_gone",
+    "create_time",
+    "exit_marker",
+    "exited",
+    "superseded",
+    "host_gone",
+)
+DELETED_KV_PREFIX = "deleted:"
+# Tombstones outlive any row a tracker could still hold for the workspace.
+DELETED_KEEP_DAYS = 7
+RETENTION_BATCH = 10000
 
 _LITERAL = re.compile(r"^[a-z_]+$")
 _LIKE_SPECIAL = re.compile(r"([\\%_])")
@@ -136,6 +172,37 @@ def utc_iso(value: Any) -> Optional[str]:
 def workspace_hash(workspace: str) -> str:
     """What a deleted workspace becomes in kept audit rows."""
     return hashlib.sha256(workspace.encode("utf-8")).hexdigest()[:16]
+
+
+def deleted_key(workspace: str) -> str:
+    """KV tombstone of a deleted workspace (``{"at": epoch}``).
+
+    Run trackers check it before writing buffered rows, so rows buffered for
+    a workspace before its deletion (by any worker) are never written back.
+    """
+    return f"{DELETED_KV_PREFIX}{workspace_hash(workspace)}"
+
+
+def _pause_counts(rows: list[dict[str, Any]], workspaces: int) -> dict[str, Any]:
+    by_slot_kind: dict[str, dict[str, int]] = {}
+    total = 0
+    for row in rows:
+        count = int(row["count"])
+        kinds = by_slot_kind.setdefault(row["slot"], {})
+        kinds[row["kind"]] = kinds.get(row["kind"], 0) + count
+        total += count
+    return {"total": total, "workspaces": workspaces, "by_slot_kind": by_slot_kind}
+
+
+def pg_text(value: Any, limit: int) -> Optional[str]:
+    """``value`` cut to ``limit`` characters, without the NUL characters
+    Postgres text rejects; None when empty."""
+    if value is None:
+        return None
+    text = str(value)
+    if "\x00" in text:
+        text = text.replace("\x00", "")
+    return text[:limit] or None
 
 
 def failure_signature(message: Optional[str]) -> str:
@@ -383,6 +450,104 @@ class OpsStore(ABC):
     @abstractmethod
     async def probe_cleanup(self, days: int) -> None: ...
 
+    # -- run tracking (writes come from the buffered RunTracker) ----------------
+    @abstractmethod
+    async def kv_merge_existing(self, patches: dict[str, dict[str, Any]]) -> None:
+        """Shallow-merge each patch into an *existing* JSON object; absent keys
+        stay absent."""
+
+    @abstractmethod
+    async def runs_write(self, rows: list[dict[str, Any]]) -> None:
+        """Upsert run rows (epoch-second times). A row that already reached a
+        final status is never changed again; a row the reconciler orphaned
+        takes the new status and keeps ``was_orphaned``."""
+
+    @abstractmethod
+    async def doc_failures_write(self, rows: list[dict[str, Any]]) -> None: ...
+
+    @abstractmethod
+    async def runs_orphan(
+        self, run_ids: list[str], confirmed_by: Optional[dict[str, str]] = None
+    ) -> list[str]:
+        """Mark still-running runs orphaned; returns the IDs that changed.
+
+        ``confirmed_by`` records, per run, how the owner's death was
+        confirmed (one of :data:`ORPHAN_REASONS`)."""
+
+    @abstractmethod
+    async def runs_cleanup(self, run_days: int, failure_days: int) -> None: ...
+
+    @abstractmethod
+    async def running_runs(self, limit: int) -> list[dict[str, Any]]:
+        """Running runs, newest first, with ages by the database clock and the
+        owner worker's row (``worker_*`` fields; None when it has none)."""
+
+    @abstractmethod
+    async def orphaned_runs(self, hours: int, limit: int) -> list[dict[str, Any]]: ...
+
+    @abstractmethod
+    async def runs_page(
+        self,
+        *,
+        workspace: Optional[str],
+        kind: Optional[str],
+        status: Optional[str],
+        before: Optional[tuple[datetime, str]],
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        """Run history, newest first, keyset on ``(started_at, run_id)``."""
+
+    @abstractmethod
+    async def run_get(self, run_id: str) -> Optional[dict[str, Any]]: ...
+
+    @abstractmethod
+    async def run_failures(self, run_id: str, limit: int) -> list[dict[str, Any]]: ...
+
+    @abstractmethod
+    async def last_runs(self, workspaces: list[str]) -> dict[str, dict[str, Any]]:
+        """Latest run per workspace, for the given workspaces only."""
+
+    @abstractmethod
+    async def failure_groups(
+        self, hours: int, group: str, include_cancelled: bool, limit: int = 50
+    ) -> dict[str, Any]:
+        """Classified failures grouped by kind, stage, model or workspace."""
+
+    @abstractmethod
+    async def failure_group_docs(
+        self, hours: int, group: str, key: str, page: Page
+    ) -> tuple[list[dict[str, Any]], int]:
+        """Documents of one durable failure group (latest failure per doc)."""
+
+    @abstractmethod
+    async def failures_by_kind(
+        self, workspace: str, hours: int
+    ) -> list[dict[str, Any]]: ...
+
+    @abstractmethod
+    async def doc_failures(
+        self, workspace: str, doc_id: str, limit: int
+    ) -> list[dict[str, Any]]: ...
+
+    @abstractmethod
+    async def open_pauses(self, limit: int) -> list[dict[str, Any]]:
+        """Persisted provider pauses (``pause:<ws>:<slot>``) not cleared yet."""
+
+    @abstractmethod
+    async def pauses_page(self, limit: int, offset: int) -> list[dict[str, Any]]:
+        """One page of open persisted pauses, oldest ``since`` first."""
+
+    @abstractmethod
+    async def pause_counts(self) -> dict[str, Any]:
+        """Open persisted pauses counted in SQL (never capped): ``total``,
+        ``workspaces`` and ``by_slot_kind`` (``{slot: {kind: count}}``)."""
+
+    @abstractmethod
+    async def run_events(
+        self, start: datetime, end: datetime, limit: int
+    ) -> list[dict[str, Any]]:
+        """Orphaned runs in a window, for the timeline."""
+
 
 def _workspace_keys(workspace: str) -> list[str]:
     return [template.format(ws=workspace) for template in WORKSPACE_KV_KEYS]
@@ -471,6 +636,58 @@ class PostgresOpsStore(OpsStore):
                 PRIMARY KEY (dependency, ts)
             )""",
             f"CREATE INDEX IF NOT EXISTS idx_ops_probes_ts ON {TABLE_PROBES} (ts DESC)",
+            f"""CREATE TABLE IF NOT EXISTS {TABLE_RUNS} (
+                run_id UUID PRIMARY KEY,
+                workspace VARCHAR(255) NOT NULL,
+                kind VARCHAR(24) NOT NULL,
+                trigger VARCHAR(32) NOT NULL,
+                status VARCHAR(16) NOT NULL,
+                was_orphaned BOOLEAN NOT NULL DEFAULT false,
+                worker_id UUID,
+                pid INT,
+                started_at TIMESTAMPTZ NOT NULL,
+                heartbeat_at TIMESTAMPTZ NOT NULL,
+                progress_at TIMESTAMPTZ NOT NULL,
+                finished_at TIMESTAMPTZ,
+                docs_total INT NOT NULL DEFAULT 0,
+                docs_done INT NOT NULL DEFAULT 0,
+                docs_failed INT NOT NULL DEFAULT 0,
+                stage VARCHAR(16),
+                label VARCHAR(128),
+                error_kind VARCHAR(32),
+                error_summary VARCHAR(512),
+                request_id VARCHAR(64),
+                host VARCHAR(255),
+                orphaned_by VARCHAR(16)
+            )""",
+            # Columns added while run tracking was in development.
+            f"ALTER TABLE {TABLE_RUNS} ADD COLUMN IF NOT EXISTS host VARCHAR(255)",
+            f"ALTER TABLE {TABLE_RUNS} ADD COLUMN IF NOT EXISTS orphaned_by VARCHAR(16)",
+            f"""CREATE INDEX IF NOT EXISTS idx_ops_runs_running ON {TABLE_RUNS}
+                (heartbeat_at) WHERE status = 'running'""",
+            f"CREATE INDEX IF NOT EXISTS idx_ops_runs_ws ON {TABLE_RUNS} (workspace, started_at DESC)",
+            f"CREATE INDEX IF NOT EXISTS idx_ops_runs_started ON {TABLE_RUNS} (started_at DESC)",
+            f"""CREATE TABLE IF NOT EXISTS {TABLE_DOC_FAILURES} (
+                id BIGSERIAL PRIMARY KEY,
+                ts TIMESTAMPTZ NOT NULL,
+                workspace VARCHAR(255) NOT NULL,
+                doc_id VARCHAR(255) NOT NULL,
+                track_id VARCHAR(255),
+                run_id UUID,
+                stage VARCHAR(16) NOT NULL,
+                error_kind VARCHAR(32) NOT NULL,
+                http_status SMALLINT,
+                exc_type VARCHAR(128),
+                message VARCHAR(1024),
+                attempt INT NOT NULL,
+                model VARCHAR(255)
+            )""",
+            f"CREATE INDEX IF NOT EXISTS idx_ops_fail_ts ON {TABLE_DOC_FAILURES} (ts DESC)",
+            f"CREATE INDEX IF NOT EXISTS idx_ops_fail_kind ON {TABLE_DOC_FAILURES} (error_kind, ts DESC)",
+            f"CREATE INDEX IF NOT EXISTS idx_ops_fail_doc ON {TABLE_DOC_FAILURES} (workspace, doc_id, ts DESC)",
+            f"CREATE INDEX IF NOT EXISTS idx_ops_fail_docid ON {TABLE_DOC_FAILURES} (doc_id)",
+            f"""CREATE INDEX IF NOT EXISTS idx_ops_fail_run ON {TABLE_DOC_FAILURES}
+                (run_id) WHERE run_id IS NOT NULL""",
         ):
             await self._db.execute(statement)
         await self._refresh_tables(force=True)
@@ -979,7 +1196,10 @@ class PostgresOpsStore(OpsStore):
             )
             args = [int(hours), key]
         elif group == "workspace":
-            condition = f"{base} AND NOT {_CANCELLED} AND workspace = $2"
+            condition = (
+                f"{base} AND NOT {_CANCELLED} AND {_NO_FAILURE_META} "
+                "AND workspace = $2"
+            )
             args = [int(hours), key]
         else:
             raise ValueError(f"Unknown group: {group}")
@@ -1105,6 +1325,14 @@ class PostgresOpsStore(OpsStore):
                     WHERE key = ANY($1::varchar[]) OR key LIKE ANY($2::text[])""",
                     _workspace_keys(workspace),
                     [like_escape(p) + "%" for p in _workspace_prefixes(workspace)],
+                )
+                await conn.execute(
+                    f"""INSERT INTO {TABLE_KV} (key, value, updated_at)
+                    VALUES ($1, $2::jsonb, now())
+                    ON CONFLICT (key) DO UPDATE
+                    SET value = EXCLUDED.value, updated_at = now()""",
+                    deleted_key(workspace),
+                    json.dumps({"at": time.time()}),
                 )
                 for summary in WORKSPACE_KV_SUMMARIES:
                     await conn.execute(
@@ -1441,6 +1669,432 @@ class PostgresOpsStore(OpsStore):
             int(days),
         )
 
+    # -- run tracking -----------------------------------------------------------------------------
+    async def kv_merge_existing(self, patches):
+        if not patches:
+            return
+        rows = [(k, json.dumps(v, default=str)) for k, v in patches.items()]
+        async with self._conn() as conn:
+            async with conn.transaction():
+                await conn.execute(f"SET LOCAL statement_timeout = {WRITE_TIMEOUT_MS}")
+                await conn.executemany(
+                    f"""UPDATE {TABLE_KV} SET value = value || $2::jsonb, updated_at = now()
+                    WHERE key = $1 AND jsonb_typeof(value) = 'object'""",
+                    rows,
+                )
+
+    async def runs_write(self, rows):
+        if not rows:
+            return
+        values = [
+            (
+                r["run_id"],
+                pg_text(r["workspace"], 255) or "",
+                r["kind"][:24],
+                pg_text(r.get("trigger"), 32) or "other",
+                r["status"][:16],
+                r.get("worker_id"),
+                r.get("pid"),
+                float(r["started_at"]),
+                float(r["heartbeat_at"]),
+                float(r["progress_at"]),
+                None if r.get("finished_at") is None else float(r["finished_at"]),
+                int(r.get("docs_total") or 0),
+                int(r.get("docs_done") or 0),
+                int(r.get("docs_failed") or 0),
+                pg_text(r.get("stage"), 16),
+                pg_text(r.get("label"), 128),
+                pg_text(r.get("error_kind"), 32),
+                pg_text(r.get("error_summary"), 512),
+                pg_text(r.get("request_id"), 64),
+                pg_text(r.get("host"), 255),
+            )
+            for r in rows
+        ]
+        final = sql_in(RUN_FINAL_STATUSES)
+        async with self._conn() as conn:
+            async with conn.transaction():
+                await conn.execute(f"SET LOCAL statement_timeout = {WRITE_TIMEOUT_MS}")
+                await conn.executemany(
+                    f"""INSERT INTO {TABLE_RUNS} AS r (run_id, workspace, kind, trigger,
+                        status, worker_id, pid, started_at, heartbeat_at, progress_at,
+                        finished_at, docs_total, docs_done, docs_failed, stage, label,
+                        error_kind, error_summary, request_id, host)
+                    VALUES ($1::uuid, $2, $3, $4, $5, $6::uuid, $7,
+                        to_timestamp($8::float8), to_timestamp($9::float8),
+                        to_timestamp($10::float8), to_timestamp($11::float8),
+                        $12, $13, $14, $15, $16, $17, $18, $19, $20)
+                    ON CONFLICT (run_id) DO UPDATE SET
+                        status = EXCLUDED.status,
+                        was_orphaned = r.was_orphaned OR r.status = 'orphaned',
+                        trigger = EXCLUDED.trigger,
+                        heartbeat_at = GREATEST(r.heartbeat_at, EXCLUDED.heartbeat_at),
+                        progress_at = GREATEST(r.progress_at, EXCLUDED.progress_at),
+                        finished_at = EXCLUDED.finished_at,
+                        docs_total = EXCLUDED.docs_total,
+                        docs_done = EXCLUDED.docs_done,
+                        docs_failed = EXCLUDED.docs_failed,
+                        stage = EXCLUDED.stage,
+                        label = COALESCE(EXCLUDED.label, r.label),
+                        error_kind = EXCLUDED.error_kind,
+                        error_summary = EXCLUDED.error_summary,
+                        host = COALESCE(r.host, EXCLUDED.host)
+                    WHERE r.status NOT IN {final}""",
+                    values,
+                )
+
+    async def doc_failures_write(self, rows):
+        if not rows:
+            return
+        values = [
+            (
+                float(r["ts"]),
+                pg_text(r["workspace"], 255) or "",
+                pg_text(r["doc_id"], 255) or "",
+                pg_text(r.get("track_id"), 255),
+                r.get("run_id"),
+                pg_text(r["stage"], 16) or "other",
+                pg_text(r["error_kind"], 32) or "unknown",
+                r.get("http_status"),
+                pg_text(r.get("exc_type"), 128),
+                pg_text(r.get("message"), 1024),
+                int(r.get("attempt") or 1),
+                pg_text(r.get("model"), 255),
+            )
+            for r in rows
+        ]
+        async with self._conn() as conn:
+            async with conn.transaction():
+                await conn.execute(f"SET LOCAL statement_timeout = {WRITE_TIMEOUT_MS}")
+                await conn.executemany(
+                    f"""INSERT INTO {TABLE_DOC_FAILURES} (ts, workspace, doc_id, track_id,
+                        run_id, stage, error_kind, http_status, exc_type, message,
+                        attempt, model)
+                    VALUES (to_timestamp($1::float8), $2, $3, $4, $5::uuid, $6, $7,
+                        $8, $9, $10, $11, $12)""",
+                    values,
+                )
+
+    async def runs_orphan(self, run_ids, confirmed_by=None):
+        if not run_ids:
+            return []
+        ids = list(run_ids)
+        how = [pg_text((confirmed_by or {}).get(run_id), 16) for run_id in ids]
+        rows = await self._write(
+            f"""UPDATE {TABLE_RUNS} AS r
+            SET status = 'orphaned', error_summary = $3, orphaned_by = u.how
+            FROM unnest($1::uuid[], $2::varchar[]) AS u(id, how)
+            WHERE r.run_id = u.id AND r.status = 'running'
+            RETURNING r.run_id""",
+            ids,
+            how,
+            ORPHAN_SUMMARY,
+        )
+        return [_uuid_hex(r["run_id"]) for r in rows]
+
+    async def runs_cleanup(self, run_days, failure_days):
+        for table, column, days in (
+            (TABLE_RUNS, "started_at", run_days),
+            (TABLE_DOC_FAILURES, "ts", failure_days),
+        ):
+            key = "run_id" if table == TABLE_RUNS else "id"
+            # Batched so retention never holds long locks on a busy table.
+            while True:
+                rows = await self._write(
+                    f"""DELETE FROM {table} WHERE {key} IN (
+                        SELECT {key} FROM {table}
+                        WHERE {column} < now() - make_interval(days => $1::int)
+                        LIMIT {RETENTION_BATCH})
+                    RETURNING 1""",
+                    int(days),
+                )
+                if len(rows) < RETENTION_BATCH:
+                    break
+        await self._write(
+            f"""DELETE FROM {TABLE_KV} WHERE key LIKE '{DELETED_KV_PREFIX}%'
+            AND updated_at < now() - make_interval(days => $1::int)""",
+            DELETED_KEEP_DAYS,
+        )
+
+    _RUN_COLUMNS = """r.run_id, r.workspace, r.kind, r.trigger, r.status, r.was_orphaned,
+        r.worker_id, r.pid, r.started_at, r.heartbeat_at, r.progress_at, r.finished_at,
+        r.docs_total, r.docs_done, r.docs_failed, r.stage, r.label, r.error_kind,
+        r.error_summary, r.request_id, r.host AS run_host, r.orphaned_by,
+        extract(epoch FROM (now() - r.heartbeat_at))::float8 AS heartbeat_age_s,
+        extract(epoch FROM (now() - r.progress_at))::float8 AS progress_age_s"""
+    _WORKER_COLUMNS = """w.host AS worker_host, w.pid_create_time AS worker_pid_create_time,
+        w.started_at AS worker_started_at, w.superseded AS worker_superseded,
+        w.exited_at AS worker_exited_at,
+        extract(epoch FROM (now() - w.heartbeat_at))::float8 AS worker_heartbeat_age_s"""
+
+    @staticmethod
+    def _run_row(row: dict[str, Any]) -> dict[str, Any]:
+        row["run_id"] = _uuid_hex(row["run_id"])
+        if row.get("worker_id") is not None:
+            row["worker_id"] = _uuid_hex(row["worker_id"])
+        return row
+
+    async def running_runs(self, limit):
+        rows = await self._read(
+            f"""SELECT {self._RUN_COLUMNS}, {self._WORKER_COLUMNS}
+            FROM {TABLE_RUNS} r LEFT JOIN {TABLE_WORKERS} w ON w.worker_id = r.worker_id
+            WHERE r.status = 'running'
+            ORDER BY r.started_at DESC LIMIT $1""",
+            int(limit),
+        )
+        return [self._run_row(r) for r in rows]
+
+    async def orphaned_runs(self, hours, limit):
+        rows = await self._read(
+            f"""SELECT {self._RUN_COLUMNS}, {self._WORKER_COLUMNS}
+            FROM {TABLE_RUNS} r LEFT JOIN {TABLE_WORKERS} w ON w.worker_id = r.worker_id
+            WHERE r.started_at >= now() - make_interval(hours => $1::int)
+              AND r.status = 'orphaned'
+            ORDER BY r.started_at DESC LIMIT $2""",
+            int(hours),
+            int(limit),
+        )
+        return [self._run_row(r) for r in rows]
+
+    async def runs_page(self, *, workspace, kind, status, before, limit):
+        conditions: list[str] = []
+        params: list[Any] = []
+        if workspace:
+            params.append(workspace)
+            conditions.append(f"r.workspace = ${len(params)}")
+        if kind:
+            params.append(kind)
+            conditions.append(f"r.kind = ${len(params)}")
+        if status:
+            params.append(status)
+            conditions.append(f"r.status = ${len(params)}")
+        if before is not None:
+            params += [before[0], before[1]]
+            conditions.append(
+                f"(r.started_at, r.run_id) < (${len(params) - 1}, ${len(params)}::uuid)"
+            )
+        params.append(int(limit))
+        where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+        rows = await self._read(
+            f"""SELECT {self._RUN_COLUMNS}, {self._WORKER_COLUMNS}
+            FROM {TABLE_RUNS} r LEFT JOIN {TABLE_WORKERS} w ON w.worker_id = r.worker_id
+            {where}
+            ORDER BY r.started_at DESC, r.run_id DESC LIMIT ${len(params)}""",
+            *params,
+        )
+        return [self._run_row(r) for r in rows]
+
+    async def run_get(self, run_id):
+        rows = await self._read(
+            f"""SELECT {self._RUN_COLUMNS}, {self._WORKER_COLUMNS}
+            FROM {TABLE_RUNS} r LEFT JOIN {TABLE_WORKERS} w ON w.worker_id = r.worker_id
+            WHERE r.run_id = $1::uuid""",
+            run_id,
+        )
+        return self._run_row(rows[0]) if rows else None
+
+    _FAILURE_COLUMNS = """id, ts, workspace, doc_id, track_id, run_id, stage, error_kind,
+        http_status, exc_type, message, attempt, model"""
+
+    @staticmethod
+    def _failure_row(row: dict[str, Any]) -> dict[str, Any]:
+        if row.get("run_id") is not None:
+            row["run_id"] = _uuid_hex(row["run_id"])
+        return row
+
+    async def run_failures(self, run_id, limit):
+        rows = await self._read(
+            f"""SELECT {self._FAILURE_COLUMNS} FROM {TABLE_DOC_FAILURES}
+            WHERE run_id = $1::uuid ORDER BY ts DESC, id DESC LIMIT $2""",
+            run_id,
+            int(limit),
+        )
+        return [self._failure_row(r) for r in rows]
+
+    async def last_runs(self, workspaces):
+        if not workspaces:
+            return {}
+        rows = await self._read(
+            f"""SELECT DISTINCT ON (r.workspace) {self._RUN_COLUMNS}
+            FROM {TABLE_RUNS} r WHERE r.workspace = ANY($1::varchar[])
+            ORDER BY r.workspace, r.started_at DESC""",
+            list(workspaces),
+        )
+        return {r["workspace"]: self._run_row(r) for r in rows}
+
+    async def failure_groups(self, hours, group, include_cancelled, limit=50):
+        column = DURABLE_GROUP_COLUMNS.get(group)
+        if column is None:
+            raise ValueError(f"Unknown group: {group}")
+        window = "ts >= now() - make_interval(hours => $1::int)"
+        groups = await self._read(
+            f"""SELECT {column} AS key, count(*)::bigint AS count,
+                count(DISTINCT (workspace, doc_id))::bigint AS docs,
+                count(DISTINCT workspace)::bigint AS workspaces,
+                min(ts) AS first_seen, max(ts) AS last_seen,
+                (array_agg(message ORDER BY ts DESC, id DESC))[1] AS example,
+                (array_agg(error_kind ORDER BY ts DESC, id DESC))[1] AS example_kind,
+                (array_agg(stage ORDER BY ts DESC, id DESC))[1] AS example_stage
+            FROM {TABLE_DOC_FAILURES}
+            WHERE {window} AND error_kind <> 'cancelled'
+            GROUP BY 1 ORDER BY 2 DESC, 1 LIMIT $2""",
+            int(hours),
+            int(limit),
+        )
+        cancelled = await self._read(
+            f"""SELECT count(*)::bigint AS count,
+                count(DISTINCT (workspace, doc_id))::bigint AS docs,
+                count(DISTINCT workspace)::bigint AS workspaces,
+                min(ts) AS first_seen, max(ts) AS last_seen,
+                (array_agg(message ORDER BY ts DESC, id DESC))[1] AS example
+            FROM {TABLE_DOC_FAILURES}
+            WHERE {window} AND error_kind = 'cancelled'""",
+            int(hours),
+        )
+        summary = cancelled[0] if cancelled else {"count": 0}
+        return {
+            "groups": groups,
+            "cancelled": summary if include_cancelled else {"count": summary["count"]},
+        }
+
+    async def failure_group_docs(self, hours, group, key, page):
+        column = DURABLE_GROUP_COLUMNS.get(group)
+        if column is None:
+            raise ValueError(f"Unknown group: {group}")
+        condition = f"ts >= now() - make_interval(hours => $1::int) AND {column} = $2"
+        if not (group == "error_kind" and key == CANCELLED_GROUP_KEY):
+            condition += " AND error_kind <> 'cancelled'"
+        with_docs = self.doc_status_ready and await self._has_table(TABLE_DOC_STATUS)
+        doc_select = (
+            "ds.file_path, ds.status AS current_status"
+            if with_docs
+            else "NULL AS file_path, NULL AS current_status"
+        )
+        doc_join = (
+            f"LEFT JOIN {TABLE_DOC_STATUS} ds ON ds.workspace = p.workspace AND ds.id = p.doc_id"
+            if with_docs
+            else ""
+        )
+        rows = await self._read(
+            f"""WITH latest AS (
+                SELECT DISTINCT ON (workspace, doc_id) {self._FAILURE_COLUMNS}
+                FROM {TABLE_DOC_FAILURES} WHERE {condition}
+                ORDER BY workspace, doc_id, ts DESC, id DESC
+            ), page AS (
+                SELECT latest.*, count(*) OVER () AS total FROM latest
+                ORDER BY ts DESC, workspace, doc_id LIMIT $3 OFFSET $4
+            )
+            SELECT p.*, {doc_select} FROM page p {doc_join}
+            ORDER BY p.ts DESC, p.workspace, p.doc_id""",
+            int(hours),
+            key,
+            page.limit,
+            page.offset,
+        )
+        total = int(rows[0]["total"]) if rows else 0
+        if not rows and page.offset:
+            count = await self._read(
+                f"""SELECT count(*)::bigint AS n FROM (SELECT DISTINCT workspace, doc_id
+                FROM {TABLE_DOC_FAILURES} WHERE {condition}) d""",
+                int(hours),
+                key,
+            )
+            total = int(count[0]["n"]) if count else 0
+        for row in rows:
+            row.pop("total", None)
+            self._failure_row(row)
+        return rows, total
+
+    async def failures_by_kind(self, workspace, hours):
+        return await self._read(
+            f"""SELECT error_kind AS key, count(*)::bigint AS count,
+                count(DISTINCT doc_id)::bigint AS docs, max(ts) AS last_seen
+            FROM {TABLE_DOC_FAILURES}
+            WHERE workspace = $1 AND ts >= now() - make_interval(hours => $2::int)
+            GROUP BY 1 ORDER BY 2 DESC, 1 LIMIT 20""",
+            workspace,
+            int(hours),
+        )
+
+    async def doc_failures(self, workspace, doc_id, limit):
+        rows = await self._read(
+            f"""SELECT {self._FAILURE_COLUMNS} FROM {TABLE_DOC_FAILURES}
+            WHERE workspace = $1 AND doc_id = $2 ORDER BY ts DESC, id DESC LIMIT $3""",
+            workspace,
+            doc_id,
+            int(limit),
+        )
+        return [self._failure_row(r) for r in rows]
+
+    async def open_pauses(self, limit):
+        rows = await self._read(
+            f"""SELECT key, value FROM {TABLE_KV}
+            WHERE key LIKE 'pause:%' AND jsonb_typeof(value) = 'object'
+              AND COALESCE(value->>'cleared_at', '') = ''
+            ORDER BY key LIMIT $1""",
+            int(limit),
+        )
+        out = []
+        for row in rows:
+            value = self._decode(row["value"])
+            if isinstance(value, dict):
+                out.append({**value, "key": row["key"]})
+        return out
+
+    async def pauses_page(self, limit, offset):
+        rows = await self._read(
+            f"""SELECT key, value FROM {TABLE_KV}
+            WHERE key LIKE 'pause:%' AND jsonb_typeof(value) = 'object'
+              AND COALESCE(value->>'cleared_at', '') = ''
+            ORDER BY CASE WHEN jsonb_typeof(value->'since') = 'number'
+                     THEN (value->>'since')::float8 ELSE 0 END,
+                value->>'workspace', key
+            LIMIT $1 OFFSET $2""",
+            int(limit),
+            int(offset),
+        )
+        out = []
+        for row in rows:
+            value = self._decode(row["value"])
+            if isinstance(value, dict):
+                out.append({**value, "key": row["key"]})
+        return out
+
+    async def pause_counts(self):
+        rows = await self._read(
+            f"""SELECT COALESCE(value->>'slot', 'unknown') AS slot,
+                COALESCE(value->>'kind', 'unknown') AS kind,
+                count(*)::bigint AS count
+            FROM {TABLE_KV}
+            WHERE key LIKE 'pause:%' AND jsonb_typeof(value) = 'object'
+              AND COALESCE(value->>'cleared_at', '') = ''
+            GROUP BY 1, 2"""
+        )
+        workspaces = await self._read(
+            f"""SELECT count(DISTINCT value->>'workspace')::bigint AS n
+            FROM {TABLE_KV}
+            WHERE key LIKE 'pause:%' AND jsonb_typeof(value) = 'object'
+              AND COALESCE(value->>'cleared_at', '') = ''"""
+        )
+        return _pause_counts(rows, int(workspaces[0]["n"]) if workspaces else 0)
+
+    async def run_events(self, start, end, limit):
+        # Orphaned runs are marked at their last sign of life.
+        rows = await self._read(
+            f"""SELECT run_id, workspace, kind, status, was_orphaned, heartbeat_at AS ts
+            FROM {TABLE_RUNS}
+            WHERE started_at >= $1::timestamptz - interval '1 day'
+              AND started_at < $2 AND heartbeat_at >= $1 AND heartbeat_at < $2
+              AND (status = 'orphaned' OR was_orphaned)
+            ORDER BY heartbeat_at DESC LIMIT $3""",
+            start,
+            end,
+            int(limit),
+        )
+        for row in rows:
+            row["run_id"] = _uuid_hex(row["run_id"])
+        return rows
+
 
 def _still_running(
     alive: Optional[Callable[[Any, Any], bool]], pid, create_time
@@ -1545,6 +2199,11 @@ class MemoryOpsStore(OpsStore):
         self.pg_health: dict[str, Any] = {"latency_ms": 1.0, "connect_ms": 2.0}
         self.pg_health_error: Optional[BaseException] = None
         self.fail_reads: Optional[BaseException] = None
+        # Run tracking tables, and switches for the writer tests.
+        self.run_rows: dict[str, dict[str, Any]] = {}
+        self.failure_rows: list[dict[str, Any]] = []
+        self.fail_writes: Optional[BaseException] = None
+        self.write_delay_s: float = 0.0
         self.ready = True
         self.doc_status_ready = True
 
@@ -1908,7 +2567,9 @@ class MemoryOpsStore(OpsStore):
             rows = [
                 r
                 for r in rows
-                if not is_cancelled(r["error_msg"]) and r["workspace"] == key
+                if not is_cancelled(r["error_msg"])
+                and "failure" not in (r["metadata"] or {})
+                and r["workspace"] == key
             ]
         else:
             raise ValueError(f"Unknown group: {group}")
@@ -2036,6 +2697,7 @@ class MemoryOpsStore(OpsStore):
         hashed = workspace_hash(workspace)
         for key in _workspace_keys(workspace):
             self.kv.pop(key, None)
+        self.kv[deleted_key(workspace)] = {"at": time.time()}
         for prefix in _workspace_prefixes(workspace):
             for key in [k for k in self.kv if k.startswith(prefix)]:
                 self.kv.pop(key, None)
@@ -2051,6 +2713,12 @@ class MemoryOpsStore(OpsStore):
             if row.get("target") == workspace:
                 row["target"] = hashed
         self.workspace_rows.pop(workspace, None)
+        self.run_rows = {
+            k: r for k, r in self.run_rows.items() if r["workspace"] != workspace
+        }
+        self.failure_rows = [
+            r for r in self.failure_rows if r["workspace"] != workspace
+        ]
         for alert in self.alert_rows:
             if (alert.get("scope") or {}).get("workspace") == workspace:
                 alert["title"] = alert["title"].replace(workspace, hashed)
@@ -2267,3 +2935,366 @@ class MemoryOpsStore(OpsStore):
     async def probe_cleanup(self, days):
         cutoff = self._aware_now() - timedelta(days=days)
         self.probe_rows = [r for r in self.probe_rows if r["ts"] >= cutoff]
+
+    # -- run tracking ----------------------------------------------------------------------
+    async def _write_gate(self) -> None:
+        if self.write_delay_s:
+            await asyncio.sleep(self.write_delay_s)
+        if self.fail_writes is not None:
+            raise self.fail_writes
+
+    async def kv_merge_existing(self, patches):
+        await self._write_gate()
+        for key, patch in patches.items():
+            current = self.kv.get(key)
+            if isinstance(current, dict):
+                value = json.loads(json.dumps(patch, default=str))
+                self.kv[key] = {**current, **value}
+
+    def _moment(self, epoch: Any) -> Optional[datetime]:
+        if epoch is None:
+            return None
+        return datetime.fromtimestamp(float(epoch), timezone.utc)
+
+    async def runs_write(self, rows):
+        await self._write_gate()
+        for r in rows:
+            current = self.run_rows.get(r["run_id"])
+            if current is not None and current["status"] in RUN_FINAL_STATUSES:
+                continue
+            row = {
+                "run_id": r["run_id"],
+                "workspace": r["workspace"],
+                "kind": r["kind"],
+                "trigger": r.get("trigger") or "other",
+                "status": r["status"],
+                "was_orphaned": bool(current and current["was_orphaned"])
+                or bool(current and current["status"] == "orphaned"),
+                "worker_id": r.get("worker_id"),
+                "pid": r.get("pid"),
+                "started_at": current["started_at"]
+                if current
+                else self._moment(r["started_at"]),
+                "heartbeat_at": max(
+                    self._moment(r["heartbeat_at"]),
+                    current["heartbeat_at"] if current else self._moment(0),
+                ),
+                "progress_at": max(
+                    self._moment(r["progress_at"]),
+                    current["progress_at"] if current else self._moment(0),
+                ),
+                "finished_at": self._moment(r.get("finished_at")),
+                "docs_total": int(r.get("docs_total") or 0),
+                "docs_done": int(r.get("docs_done") or 0),
+                "docs_failed": int(r.get("docs_failed") or 0),
+                "stage": pg_text(r.get("stage"), 16),
+                "label": pg_text(r.get("label"), 128) or (current or {}).get("label"),
+                "error_kind": pg_text(r.get("error_kind"), 32),
+                "error_summary": pg_text(r.get("error_summary"), 512),
+                "request_id": (current or {}).get("request_id", r.get("request_id")),
+                "host": (current or {}).get("host") or r.get("host"),
+                "orphaned_by": (current or {}).get("orphaned_by"),
+            }
+            self.run_rows[r["run_id"]] = row
+
+    async def doc_failures_write(self, rows):
+        await self._write_gate()
+        for r in rows:
+            row = {
+                key: r.get(key)
+                for key in (
+                    "workspace",
+                    "doc_id",
+                    "track_id",
+                    "run_id",
+                    "stage",
+                    "error_kind",
+                    "http_status",
+                    "exc_type",
+                    "message",
+                    "attempt",
+                    "model",
+                )
+            }
+            row["message"] = pg_text(row["message"], 1024)
+            row["id"] = len(self.failure_rows) + 1
+            row["ts"] = self._moment(r["ts"])
+            self.failure_rows.append(row)
+
+    async def runs_orphan(self, run_ids, confirmed_by=None):
+        changed = []
+        for run_id in run_ids:
+            row = self.run_rows.get(run_id)
+            if row is not None and row["status"] == "running":
+                row["status"] = "orphaned"
+                row["error_summary"] = ORPHAN_SUMMARY
+                row["orphaned_by"] = (confirmed_by or {}).get(run_id)
+                changed.append(run_id)
+        return changed
+
+    async def runs_cleanup(self, run_days, failure_days):
+        now = self._aware_now()
+        self.run_rows = {
+            k: r
+            for k, r in self.run_rows.items()
+            if (now - r["started_at"]).total_seconds() <= run_days * 86400
+        }
+        self.failure_rows = [
+            r
+            for r in self.failure_rows
+            if (now - r["ts"]).total_seconds() <= failure_days * 86400
+        ]
+        cutoff = time.time() - DELETED_KEEP_DAYS * 86400
+        for key in [k for k in self.kv if k.startswith(DELETED_KV_PREFIX)]:
+            value = self.kv[key]
+            if isinstance(value, dict) and float(value.get("at") or 0) < cutoff:
+                self.kv.pop(key, None)
+
+    def _run_view(self, row: dict[str, Any]) -> dict[str, Any]:
+        now = self._aware_now()
+        out = copy.deepcopy(row)
+        out["run_host"] = out.pop("host", None)
+        out.setdefault("orphaned_by", None)
+        out["heartbeat_age_s"] = (now - row["heartbeat_at"]).total_seconds()
+        out["progress_age_s"] = (now - row["progress_at"]).total_seconds()
+        worker = self.worker_rows.get(row.get("worker_id") or "")
+        out["worker_host"] = worker["host"] if worker else None
+        out["worker_pid_create_time"] = worker["pid_create_time"] if worker else None
+        out["worker_started_at"] = worker["started_at"] if worker else None
+        out["worker_superseded"] = worker["superseded"] if worker else None
+        out["worker_exited_at"] = worker["exited_at"] if worker else None
+        out["worker_heartbeat_age_s"] = (
+            (now - worker["heartbeat_at"]).total_seconds() if worker else None
+        )
+        return out
+
+    def _runs_sorted(self) -> list[dict[str, Any]]:
+        rows = sorted(self.run_rows.values(), key=lambda r: r["run_id"], reverse=True)
+        rows.sort(key=lambda r: r["started_at"], reverse=True)
+        return rows
+
+    async def running_runs(self, limit):
+        self._check()
+        return [
+            self._run_view(r) for r in self._runs_sorted() if r["status"] == "running"
+        ][:limit]
+
+    async def orphaned_runs(self, hours, limit):
+        self._check()
+        cutoff = self._aware_now() - timedelta(hours=hours)
+        return [
+            self._run_view(r)
+            for r in self._runs_sorted()
+            if r["status"] == "orphaned" and r["started_at"] >= cutoff
+        ][:limit]
+
+    async def runs_page(self, *, workspace, kind, status, before, limit):
+        self._check()
+        out = []
+        for r in self._runs_sorted():
+            if workspace and r["workspace"] != workspace:
+                continue
+            if kind and r["kind"] != kind:
+                continue
+            if status and r["status"] != status:
+                continue
+            if before is not None and (r["started_at"], r["run_id"]) >= (
+                before[0],
+                before[1],
+            ):
+                continue
+            out.append(self._run_view(r))
+            if len(out) >= limit:
+                break
+        return out
+
+    async def run_get(self, run_id):
+        self._check()
+        row = self.run_rows.get(run_id)
+        return self._run_view(row) if row else None
+
+    def _failures_sorted(self) -> list[dict[str, Any]]:
+        rows = sorted(self.failure_rows, key=lambda r: r["id"], reverse=True)
+        rows.sort(key=lambda r: r["ts"], reverse=True)
+        return rows
+
+    async def run_failures(self, run_id, limit):
+        self._check()
+        return [dict(r) for r in self._failures_sorted() if r.get("run_id") == run_id][
+            :limit
+        ]
+
+    async def last_runs(self, workspaces):
+        self._check()
+        out: dict[str, dict[str, Any]] = {}
+        wanted = set(workspaces)
+        for r in self._runs_sorted():
+            if r["workspace"] in wanted and r["workspace"] not in out:
+                out[r["workspace"]] = self._run_view(r)
+        return out
+
+    def _failures_in_window(self, hours: int) -> list[dict[str, Any]]:
+        cutoff = self._aware_now() - timedelta(hours=hours)
+        return [r for r in self._failures_sorted() if r["ts"] >= cutoff]
+
+    @staticmethod
+    def _group_key(row: dict[str, Any], group: str) -> str:
+        if group == "model":
+            return row.get("model") or ""
+        return row[group]
+
+    @staticmethod
+    def _failure_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
+        latest = rows[0]
+        return {
+            "count": len(rows),
+            "docs": len({(r["workspace"], r["doc_id"]) for r in rows}),
+            "workspaces": len({r["workspace"] for r in rows}),
+            "first_seen": min(r["ts"] for r in rows),
+            "last_seen": latest["ts"],
+            "example": latest.get("message"),
+            "example_kind": latest["error_kind"],
+            "example_stage": latest["stage"],
+        }
+
+    async def failure_groups(self, hours, group, include_cancelled, limit=50):
+        self._check()
+        if group not in DURABLE_GROUP_COLUMNS:
+            raise ValueError(f"Unknown group: {group}")
+        rows = self._failures_in_window(hours)
+        buckets: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for r in rows:
+            if r["error_kind"] != "cancelled":
+                buckets[self._group_key(r, group)].append(r)
+        groups = [{"key": k, **self._failure_summary(v)} for k, v in buckets.items()]
+        groups.sort(key=lambda g: g["key"])
+        groups.sort(key=lambda g: g["count"], reverse=True)
+        cancelled_rows = [r for r in rows if r["error_kind"] == "cancelled"]
+        if include_cancelled and cancelled_rows:
+            cancelled = self._failure_summary(cancelled_rows)
+            for key in ("example_kind", "example_stage"):
+                cancelled.pop(key)
+        else:
+            cancelled = {"count": len(cancelled_rows)}
+        return {"groups": groups[:limit], "cancelled": cancelled}
+
+    async def failure_group_docs(self, hours, group, key, page):
+        self._check()
+        if group not in DURABLE_GROUP_COLUMNS:
+            raise ValueError(f"Unknown group: {group}")
+        include_cancelled = group == "error_kind" and key == CANCELLED_GROUP_KEY
+        latest: dict[tuple[str, str], dict[str, Any]] = {}
+        for r in self._failures_in_window(hours):
+            if self._group_key(r, group) != key:
+                continue
+            if r["error_kind"] == "cancelled" and not include_cancelled:
+                continue
+            latest.setdefault((r["workspace"], r["doc_id"]), r)
+        rows = sorted(latest.values(), key=lambda r: (r["workspace"], r["doc_id"]))
+        rows.sort(key=lambda r: r["ts"], reverse=True)
+        picked = rows[page.offset : page.offset + page.limit]
+        out = []
+        for r in picked:
+            doc = next(
+                (
+                    d
+                    for d in self.doc_rows
+                    if d["workspace"] == r["workspace"] and d["id"] == r["doc_id"]
+                ),
+                None,
+            )
+            out.append(
+                {
+                    **r,
+                    "file_path": doc["file_path"] if doc else None,
+                    "current_status": doc["status"] if doc else None,
+                }
+            )
+        return out, len(rows)
+
+    async def failures_by_kind(self, workspace, hours):
+        self._check()
+        buckets: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for r in self._failures_in_window(hours):
+            if r["workspace"] == workspace:
+                buckets[r["error_kind"]].append(r)
+        out = [
+            {
+                "key": k,
+                "count": len(v),
+                "docs": len({r["doc_id"] for r in v}),
+                "last_seen": v[0]["ts"],
+            }
+            for k, v in buckets.items()
+        ]
+        out.sort(key=lambda g: g["key"])
+        out.sort(key=lambda g: g["count"], reverse=True)
+        return out[:20]
+
+    async def doc_failures(self, workspace, doc_id, limit):
+        self._check()
+        return [
+            dict(r)
+            for r in self._failures_sorted()
+            if r["workspace"] == workspace and r["doc_id"] == doc_id
+        ][:limit]
+
+    async def open_pauses(self, limit):
+        self._check()
+        out = []
+        for key in sorted(self.kv):
+            value = self.kv[key]
+            if (
+                key.startswith("pause:")
+                and isinstance(value, dict)
+                and not value.get("cleared_at")
+            ):
+                out.append({**copy.deepcopy(value), "key": key})
+        return out[:limit]
+
+    async def pauses_page(self, limit, offset):
+        rows = await self.open_pauses(10**9)
+
+        def since(row: dict[str, Any]) -> float:
+            value = row.get("since")
+            return float(value) if isinstance(value, (int, float)) else 0.0
+
+        rows.sort(key=lambda r: (since(r), str(r.get("workspace")), r["key"]))
+        return rows[offset : offset + limit]
+
+    async def pause_counts(self):
+        self._check()
+        rows: dict[tuple[str, str], int] = {}
+        workspaces = set()
+        for key, value in self.kv.items():
+            if (
+                key.startswith("pause:")
+                and isinstance(value, dict)
+                and not value.get("cleared_at")
+            ):
+                slot = value.get("slot") or "unknown"
+                kind = value.get("kind") or "unknown"
+                rows[(slot, kind)] = rows.get((slot, kind), 0) + 1
+                workspaces.add(value.get("workspace"))
+        return _pause_counts(
+            [{"slot": s, "kind": k, "count": n} for (s, k), n in rows.items()],
+            len(workspaces),
+        )
+
+    async def run_events(self, start, end, limit):
+        self._check()
+        rows = [
+            {
+                "run_id": r["run_id"],
+                "workspace": r["workspace"],
+                "kind": r["kind"],
+                "status": r["status"],
+                "was_orphaned": r["was_orphaned"],
+                "ts": r["heartbeat_at"],
+            }
+            for r in self.run_rows.values()
+            if (r["status"] == "orphaned" or r["was_orphaned"])
+            and start <= r["heartbeat_at"] < end
+        ]
+        rows.sort(key=lambda r: r["ts"], reverse=True)
+        return rows[:limit]

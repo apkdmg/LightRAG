@@ -6,16 +6,21 @@ import { Kv, Seg } from '@/features/TokenInsights/ui'
 import { useSettingsStore } from '@/stores/settings'
 import { Feed, WorkspaceDetail, opsApi } from '../api'
 import ErrorPanel from '../components/ErrorPanel'
+import OpsLink from '../components/OpsLink'
 import { ApproxChip, Pager, StaleChip } from '../components/Panel'
 import { RunStateLabel } from '../components/RunState'
 import Skeleton from '../components/Skeleton'
 import { StatusChip } from '../components/StatusChip'
 import { useOpsNav, useOpsShell } from '../context'
-import { ageSeconds, fmtAge, fmtClock, fmtCount, shortId, utcTitle } from '../format'
+import { ageSeconds, fmtAge, fmtClock, fmtCount, fmtStamp, shortId, utcTitle } from '../format'
+import { viewForTarget } from '../hashState'
 import { useStale } from '../hooks'
 import { useOpsPoll } from '../poll'
+import { DrainerText } from '../processing/EmailQueueView'
+import { runDurationSeconds } from '../processing/runs'
 import { docStatusState } from '../severity'
 import { EMPTY_FEED, FeedState, mergeFeed } from './feed'
+import { ErrorKindText } from './RunDrawer'
 import Section from './Section'
 
 /** §3.10: the drawer's feed refreshes every 3 s, the rest every 15 s. */
@@ -25,6 +30,7 @@ const DOC_STATUSES = ['all', 'failed', 'processing', 'pending', 'processed'] as 
 
 function LiveState({ data, now, stale }: { data: WorkspaceDetail; now: number | null; stale: boolean }) {
   const { t } = useTranslation()
+  const nav = useOpsNav()
   const live = data.live
   const loaded = Array.isArray(data.loaded_in) ? data.loaded_in : null
   if (data.live_status === 'unresponsive') {
@@ -48,6 +54,10 @@ function LiveState({ data, now, stale }: { data: WorkspaceDetail; now: number | 
     )
   }
   const paused = !!live.paused || !!live.provider_rejection
+  // The run holding busy, from the run table: it says hung or orphaned where the live flags only say busy.
+  const runs = data.recent_runs ?? []
+  const current = (live.run_id ? runs.find((r) => r.run_id === live.run_id) : undefined) ?? runs.find((r) => r.status === 'running')
+  const heldState = current && (current.status === 'running' || current.status === 'orphaned') ? current.state : 'running'
   const started = live.job_start ? ageSeconds(live.job_start, now ?? undefined) : null
   const notes: string[] = []
   if (typeof live.batchs === 'number' && live.batchs > 0) notes.push(t('operations.workspace.batch', { current: live.cur_batch ?? 0, total: live.batchs }))
@@ -56,7 +66,7 @@ function LiveState({ data, now, stale }: { data: WorkspaceDetail; now: number | 
   return (
     <div className="flex flex-col items-start gap-1">
       <span className="flex flex-wrap items-center gap-2">
-        <RunStateLabel state={paused ? 'paused' : 'running'} stale={stale} />
+        <RunStateLabel state={paused ? 'paused' : heldState} stale={stale} />
         {live.job_name ? <span className="text-[13px] break-all">{live.job_name}</span> : null}
       </span>
       {notes.length ? <p className="text-muted-foreground m-0 text-xs">{notes.join(' · ')}</p> : null}
@@ -65,6 +75,21 @@ function LiveState({ data, now, stale }: { data: WorkspaceDetail; now: number | 
           {typeof live.provider_rejection?.status_code === 'number'
             ? t('operations.active.pausedCode', { code: live.provider_rejection.status_code, slot: live.provider_rejection.slot ?? '' })
             : t('operations.active.pausedNoCode')}
+        </p>
+      ) : null}
+      {live.run_id || current ? (
+        <p className="m-0 text-xs">
+          <button
+            type="button"
+            className="underline underline-offset-2"
+            onClick={() => nav.openDrawer({ kind: 'run', id: (live.run_id ?? current?.run_id) as string }, { push: true })}
+          >
+            {t('operations.stuck.run', { id: shortId(live.run_id ?? current?.run_id) })}
+          </button>
+          {typeof (live.owner_pid ?? current?.pid) === 'number' ? (
+            <span className="text-muted-foreground"> · {t('operations.runDrawer.pid', { pid: live.owner_pid ?? current?.pid })}</span>
+          ) : null}
+          {current?.worker_alive === false ? <span className="text-[color:var(--ops-crit)]"> · {t('operations.runDrawer.ownerGone')}</span> : null}
         </p>
       ) : null}
       {live.cancellation_requested ? <p className="m-0 text-xs">{t('operations.active.cancelling')}</p> : null}
@@ -205,11 +230,14 @@ function Documents({ workspace }: { workspace: string }) {
 
 /**
  * The Workspace drawer (§2.9, US-4), read-only. Opening it never loads the
- * workspace on the server: counts come from SQL and live state from a
- * read-only snapshot. "Idle (not loaded in memory)" when no process has it.
+ * workspace on the server: counts, recent runs and failures by kind come
+ * from SQL and live state from a read-only snapshot. "Idle (not loaded in
+ * memory)" when no process has it. Runs open the Run drawer on the
+ * breadcrumb.
  */
 export default function WorkspaceDrawer({ workspace }: { workspace: string }) {
   const { t } = useTranslation()
+  const nav = useOpsNav()
   const { status, openInsights } = useOpsShell()
   const poll = useOpsPoll((signal) => opsApi.workspace(workspace, signal), [workspace], DETAIL_SECONDS)
   const { stale, ageSeconds: age } = useStale(poll.updatedAt, DETAIL_SECONDS)
@@ -277,6 +305,11 @@ export default function WorkspaceDrawer({ workspace }: { workspace: string }) {
                 <Kv k={t('operations.email.col.since')}>
                   <span title={utcTitle(eq.pending_since)}>{fmtAge(eq.pending_since ? ageSeconds(eq.pending_since, poll.updatedAt ?? undefined) : null)}</span>
                 </Kv>
+                {eq.drainer || eq.backoff_until ? (
+                  <Kv k={t('operations.email.col.drainer')}>
+                    <DrainerText item={eq} now={poll.updatedAt} />
+                  </Kv>
+                ) : null}
                 {typeof eq.attempts === 'number' ? <Kv k={t('operations.email.col.attempts')}>{fmtCount(eq.attempts)}</Kv> : null}
                 {typeof eq.bad === 'number' && eq.bad > 0 ? <Kv k={t('operations.email.col.bad')}>{fmtCount(eq.bad)}</Kv> : null}
                 {eq.last_result_class ? (
@@ -312,30 +345,59 @@ export default function WorkspaceDrawer({ workspace }: { workspace: string }) {
             </Section>
           ) : null}
           {d.failures_by_kind?.length ? (
-            <Section title={t('operations.workspace.failuresByKind')}>
-              <p className="m-0 text-[13px]">{d.failures_by_kind.map((f) => `${t(`operations.errorKind.${f.key}`, { defaultValue: f.key })} ${fmtCount(f.count)}`).join(' · ')}</p>
-            </Section>
-          ) : null}
-          {d.recent_runs?.length ? (
-            <Section title={t('operations.workspace.recentRuns')}>
-              <ul className="m-0 flex list-none flex-col gap-1 p-0 text-[13px]">
-                {d.recent_runs.map((r, i) => (
-                  <li key={r.run_id ?? i} className="flex flex-wrap items-center gap-2">
-                    <span className="font-mono text-xs">{fmtClock(r.started_at ?? null)}</span>
-                    <span>{r.kind ? t(`operations.kind.${r.kind}`, { defaultValue: r.kind }) : '–'}</span>
-                    <RunStateLabel state={r.state} stale={stale} />
-                    {typeof r.docs_total === 'number' ? (
-                      <span className="font-mono text-xs">
-                        {fmtCount(r.docs_done ?? 0)}/{fmtCount(r.docs_total)}
-                      </span>
-                    ) : null}
+            <Section
+              title={t('operations.workspace.failuresByKind')}
+              aside={
+                <OpsLink to={viewForTarget(nav.view, { tab: 'processing', sub: 'failures' })} className="text-xs underline underline-offset-2">
+                  {t('operations.workspace.allFailures')}
+                </OpsLink>
+              }
+            >
+              <ul className="m-0 flex list-none flex-wrap gap-x-3 gap-y-1 p-0 text-[13px]">
+                {d.failures_by_kind.map((f) => (
+                  <li key={f.key}>
+                    <ErrorKindText kind={f.key} status={f.http_status} /> <span className="font-mono text-xs">{fmtCount(f.count)}</span>
                   </li>
                 ))}
               </ul>
+              <p className="text-muted-foreground m-0 text-xs">{t('operations.workspace.failuresWindow')}</p>
             </Section>
-          ) : status?.features?.runs === false ? (
-            <p className="text-muted-foreground m-0 text-xs">{t('operations.workspace.runsLater')}</p>
           ) : null}
+          <Section title={t('operations.workspace.recentRuns')}>
+            {d.recent_runs?.length ? (
+              <ul className="m-0 flex list-none flex-col p-0">
+                {d.recent_runs.map((r) => (
+                  <li key={r.run_id}>
+                    <button
+                      type="button"
+                      className="hover:bg-muted flex w-full flex-wrap items-center gap-x-2.5 gap-y-0.5 rounded-lg px-2 py-1.5 text-left text-[13px]"
+                      onClick={() => nav.openDrawer({ kind: 'run', id: r.run_id }, { push: true })}
+                    >
+                      <span className="font-mono text-xs" title={utcTitle(r.started_at)}>
+                        {fmtStamp(r.started_at ?? null, poll.updatedAt ?? undefined)}
+                      </span>
+                      <span>{r.kind ? t(`operations.kind.${r.kind}`, { defaultValue: r.kind }) : '–'}</span>
+                      {/* Recent runs are history: their dot never breathes (§2.12). */}
+                      <RunStateLabel state={r.state} stale />
+                      {typeof r.docs_total === 'number' ? (
+                        <span className="font-mono text-xs">
+                          {fmtCount(r.docs_done ?? 0)}/{fmtCount(r.docs_total)}
+                        </span>
+                      ) : null}
+                      {typeof r.docs_failed === 'number' && r.docs_failed > 0 ? (
+                        <span className="text-xs">{t('operations.active.failedDocs', { count: r.docs_failed })}</span>
+                      ) : null}
+                      <span className="text-muted-foreground text-xs">{fmtAge(runDurationSeconds(r, poll.updatedAt))}</span>
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            ) : (
+              <p className="text-muted-foreground m-0 text-xs">
+                {status?.features?.runs === false ? t('operations.workspace.runsOff') : t('operations.workspace.noRuns')}
+              </p>
+            )}
+          </Section>
         </div>
       ) : null}
       <LiveFeed workspace={workspace} />
