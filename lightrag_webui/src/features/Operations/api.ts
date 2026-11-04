@@ -18,6 +18,7 @@ import {
   normalizeWorkspace
 } from './normalize'
 import { normalizeConfig, normalizeDepDetail, normalizeHealth, normalizeProbeResult, normalizeSmtpTest, normalizeWorkerHistory, normalizeWorkers } from './health/model'
+import { normalizeAlertDetail, normalizeAlertRules, normalizeAlertsPage, normalizeLogCapture } from './activity/alerts'
 import { filenameFromDisposition } from './logs'
 import { normalizeCorrelate, normalizeLogDetail, normalizeLogGroups, normalizeLogPage } from './logsNormalize'
 import {
@@ -59,6 +60,8 @@ export const get = async <T>(path: string, params?: Params, signal?: AbortSignal
 export const post = async <T>(path: string, body?: unknown, signal?: AbortSignal): Promise<T> =>
   (await axiosInstance.post(`${OPS_PREFIX}${path}`, body ?? {}, { signal })).data
 
+export const put = async <T>(path: string, body: unknown): Promise<T> => (await axiosInstance.put(`${OPS_PREFIX}${path}`, body)).data
+
 /** Feature switches reported by /status; each view shows "not available" instead of failing. */
 export type OpsFeatures = {
   durable: boolean
@@ -76,6 +79,10 @@ export type OpsFeatures = {
   metrics: boolean
   /** Admin actions (cancel, run now, drain, release, reveal) are turned on (OPS_ACTIONS_ENABLED). */
   actions: boolean
+  /** OPS_ALERT_EMAIL: alert email is sent; false is record-only. */
+  alert_email: boolean
+  /** This process has a log sink, so an INFO capture can be started here. */
+  log_capture: boolean
 }
 
 export type OpsStatus = {
@@ -148,6 +155,12 @@ export type AttentionItem = {
   dep?: string | null
   worker_id?: string | null
   target?: OpsTarget | null
+  /** The open OPS_ALERTS row behind the item (PR-8): the item links to its Alert drawer. */
+  alert_id?: string | null
+  /** Who acked that alert (an ack does not clear the item: the rule still holds). */
+  acked_by?: string | null
+  /** The item's rule is muted: no email, still shown. */
+  muted?: boolean | null
 }
 
 export type OpsEvent = {
@@ -165,7 +178,8 @@ export type OpsOverview = Generated & {
   /** ok | warning | serious | critical | down | unknown | maintenance */
   state: string
   worst?: string | null
-  maintenance?: { until?: string | null; by?: string | null; reason?: string | null } | null
+  /** Maintenance mode while it is on (FR-64); the header then reads Maintenance. */
+  maintenance?: Maintenance | null
   kpis: OverviewKpis
   attention: AttentionItem[]
   /** What the attention check covered, for the "No issues. Checked …" sentence. */
@@ -176,7 +190,9 @@ export type OpsOverview = Generated & {
   active_top?: ActiveRun[]
   /** Dependency summary from the latest probe cycle (same shape as /health deps, strip optional). */
   deps?: DepHealth[]
-  alert_channel?: { ok: boolean | null; reason?: string | null } | null
+  alert_channel?: AlertChannel | null
+  /** Open and recently resolved alerts, for the attention panel's footer (PR-8). */
+  alerts?: { open?: Num; resolved_24h?: Num } | null
   approximate?: boolean
 }
 
@@ -960,6 +976,170 @@ export type AuditPage = Generated & {
 
 export type AuditFilters = { actor?: string; action?: string; from?: string; to?: string }
 
+// ---------- alerts (PR-8) ----------
+
+/**
+ * Whether alert email reaches anyone (FR-63): `ok: false` shows the "alert
+ * email is not being delivered" banner. `reason` is a code
+ * (smtp_probe_failing, smtp_not_configured, send_failing, no_recipients);
+ * `failures` counts failed sends since the last success.
+ */
+export type AlertChannel = {
+  ok: boolean | null
+  reason?: string | null
+  since?: string | null
+  failures?: Num
+  /** OPS_ALERT_EMAIL: false means record-only (the first week after rollout). */
+  email_enabled?: boolean | null
+  last_sent_at?: string | null
+}
+
+/** The alert email state as the Alerts view shows it; never the recipient addresses. */
+export type AlertEmailState = {
+  /** OPS_ALERT_EMAIL; false is record-only. */
+  enabled: boolean | null
+  /** How many recipients are configured (OPS_ALERT_EMAIL_TO, else ALERT_EMAIL_TO). */
+  recipients: number | null
+  ok: boolean | null
+  reason: string | null
+  since: string | null
+  failures: number | null
+  last_sent_at: string | null
+}
+
+/** What an alert is about. Workspace IDs are shown to admins in the app (D9), never in email. */
+export type AlertScope = {
+  workspace?: string | null
+  dep?: string | null
+  worker_id?: string | null
+  run_id?: string | null
+  count?: Num
+} & Record<string, unknown>
+
+/**
+ * One LIGHTRAG_OPS_ALERTS row (§3.5): `firing` until the rule clears, then
+ * `resolved`. An ack is kept in `acked_by`/`acked_at` and never changes the
+ * state (FR-61); a re-fire after resolving is a new row.
+ */
+export type OpsAlert = {
+  id: string
+  rule: string
+  fingerprint: string | null
+  severity: string
+  /** firing | resolved */
+  state: string
+  title: string | null
+  /** The rule's name in words, from the server's catalogue. */
+  label: string | null
+  scope: AlertScope
+  /** The view the alert drills into (from its `link`). */
+  target: OpsTarget | null
+  runbook: string | null
+  /** OPS_RUNBOOK_BASE_URL + the rule's page, when configured. */
+  runbook_url: string | null
+  first_seen: string | null
+  last_seen: string | null
+  resolved_at: string | null
+  acked_by: string | null
+  acked_at: string | null
+  ack_note: string | null
+  last_emailed_at: string | null
+  /**
+   * How the alert reached people: sent, pending, in_app_only (warnings,
+   * provider pauses), record_only (OPS_ALERT_EMAIL=false), muted,
+   * maintenance, suppressed (after a deploy) or failed. Null when the server
+   * does not say; the view then infers it.
+   */
+  email: string | null
+  muted_until: string | null
+}
+
+/** Alerts, newest first, keyset-paged by `next_before` (null on the last page). */
+export type AlertsPage = Generated & {
+  items: OpsAlert[]
+  next_before: string | null
+  /** False when the evaluator is turned off on this server (OPS_ALERTS_ENABLED). */
+  enabled?: boolean
+  email: AlertEmailState | null
+}
+
+/** One editable threshold of a rule (the `thresholds` KV value, §1.7). */
+export type RuleThreshold = {
+  key: string
+  value: number
+  default: number | null
+  min: number | null
+  max: number | null
+  unit: string | null
+  /** Whole numbers only (counts, minutes). */
+  integer: boolean
+}
+
+/** One rule of the catalogue (§1.7) with its runbook and current thresholds. */
+export type AlertRule = {
+  rule: string
+  /** The rule's name in words, from the server's catalogue. */
+  label: string | null
+  /** The severities the rule can raise, mildest first. */
+  severities: string[]
+  /** Critical and serious alerts of this rule are emailed; provider pauses and warnings stay in the app. */
+  email: boolean
+  /** The condition and guard in words ("≥ 20 calls", "2 consecutive"). */
+  condition: string | null
+  runbook: string | null
+  runbook_url: string | null
+  thresholds: RuleThreshold[]
+  /** Higher values are worse ('above': rates, ages) or lower ('below': disk free, days to expiry). */
+  direction: 'above' | 'below' | null
+  muted_until: string | null
+  mute_reason: string | null
+  muted_by: string | null
+}
+
+/** A rule mute (KV `alert_mutes`): email and attention for the rule are held until `until`. */
+export type AlertMute = { rule: string; until: string | null; reason: string | null; by: string | null; at: string | null }
+
+/** Maintenance mode (KV `maintenance`): alerts are still recorded, email is held. */
+export type Maintenance = { until: string | null; reason: string | null; by: string | null; at?: string | null }
+
+export type AlertRules = Generated & {
+  rules: AlertRule[]
+  /** The viewer may edit thresholds (D8), as the server sees it. */
+  operator?: boolean
+  mutes: AlertMute[]
+  maintenance: Maintenance | null
+  email: AlertEmailState | null
+  enabled?: boolean
+}
+
+/** The Alert drawer: the row, its rule, and earlier occurrences of the same fingerprint. */
+export type AlertDetail = Generated & { alert: OpsAlert | null; rule: AlertRule | null; history: OpsAlert[]; email: AlertEmailState | null }
+
+/** An INFO capture for one module (KV `log_capture`), read by the log sink on every worker. */
+export type LogCapture = { module: string; expires_at: string; by: string | null; reason: string | null; started_at: string | null }
+
+export type LogCaptureState = Generated & {
+  active: LogCapture | null
+  /** The modules that may be captured (the server's allowlist); empty when the server does not list them. */
+  modules: string[]
+  max_minutes: number
+  /** False when this server's log sink is off (OPS_LOG_SINK), so nothing would be captured. */
+  sink_enabled: boolean | null
+}
+
+/** What an alert action answered: `{ok, audit_id}` plus what changed. */
+export type AlertActionResponse = {
+  ok?: boolean | null
+  result?: string | null
+  audit_id?: string | number | null
+  until?: string | null
+  expires_at?: string | null
+  generated_at?: string
+}
+
+/** The thresholds to change, per rule; only changed values are sent. */
+export type RulesChange = Record<string, Record<string, number>>
+
 // ---------- the client ----------
 
 const enc = encodeURIComponent
@@ -1054,7 +1234,28 @@ export const opsApi = {
   audit: async (params: Params, signal?: AbortSignal) => normalizeAuditPage(await get('/audit', params, signal)),
   /** The audit rows for the filters as CSV (cells that start a formula are escaped on the server); audited itself. */
   exportAudit: (body: { filters: AuditFilters; reason: string }) =>
-    postDownload('/audit/export', body, `ops-audit-${new Date().toISOString().slice(0, 10)}.csv`)
+    postDownload('/audit/export', body, `ops-audit-${new Date().toISOString().slice(0, 10)}.csv`),
+  /** Alerts, newest first (FR-60, FR-61): `state` open | resolved | all, keyset-paged by `before`. */
+  alerts: async (params: Params, signal?: AbortSignal) => normalizeAlertsPage(await get('/alerts', params, signal)),
+  /** The rule catalogue with runbooks and current thresholds, plus mutes, maintenance and the email state. */
+  alertRules: async (signal?: AbortSignal) => normalizeAlertRules(await get('/alerts/rules', undefined, signal)),
+  /** One alert for its drawer (`oal=<id>`, the only link an alert email carries). */
+  alert: async (id: string, signal?: AbortSignal) => normalizeAlertDetail(await get(`/alerts/${enc(id)}`, undefined, signal)),
+  /** Ack (audited): records who and why in acked_by/acked_at/ack_note; the alert stays firing until it clears. */
+  ackAlert: (id: string, reason: string) => post<AlertActionResponse>(`/alerts/${enc(id)}/ack`, { reason }),
+  /** Mute a rule for `minutes` (at most 7 days); 0 ends the mute. Audited. */
+  muteRule: (rule: string, minutes: number, reason: string) => post<AlertActionResponse>(`/alerts/rules/${enc(rule)}/mute`, { minutes, reason }),
+  /** Change thresholds (operator, audited, bounds checked on the server). */
+  saveRules: (rules: RulesChange, reason: string) => put<AlertActionResponse>('/alerts/rules', { rules, reason }),
+  /** Maintenance mode for `minutes`; 0 ends it. Alerts are still recorded, email is held. Audited. */
+  setMaintenance: (minutes: number, reason: string) => post<AlertActionResponse>('/maintenance', { minutes, reason }),
+  /** The incident timeline over a window as NDJSON: alerts, audit, runs and markers, no log text (FR-65). Audited. */
+  exportActivity: (body: { from: string; to: string; reason: string }) =>
+    postDownload('/activity/export', body, `ops-incident-${new Date().toISOString().slice(0, 10)}.ndjson`),
+  /** The INFO capture in force, if any, and the modules that may be captured (FR-26). */
+  logCapture: async (signal?: AbortSignal) => normalizeLogCapture(await get('/logs/capture', undefined, signal)),
+  /** Store INFO lines from one module for at most 60 min on every worker (operator, audited); 0 minutes stops it. */
+  startCapture: (body: { module: string; minutes: number; reason: string }) => post<AlertActionResponse>('/logs/capture', body)
 }
 
 /** Pause counts as flat rows, whichever of the two server shapes arrives. */

@@ -59,7 +59,16 @@ const EMPTY_VIEW: View = { stream: EMPTY_STREAM, source: null, change: 'none' }
  * overflow-anchor) and the "↑ N new" pill counts what arrived. Follow off,
  * "⏸ auto", a hidden tab and reduced motion all stop the polling or the fade.
  */
-export default function StreamView({ filter, follow }: { filter: LogFilter; follow: boolean }) {
+export default function StreamView({
+  filter,
+  follow,
+  onCapture
+}: {
+  filter: LogFilter
+  follow: boolean
+  /** "Capture INFO for 60 min…" in the empty state (§2.5), for operators while no capture runs. */
+  onCapture?: () => void
+}) {
   const { t } = useTranslation()
   const { paused } = useOpsMotion()
   const key = filterKey(filter)
@@ -214,6 +223,11 @@ export default function StreamView({ filter, follow }: { filter: LogFilter; foll
             <div className="flex flex-col gap-1 p-4 text-sm">
               <p className="m-0">{t('operations.logs.empty', { level: filter.level })}</p>
               <p className="text-muted-foreground m-0 text-xs">{t('operations.logs.emptyHint')}</p>
+              {onCapture && filter.level !== 'INFO' ? (
+                <button type="button" className="hover:bg-muted mt-1 min-h-8 self-start rounded-lg border px-2.5 text-[13px]" onClick={onCapture}>
+                  {t('operations.capture.emptyAction')}
+                </button>
+              ) : null}
             </div>
           )}
           {items.length ? (

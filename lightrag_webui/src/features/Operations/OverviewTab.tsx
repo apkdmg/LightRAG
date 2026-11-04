@@ -22,9 +22,9 @@ import { isMultiWorker } from './severity'
 const FEATURE_ORDER: (keyof OpsFeatures)[] = ['durable', 'runs', 'logs', 'probes', 'metrics', 'alerts', 'release_busy', 'gpu', 'insights']
 const TOP_ACTIVE = 5
 
-/** Why a feature is off: Insights, probes and metrics can be switched off, release busy needs Gunicorn, the rest ships later. */
+/** Why a feature is off: Insights, probes, metrics and alerts can be switched off, release busy needs Gunicorn, the rest ships later. */
 const offLabel = (key: keyof OpsFeatures, singleProcess: boolean) => {
-  if (key === 'insights' || key === 'probes' || key === 'metrics') return 'operations.feature.off'
+  if (key === 'insights' || key === 'probes' || key === 'metrics' || key === 'alerts') return 'operations.feature.off'
   if (key === 'release_busy' && singleProcess) return 'operations.feature.multiWorkerOnly'
   return 'operations.feature.later'
 }
@@ -207,12 +207,21 @@ export function KpiRow({ data, poll }: { data: OpsOverview; poll: Pick<OpsPoll<O
 function AttentionPanel({ poll }: { poll: OpsPoll<OpsOverview> }) {
   const { t } = useTranslation()
   const nav = useOpsNav()
+  const { status } = useOpsShell()
+  const alertsView = viewForTarget(nav.view, { tab: 'activity', sub: 'alerts' })
   return (
     <Panel
       poll={poll}
       freshness={OVERVIEW_REFRESH_SECONDS}
       title={t('operations.attention.title')}
       sub={poll.updatedAt ? t('operations.attention.checked', { time: fmtClock(poll.updatedAt) }) : undefined}
+      actions={
+        status?.features?.alerts ? (
+          <OpsLink to={alertsView} className="hover:bg-muted rounded-lg border px-2.5 py-1 text-[13px] no-underline">
+            {t('operations.attention.allAlerts')}
+          </OpsLink>
+        ) : null
+      }
     >
       {(data) => {
         const c = data.checked
@@ -221,7 +230,20 @@ function AttentionPanel({ poll }: { poll: OpsPoll<OpsOverview> }) {
           c && typeof c.workspaces === 'number'
             ? t('operations.attention.none', { workspaces: fmtCount(c.workspaces), active: fmtCount(c.active ?? 0), time })
             : t('operations.attention.noneSimple', { time })
-        return <AttentionList items={data.attention ?? []} base={nav.view} baseline={poll.baseline} now={poll.updatedAt} empty={empty} />
+        const resolved = data.alerts?.resolved_24h
+        return (
+          <>
+            <AttentionList items={data.attention ?? []} base={nav.view} baseline={poll.baseline} now={poll.updatedAt} empty={empty} />
+            {typeof resolved === 'number' && resolved > 0 ? (
+              <p className="text-muted-foreground m-0 border-t pt-2 text-xs">
+                {t('operations.attention.resolved24h', { count: resolved, countText: fmtCount(resolved) })}{' '}
+                <OpsLink to={alertsView} className="underline underline-offset-2">
+                  {t('operations.attention.showResolved')}
+                </OpsLink>
+              </p>
+            ) : null}
+          </>
+        )
       }}
     </Panel>
   )

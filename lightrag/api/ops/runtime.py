@@ -12,8 +12,9 @@ logged and the console reports what is unavailable instead.
 It also starts this worker's heartbeat (every process) and the dependency
 probes (a leased singleton on Postgres; local to each process without it),
 and, on Postgres, run tracking (this worker's buffered run writer), the
-leased reconcile + attention cycle, the structured log sink (this worker's
-handler and flusher) and the leased log retention.
+leased reconcile cycle, the leased alerts evaluator (attention snapshot,
+alert rows and email), the structured log sink (this worker's handler and
+flusher) and the leased log retention.
 
 Switches (all default on): ``OPS_ENABLED`` (the whole backend),
 ``OPS_INDEX_BUILD`` (the background index builder), ``OPS_QUEUE_SCAN``
@@ -25,7 +26,10 @@ write volume has been measured) stores WARNING+ log lines in
 ``OPS_METRICS_ENABLED`` (default on) records HTTP, embed, rerank and
 sign-in metrics (this worker's histograms and flusher, plus the leased
 hourly rollup/retention and LLM p95 baseline jobs); off makes every
-hot-path hook a no-op.
+hot-path hook a no-op. ``OPS_ALERTS_ENABLED`` (default on) records alerts
+in ``LIGHTRAG_OPS_ALERTS``; the leased evaluator that owns the attention
+snapshot runs either way. ``OPS_ALERT_EMAIL`` (default **off**: the first
+week is record-only) emails critical and serious alerts.
 """
 
 from __future__ import annotations
@@ -76,6 +80,7 @@ class OpsRuntime:
     run_tracker: Any = None
     log_sink: Any = None
     metrics: Any = None
+    alerts: Any = None
 
     def leases_held(self) -> list[str]:
         return [
@@ -363,7 +368,7 @@ def _start_reconcile(app: Any, runtime: OpsRuntime) -> None:
     from lightrag.api.ops import reconcile
 
     async def cycle(loop: LeasedLoop) -> None:
-        await reconcile.attention_cycle(
+        await reconcile.reconcile_cycle(
             loop, service=runtime.service, process=lambda: _process(app)
         )
 
@@ -379,6 +384,42 @@ def _start_reconcile(app: Any, runtime: OpsRuntime) -> None:
     )
     loop.start()
     runtime.loops.append(loop)
+
+
+def _start_alerts(app: Any, runtime: OpsRuntime) -> None:
+    """The leased evaluator: the attention snapshot (always), the alert
+    rows (``OPS_ALERTS_ENABLED``) and their email (``OPS_ALERT_EMAIL``)."""
+    from lightrag.api.ops import alerts
+
+    evaluator = alerts.AlertEvaluator(runtime.service, process=lambda: _process(app))
+
+    async def cycle(loop: LeasedLoop) -> None:
+        await evaluator.cycle(loop)
+
+    loop = LeasedLoop(
+        runtime.store,
+        alerts.ALERTS_LEASE,
+        runtime.worker_id,
+        cycle,
+        ttl_s=alerts.ALERTS_LEASE_TTL_S,
+        interval_s=alerts.ALERTS_INTERVAL_S,
+        cycle_timeout_s=alerts.ALERTS_CYCLE_TIMEOUT_S,
+        initial_delay_s=random.uniform(10.0, 20.0),
+    )
+    loop.start()
+    runtime.loops.append(loop)
+    runtime.alerts = evaluator
+    runtime.service.alerts = evaluator
+    if not alerts.alerts_enabled():
+        logger.info(
+            "Operations console: alert rows off (OPS_ALERTS_ENABLED=false); the "
+            "attention snapshot is still evaluated"
+        )
+    else:
+        logger.info(
+            "Operations console: alerts on, email %s",
+            "on" if alerts.email_enabled() else "off (record-only)",
+        )
 
 
 async def _start(app: Any, rag: Any, args: Any) -> OpsRuntime:
@@ -471,7 +512,11 @@ async def _start(app: Any, rag: Any, args: Any) -> OpsRuntime:
     try:
         _start_reconcile(app, runtime)
     except Exception:
-        logger.error("Operations console attention loop could not start", exc_info=True)
+        logger.error("Operations console reconcile loop could not start", exc_info=True)
+    try:
+        _start_alerts(app, runtime)
+    except Exception:
+        logger.error("Operations console alerts loop could not start", exc_info=True)
     if env_flag("OPS_LOG_SINK", default=False):
         try:
             _start_log_sink(app, runtime)
@@ -576,6 +621,8 @@ async def stop_ops(app: Any) -> None:
             await loop.stop()
         except Exception:
             logger.debug("Ops loop %s did not stop cleanly", loop.name, exc_info=True)
+    if runtime.alerts is not None:
+        runtime.alerts.close()
     tasks = list(runtime.tasks)
     for task in tasks:
         task.cancel()

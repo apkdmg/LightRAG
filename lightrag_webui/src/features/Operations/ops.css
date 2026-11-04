@@ -99,6 +99,31 @@
 }
 .ops-fade-in { animation: ops-fade-in var(--ops-dur-fast) var(--ops-ease-out); }
 
+/*
+ * Shell banners (§2.2: alert email not delivered, maintenance mode). Body
+ * text stays in the foreground colour for contrast; the tone is carried by
+ * the icon, the border and a soft fill, never by colour alone. A banner that
+ * appears on a later poll fades in (.ops-fade-in); on first paint it is
+ * simply there.
+ */
+.ops-banner {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 12px;
+  font-size: 13px;
+  color: var(--foreground);
+}
+.ops-banner[data-tone="crit"] { background: var(--ops-crit-soft); border-color: color-mix(in srgb, var(--ops-crit) 45%, transparent); }
+.ops-banner[data-tone="crit"] .ops-banner-icon { color: var(--ops-crit); }
+.ops-banner[data-tone="unknown"] { background: var(--ops-unknown-soft); border-color: color-mix(in srgb, var(--ops-unknown) 45%, transparent); }
+.ops-banner[data-tone="unknown"] .ops-banner-icon { color: var(--ops-unknown); }
+.ops-banner[data-tone="info"] { background: var(--ops-info-soft); border-color: color-mix(in srgb, var(--ops-info) 45%, transparent); }
+.ops-banner[data-tone="info"] .ops-banner-icon { color: var(--ops-info); }
+
 /* Skeleton: two pulses (4 s, under the 5 s cap of WCAG 2.2.2), then still. */
 @keyframes ops-pulse {
   0%, 100% { opacity: 1; }

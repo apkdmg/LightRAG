@@ -18,6 +18,7 @@ import psutil
 import pytest
 
 from lightrag.api.ops import reconcile, runs
+from lightrag.api.ops.alerts import ALERTS_LEASE, AlertEvaluator
 from lightrag.api.ops.leases import LeasedLoop
 from lightrag.api.ops.service import (
     ATTENTION_KEY,
@@ -408,7 +409,7 @@ async def test_reconcile_cycle_is_a_noop_without_tracking(shared):
     assert BUSY_WITHOUT_RUN_KEY not in store.kv
 
 
-async def test_attention_cycle_reconciles_then_publishes(shared):
+async def test_reconcile_then_the_evaluator_publishes(shared):
     store = MemoryOpsStore()
     service = _service(store)
     proc = _spawn()
@@ -420,7 +421,7 @@ async def test_attention_cycle_reconciles_then_publishes(shared):
             store,
             reconcile.RECONCILE_LEASE,
             ME,
-            lambda loop: reconcile.attention_cycle(
+            lambda loop: reconcile.reconcile_cycle(
                 loop, service=service, process=lambda: {"mode": "gunicorn"}
             ),
             ttl_s=120,
@@ -429,8 +430,23 @@ async def test_attention_cycle_reconciles_then_publishes(shared):
         )
         assert await loop.run_once()
         assert store.run_rows[run_id]["status"] == "orphaned"
+        # The reconciler does not evaluate the rules: the alerts evaluator,
+        # under its own lease, is the snapshot's only writer.
+        assert ATTENTION_KEY not in store.kv
+        evaluator = AlertEvaluator(service, process=lambda: {"mode": "gunicorn"})
+        alerts_loop = LeasedLoop(
+            store,
+            ALERTS_LEASE,
+            ME,
+            evaluator.cycle,
+            ttl_s=120,
+            interval_s=60,
+            cycle_timeout_s=90,
+        )
+        assert await alerts_loop.run_once()
         rules = {a["rule"] for a in store.kv[ATTENTION_KEY]["items"]}
         assert "run_orphaned" in rules
+        assert any(r["rule"] == "run_orphaned" for r in store.alert_rows)
     finally:
         _kill(proc)
 

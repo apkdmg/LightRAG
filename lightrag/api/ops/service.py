@@ -24,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import statistics
 import time
 from collections import OrderedDict
 from datetime import datetime, timedelta, timezone
@@ -130,6 +131,10 @@ TTL = {
     "failures_by_kind": 30.0,
     "doc_failures": 10.0,
     "pauses_durable": 15.0,
+    "email_ingest": 30.0,
+    "failure_baseline": 300.0,
+    "failure_hour": 60.0,
+    "alert_state": 5.0,
 }
 
 DEFAULT_THRESHOLDS = {
@@ -147,6 +152,15 @@ DEFAULT_THRESHOLDS = {
     "llm_error_rate": 0.05,
     "llm_error_rate_serious": 0.20,
     "llm_min_calls": 20,
+    # email_ingest_silence: 2x the ~70 min email connector cycle (PR-8).
+    "email_silence_minutes": 140,
+    "email_silence_serious_minutes": 360,
+    # failure_spike: real failures in the last hour against the 7-day hourly
+    # median (PR-8).
+    "failure_spike_factor": 3.0,
+    "failure_spike_min": 20,
+    "failure_spike_serious": 100,
+    "failure_spike_serious_ratio": 0.30,
     # llm_p95_15m, http_5xx_rate_5m, embed_rerank_error_rate_15m and
     # signin_failures_15m (PR-6).
     **METRIC_THRESHOLDS,
@@ -161,6 +175,9 @@ EVENT_KINDS = ("deployment", "model_change", "provider_rejection", "ingestion_re
 AUDIT_EVENT_KIND = "ops_action"
 RUN_EVENT_KIND = "run_orphaned"
 BUSY_WITHOUT_RUN_KEY = "busy_without_run"
+# Written by run tracking (at most once a minute per process).
+EMAIL_INGEST_KEY = "email:last_ingest_at"
+FAILURE_BASELINE_HOURS = 168
 RESERVATIONS_KEY = "reservations"
 RUNNING_LIMIT = 200
 ORPHANED_HOURS = 24
@@ -222,6 +239,10 @@ RUNBOOK = {
     "processing that needs it waits or fails until it is back.",
     "vllm_waiting": "Compare vLLM's queue with LightRAG's own call rate before "
     "blaming LightRAG load: outside callers reach vLLM through the proxy.",
+    "unauth_warning_lines_5m": "Open Logs filtered to WARNING for the last "
+    "15 min and look for one caller or path repeating (a scanner, a "
+    "misconfigured client without credentials); block it at the proxy. "
+    "Per-call-site rate limits already cap what reaches the log table.",
     "smtp_probe": "Check the SMTP server and SMTP_* settings; alert emails "
     "cannot be delivered meanwhile.",
     "tls_cert_expiry": "Renew the certificate before it expires.",
@@ -243,6 +264,11 @@ RUNBOOK = {
     "Workers and restart the container if it does not recover.",
     "reservation_without_owner": "A scan or upload reservation outlived its "
     "owner, which blocks scans and deletes; restart the container to clear it.",
+    "email_ingest_silence": "Open Activity > System events: when no email "
+    "ingest call arrived, the email connector (not LightRAG) has stopped; check "
+    "the connector's schedule and credentials.",
+    "failure_spike": "Open Processing > Failures for the last hour grouped by "
+    "error kind, then by model or workspace, to find what changed.",
 }
 
 # What the console suggests for each stuck class (copy lives in the WebUI).
@@ -516,6 +542,8 @@ class OpsService:
         self.search_audit = SearchAudit()
         # Performance tab and Sign-in card read models (same cache).
         self.perf = PerformanceViews(self)
+        # The leased alert evaluator, when this process runs it.
+        self.alerts: Any = None
 
     # -- availability --------------------------------------------------------
     @property
@@ -2550,7 +2578,7 @@ class OpsService:
             ],
         }
 
-    # -- attention snapshot (leased, see reconcile.py) ---------------------------------------
+    # -- attention snapshot (leased, see alerts.py) ------------------------------------------
     async def _attention_snapshot(self, now: float) -> Optional[dict[str, Any]]:
         """The latest leased attention snapshot, when it is fresh."""
         if not self.available:
@@ -2577,11 +2605,18 @@ class OpsService:
     ) -> dict[str, Any]:
         """Evaluate every rule once for the host (the leased reconcile cycle)."""
         now = self.clock()
-        inputs = await self._gather(workers, now)
         try:
             previous = await self._q(lambda: self.store.kv_get(ATTENTION_KEY))
         except OpsDataUnavailable:
             previous = None
+        prior_boot = (
+            previous.get("restart_boot") if isinstance(previous, dict) else None
+        )
+        inputs = await self._gather(
+            workers,
+            now,
+            restart_prior=prior_boot if isinstance(prior_boot, (int, float)) else None,
+        )
         streaks = previous.get("streaks") if isinstance(previous, dict) else None
         items, new_streaks = self._attention(
             inputs, now, streaks=streaks if isinstance(streaks, dict) else {}
@@ -2597,6 +2632,11 @@ class OpsService:
             "worst": worst,
             "streaks": new_streaks,
             "failed_sections": inputs["failed_sections"],
+            "deploy_recent": bool(inputs["deploy_recent"]),
+            # The boot whose restart opened a deploy window (see
+            # restart_window): a later restart within the hour is a crash
+            # loop, not a deploy.
+            "restart_boot": inputs["restart_boot"],
         }
 
     # -- overview ------------------------------------------------------------------------------
@@ -2612,8 +2652,17 @@ class OpsService:
             lambda: self._overview(workers),
         )
 
-    async def _gather(self, workers: dict[str, Any], now: float) -> dict[str, Any]:
-        """Everything the KPI tiles and the attention rules read."""
+    async def _gather(
+        self,
+        workers: dict[str, Any],
+        now: float,
+        *,
+        restart_prior: Optional[float] = None,
+    ) -> dict[str, Any]:
+        """Everything the KPI tiles and the attention rules read.
+
+        ``restart_prior`` is the boot that last opened a restart deploy window
+        (from the previous leased snapshot; None for a per-request read)."""
         thresholds = await self.thresholds()
         failed_sections: list[str] = []
         backlog = active = queue = pauses = stuck_runs = None
@@ -2680,11 +2729,23 @@ class OpsService:
         postgres_down = (
             self.available and bool(failed_sections) and not await self._probe()
         )
-        deploy_recent = any(
+        restarted, restart_boot = restart_window(worker_items, now, restart_prior)
+        deploy_recent = restarted or any(
             e.get("kind") == "deployment"
             and (_epoch_of(e.get("ts")) or 0) >= now - DEPLOY_SUPPRESS_S
             for e in events
         )
+        email_ingest = failure_spike = None
+        if self.available:
+            try:
+                email_ingest = await self._email_ingest()
+            except OpsDataUnavailable:
+                failed_sections.append("email_ingest")
+            if self.durable_runs:
+                try:
+                    failure_spike = await self._failure_spike_inputs(now)
+                except OpsDataUnavailable:
+                    failed_sections.append("failure_spike")
         return {
             "thresholds": thresholds,
             "failed_sections": failed_sections,
@@ -2704,7 +2765,52 @@ class OpsService:
             "deps": deps,
             "cycle": cycle,
             "deploy_recent": deploy_recent,
+            "restart_boot": restart_boot,
             "metrics": await self.perf.rule_inputs(),
+            "email_ingest": email_ingest,
+            "failure_spike": failure_spike,
+        }
+
+    async def _email_ingest(self) -> Optional[float]:
+        """When an email ingest call last arrived (KV, any worker), or None
+        when none was recorded; raises OpsDataUnavailable when unreadable."""
+
+        async def load():
+            return await self.store.kv_get(EMAIL_INGEST_KEY)
+
+        value = await self._cached(("email_ingest",), "email_ingest", load)
+        at = value.get("at") if isinstance(value, dict) else None
+        return float(at) if isinstance(at, (int, float)) else None
+
+    async def _failure_spike_inputs(self, now: float) -> Optional[dict[str, Any]]:
+        """Real failures and processed documents in the last hour, and the
+        median of the 168 full hours before it (missing hours count as 0).
+        Raises OpsDataUnavailable when the counts cannot be read."""
+        hour_end = datetime.fromtimestamp(now, timezone.utc)
+        start_hour = int(now // 3600) * 3600
+        baseline_end = datetime.fromtimestamp(start_hour, timezone.utc)
+        baseline_start = baseline_end - timedelta(hours=FAILURE_BASELINE_HOURS)
+        baseline = await self._cached(
+            ("failure_baseline", start_hour),
+            "failure_baseline",
+            lambda: self.store.throughput(baseline_start, baseline_end, 3600),
+        )
+        recent = await self._cached(
+            ("failure_hour",),
+            "failure_hour",
+            lambda: self.store.throughput(
+                hour_end - timedelta(hours=1), hour_end, 3600
+            ),
+        )
+        hourly = {int(r["t"]): int(r.get("failed") or 0) for r in baseline["docs"]}
+        first = int(baseline_start.timestamp())
+        counts = [
+            hourly.get(first + 3600 * i, 0) for i in range(FAILURE_BASELINE_HOURS)
+        ]
+        return {
+            "last_hour": sum(int(r.get("failed") or 0) for r in recent["docs"]),
+            "processed": sum(int(r.get("processed") or 0) for r in recent["docs"]),
+            "median": float(statistics.median(counts)) if counts else 0.0,
         }
 
     async def _overview(self, workers: dict[str, Any]) -> dict[str, Any]:
@@ -2733,8 +2839,19 @@ class OpsService:
             s: sum(1 for a in attention if a["severity"] == s)
             for s in ("critical", "serious", "warning")
         }
+        from lightrag.api.ops import alerts as ops_alerts
+
+        maintenance = alert_channel = None
+        if self.available and not postgres_down:
+            maintenance = await ops_alerts.maintenance_state(self, now)
+            alert_channel = await ops_alerts.channel_state(
+                self, next((d for d in inputs["deps"] if d.get("id") == "smtp"), None)
+            )
         if not self.available:
             state = "unknown"
+        elif maintenance is not None:
+            # Planned work: expected outages do not read as an incident.
+            state = "maintenance"
         elif postgres_down or process.get("live") == 0:
             state = "down"
         elif worst:
@@ -2840,7 +2957,7 @@ class OpsService:
             "state": state,
             "worst": worst or ("ok" if self.available else "unknown"),
             "severity_counts": severity_counts,
-            "maintenance": None,
+            "maintenance": maintenance,
             "kpis": kpis,
             "attention": attention,
             "attention_source": attention_source,
@@ -2860,7 +2977,9 @@ class OpsService:
             "active_top": active_runs[:5],
             "deps": deps,
             "deps_cycle": self._cycle_view(inputs["cycle"], now),
-            "alert_channel": None,
+            "alert_channel": alert_channel,
+            # Open and recently resolved alerts, from the evaluator's snapshot.
+            "alerts": snapshot.get("alerts") if snapshot is not None else None,
             "approximate": bool((active or {}).get("approximate", True)),
             "durable": self.durable_runs,
             "postgres_ok": inputs["postgres_ok"],
@@ -3062,6 +3181,7 @@ class OpsService:
             _hash_link,
         )
         self._run_attention(add, inputs, thresholds, process)
+        self._ingest_attention(add, inputs, thresholds, now)
         new_streaks = health_attention(
             add,
             deps=inputs["deps"],
@@ -3173,6 +3293,120 @@ class OpsService:
                 count=len(reservations),
             )
 
+    @staticmethod
+    def _ingest_attention(
+        add: Callable[..., None],
+        inputs: dict[str, Any],
+        thresholds: dict[str, Any],
+        now: float,
+    ) -> None:
+        """``email_ingest_silence`` and ``failure_spike`` (§1.7)."""
+        last = inputs.get("email_ingest")
+        if isinstance(last, (int, float)):
+            minutes = max(0.0, now - last) / 60
+            if minutes > thresholds["email_silence_minutes"]:
+                add(
+                    "email_ingest_silence",
+                    "serious"
+                    if minutes > thresholds["email_silence_serious_minutes"]
+                    else "warning",
+                    f"No email has been ingested for {round(minutes)} min",
+                    _hash_link(otab="activity", osub="events"),
+                    params={
+                        "silent_min": round(minutes),
+                        "threshold_min": thresholds["email_silence_minutes"],
+                    },
+                    since=datetime.fromtimestamp(last, timezone.utc).isoformat(),
+                )
+        spike = inputs.get("failure_spike")
+        if not isinstance(spike, dict):
+            return
+        failed = int(spike.get("last_hour") or 0)
+        median = float(spike.get("median") or 0.0)
+        processed = int(spike.get("processed") or 0)
+        # Min-sample guard: a handful of failures is never a spike.
+        if failed <= thresholds["failure_spike_min"]:
+            return
+        if failed <= thresholds["failure_spike_factor"] * median:
+            return
+        # Run tracking counts failed documents in docs_done, so "processed"
+        # already includes them (the two counts come from different tables,
+        # hence the max).
+        share = failed / max(processed, failed)
+        serious = (
+            failed > thresholds["failure_spike_serious"]
+            or share > thresholds["failure_spike_serious_ratio"]
+        )
+        add(
+            "failure_spike",
+            "serious" if serious else "warning",
+            f"{failed} documents failed in the last hour (usually {median:g} an hour)",
+            _hash_link(otab="processing", osub="failures"),
+            params={
+                "failed_1h": failed,
+                "median_1h": median,
+                "processed_1h": processed,
+                "share": round(share, 3),
+            },
+            count=failed,
+        )
+
+
+# Workers a deploy starts come up within this many seconds of each other.
+RESTART_SPREAD_S = 120.0
+# Only one restart deploy window per hour: restarts closer together are a
+# crash loop, whose alerts must not be held.
+RESTART_REPEAT_S = 3600.0
+
+
+def restart_boot(
+    worker_items: Optional[list[dict[str, Any]]], now: float
+) -> Optional[float]:
+    """When the server was restarted (a deploy), whether or not a
+    ``deployment`` event was recorded: every live worker started within the
+    deploy window and within RESTART_SPREAD_S of the others. A worker that a
+    Gunicorn master respawned after a crash does not count (the others
+    started earlier), nor do workers respawned one by one. Returns the
+    earliest start, or None."""
+    starts = [
+        _epoch_of(w.get("started_at")) for w in worker_items or () if w.get("alive")
+    ]
+    starts = [s for s in starts if s is not None]
+    if not starts or min(starts) < now - DEPLOY_SUPPRESS_S:
+        return None
+    if max(starts) - min(starts) > RESTART_SPREAD_S:
+        return None
+    return min(starts)
+
+
+def restart_window(
+    worker_items: Optional[list[dict[str, Any]]],
+    now: float,
+    prior: Optional[float],
+) -> tuple[bool, Optional[float]]:
+    """``(deploy_recent, boot to remember)`` from a restart.
+
+    ``prior`` is the boot that opened the last restart window. The same boot
+    keeps its window (at most DEPLOY_SUPPRESS_S after it started); a new boot
+    opens one only when RESTART_REPEAT_S have passed since ``prior``, so a
+    server that keeps restarting gets one window, not suppression forever.
+    """
+    boot = restart_boot(worker_items, now)
+    if boot is None:
+        return False, prior
+    if prior is not None and abs(boot - prior) <= RESTART_SPREAD_S:
+        return True, prior
+    if prior is not None and boot - prior < RESTART_REPEAT_S:
+        return False, prior
+    return True, boot
+
+
+def _restarted_recently(
+    worker_items: Optional[list[dict[str, Any]]], now: float
+) -> bool:
+    """A restart deploy window without memory (a per-request read)."""
+    return restart_window(worker_items, now, None)[0]
+
 
 _TILE_RULES = {
     "stuck": (
@@ -3184,7 +3418,8 @@ _TILE_RULES = {
         "reservation_without_owner",
     ),
     "backlog": ("oldest_pending",),
-    "email_queue": ("email_queue_bad", "email_queue_stalled"),
+    "failed_24h": ("failure_spike",),
+    "email_queue": ("email_queue_bad", "email_queue_stalled", "email_ingest_silence"),
     "llm": ("llm_error_rate_15m", "llm_p95_15m"),
     "active": ("provider_paused",),
     "deps": (
@@ -3202,6 +3437,7 @@ _TILE_RULES = {
         "manager_rtt",
         "pg_pool_wait",
         "log_sink_or_recorder_drops_5m",
+        "unauth_warning_lines_5m",
     ),
 }
 

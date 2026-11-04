@@ -11,6 +11,7 @@ import ActivityTab from './ActivityTab'
 import { OpsOverview, OpsStatus, opsApi } from './api'
 import DrawerStack from './components/DrawerStack'
 import ErrorPanel from './components/ErrorPanel'
+import OpsBanners from './components/OpsBanners'
 import ProcessChip from './components/ProcessChip'
 import { HostedActionDialogs } from './components/WorkspaceActions'
 import RefreshHairline from './components/RefreshHairline'
@@ -18,11 +19,11 @@ import Skeleton from './components/Skeleton'
 import { OverallStateChip } from './components/StatusChip'
 import { DrawerMove, OpsNav, OpsNavContext, OpsOverviewContext, OpsShellContext, useOpsNav } from './context'
 import CorrelateBar from './components/CorrelateBar'
+import AlertDrawer from './drawers/AlertDrawer'
 import DependencyDrawer from './drawers/DependencyDrawer'
 import DocumentDrawer from './drawers/DocumentDrawer'
 import LogEntryDrawer from './drawers/LogEntryDrawer'
 import RunDrawer from './drawers/RunDrawer'
-import UnsupportedDrawer from './drawers/UnsupportedDrawer'
 import WorkerDrawer from './drawers/WorkerDrawer'
 import WorkspaceDrawer from './drawers/WorkspaceDrawer'
 import { ageSeconds, fmtAge, fmtClock } from './format'
@@ -146,7 +147,7 @@ function Header({ poll, overview, reloadAll }: { poll: OpsPoll<OpsStatus>; overv
   )
 }
 
-function TabRow({ tab, onSelect }: { tab: OpsTab; onSelect: (tab: OpsTab) => void }) {
+function TabRow({ tab, onSelect, badges }: { tab: OpsTab; onSelect: (tab: OpsTab) => void; badges?: Partial<Record<OpsTab, number>> }) {
   const { t } = useTranslation()
   const refs = useRef<Partial<Record<OpsTab, HTMLButtonElement | null>>>({})
   // Arrow keys, Home and End move between tabs (automatic activation).
@@ -183,6 +184,12 @@ function TabRow({ tab, onSelect }: { tab: OpsTab; onSelect: (tab: OpsTab) => voi
           )}
         >
           {t(`operations.tab.${id}`)}
+          {badges?.[id] ? (
+            <span className="bg-muted ms-1.5 rounded-full px-1.5 py-px font-mono text-[11px]">
+              <span aria-hidden="true">{badges[id]}</span>
+              <span className="sr-only">{t('operations.tabBadge', { count: badges[id] })}</span>
+            </span>
+          ) : null}
         </button>
       ))}
     </div>
@@ -337,7 +344,7 @@ function renderDrawer(drawer: Drawer) {
   if (drawer.kind === 'dependency') return <DependencyDrawer dep={drawer.id} />
   if (drawer.kind === 'worker') return <WorkerDrawer workerId={drawer.id} />
   if (drawer.kind === 'log') return <LogEntryDrawer id={drawer.id} />
-  return <UnsupportedDrawer kind={drawer.kind} />
+  return <AlertDrawer alertId={drawer.id} />
 }
 
 function StatusShell({
@@ -371,6 +378,14 @@ function StatusShell({
     slot.offer(ringCandidates(prev, next), Date.now())
   }, [overview.data, overview.baseline, reduced, hidden, paused, slot])
 
+  // "Activity (3)": what needs attention now, from the evaluator's snapshot (§2.2).
+  const attention = overview.data?.attention
+  const badges = useMemo(() => {
+    const c = attentionCounts(attention)
+    const open = c.critical + c.serious + c.warning
+    return open ? { activity: open } : undefined
+  }, [attention])
+
   const reloadStatus = poll.reload
   const reloadOverview = overview.reload
   const reloadAll = useCallback(() => {
@@ -403,7 +418,8 @@ function StatusShell({
                         <ErrorPanel error={poll.error} onRetry={poll.reload} compact />
                       </Card>
                     ) : null}
-                    <TabRow tab={view.tab} onSelect={selectTab} />
+                    <TabRow tab={view.tab} onSelect={selectTab} badges={badges} />
+                    <OpsBanners />
                     <div
                       key={view.tab}
                       id={`ops-panel-${view.tab}`}

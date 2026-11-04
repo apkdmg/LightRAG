@@ -62,6 +62,7 @@ def _route_path(route) -> str:
         .replace("{worker_id}", "w")
         .replace("{id}", "1")
         .replace("{log_id}", "1")
+        .replace("{alert_id}", "1")
         .replace("{rule}", "x")
     )
 
@@ -122,6 +123,8 @@ def test_status_payload_shape(monkeypatch):
         "probes": False,
         "heartbeats": False,
         "alerts": False,
+        "alert_email": False,
+        "log_capture": False,
         "insights": True,
         "actions": False,
         "release_busy": False,

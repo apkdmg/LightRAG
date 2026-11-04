@@ -37,6 +37,7 @@ from lightrag.api.dependencies import UserInfo, require_admin
 from lightrag.api.ops import log_sink as ops_log_sink
 from lightrag.api.ops import logs as ops_logs
 from lightrag.api.ops import actions as ops_actions
+from lightrag.api.ops import alerts as ops_alerts
 from lightrag.api.ops.audit import (
     SearchAudit,
     audit_csv,
@@ -398,7 +399,12 @@ async def status(
             "log_sink": _log_sink(request) is not None,
             "probes": service.probes is not None,
             "heartbeats": service.heartbeat is not None,
-            "alerts": False,
+            # Alert rows (OPS_ALERTS_ENABLED) and their email
+            # (OPS_ALERT_EMAIL, record-only while off).
+            "alerts": service.available and ops_alerts.alerts_enabled(),
+            "alert_email": ops_alerts.email_enabled(),
+            # INFO capture needs the log sink in this process.
+            "log_capture": _log_sink(request) is not None,
             "insights": getattr(request.app.state, "insights", None) is not None,
             # Admin actions and the audited reveal (OPS_ACTIONS_ENABLED);
             # releasing a stale busy slot only exists under Gunicorn, and
@@ -755,13 +761,27 @@ async def _sink_meta(request: Request, service: OpsService) -> dict[str, Any]:
             )
         except Exception:
             audit = None
+    capture = None
+    if service.available:
+        try:
+            capture = ops_log_sink.capture_view(
+                await service.cache.get(
+                    ("log_capture",),
+                    5.0,
+                    lambda: service.store.kv_get(ops_log_sink.CAPTURE_KEY, None),
+                ),
+                time.time(),
+            )
+        except Exception:
+            capture = None
     return {
         "enabled": sink is not None,
         "sink": {
             "enabled": sink is not None,
-            "level": logging.getLevelName(sink.handler.level) if sink else None,
+            "level": logging.getLevelName(sink.level) if sink else None,
             "retention_days": ops_log_sink.retention_days(),
             "redaction_audit": audit if isinstance(audit, dict) else None,
+            "capture": capture,
         },
     }
 
@@ -880,6 +900,128 @@ async def log_groups(
     return await _answer(
         service, call, {"hours": hours, "groups": [], "capped": False}, needs_docs=False
     )
+
+
+# -- INFO capture (Logs tab) ------------------------------------------------------------------
+
+
+def _lightrag_logger_level() -> str:
+    return logging.getLevelName(logging.getLogger("lightrag").getEffectiveLevel())
+
+
+@router.get("/logs/capture")
+async def log_capture(request: Request) -> dict[str, Any]:
+    """The running INFO capture (any worker started it), the modules that
+    can be captured and the limits."""
+    service = _service(request)
+    sink = _log_sink(request)
+
+    async def call() -> dict[str, Any]:
+        value = await service._q(
+            lambda: service.store.kv_get(ops_log_sink.CAPTURE_KEY, None)
+        )
+        view = ops_log_sink.capture_view(value, time.time())
+        return {
+            "capture": view,
+            "active": view,
+            "modules": list(ops_log_sink.CAPTURE_MODULES),
+            "max_minutes": ops_log_sink.CAPTURE_MAX_MINUTES,
+            "sink_enabled": sink is not None,
+            "logger_level": _lightrag_logger_level(),
+        }
+
+    return await _answer(
+        service,
+        call,
+        {
+            "capture": None,
+            "active": None,
+            "modules": list(ops_log_sink.CAPTURE_MODULES),
+            "max_minutes": ops_log_sink.CAPTURE_MAX_MINUTES,
+            "sink_enabled": sink is not None,
+            "logger_level": _lightrag_logger_level(),
+        },
+        needs_docs=False,
+    )
+
+
+class CaptureRequest(BaseModel):
+    module: Optional[str] = Field(None, max_length=64)
+    minutes: int = Field(..., ge=0, le=ops_log_sink.CAPTURE_MAX_MINUTES)
+    reason: str = Field(..., min_length=3, max_length=512)
+
+
+@router.post(
+    "/logs/capture",
+    dependencies=[*_POST_GUARDS, Depends(require_operator)],
+)
+async def start_log_capture(
+    request: Request,
+    body: CaptureRequest = Body(...),
+    user: UserInfo = Depends(require_live_admin),
+) -> Any:
+    """Store INFO lines of one allowlisted module for ``minutes`` (at most
+    60; 0 stops a running capture) on every worker (operator, audited). It
+    ends by itself; captured lines are redacted and capped like any other."""
+    service = _service(request)
+    sink = _log_sink(request)
+    actions = _alert_actions(request)
+
+    async def call() -> dict[str, Any]:
+        if sink is None:
+            raise ops_alerts.AlertActionRefused(409, "log_sink_off")
+        if body.minutes and body.module not in ops_log_sink.CAPTURE_MODULES:
+            raise ops_alerts.AlertActionRefused(400, "invalid_module")
+        reason = ops_alerts.clean_reason(body.reason)
+        now = time.time()
+        identity = user.username
+
+        async def change() -> dict[str, Any]:
+            if body.minutes:
+                value = {
+                    "module": body.module,
+                    "until": now + body.minutes * 60,
+                    "minutes": body.minutes,
+                    "started_at": now,
+                    "actor": identity,
+                    "reason": reason,
+                    "id": new_request_id(),
+                }
+            else:
+                current = ops_log_sink.capture_view(
+                    await service.store.kv_get(ops_log_sink.CAPTURE_KEY, None), now
+                )
+                if current is None:
+                    return {"result": "not_active", "capture": None, "expires_at": None}
+                value = {
+                    "module": None,
+                    "until": 0,
+                    "stopped_at": now,
+                    "actor": identity,
+                }
+            await service._q(
+                lambda: service.store.kv_put(ops_log_sink.CAPTURE_KEY, value)
+            )
+            service.cache.forget(("log_capture",))
+            view = sink.apply_capture(value)
+            return {
+                "result": "started" if body.minutes else "stopped",
+                "capture": view,
+                "expires_at": view["until"] if view else None,
+                "logger_level": _lightrag_logger_level(),
+            }
+
+        return await actions.audited(
+            user=user,
+            request=request,
+            action="log_capture_start" if body.minutes else "log_capture_stop",
+            reason=reason,
+            params={"module": body.module, "minutes": body.minutes},
+            target=body.module or "log_capture",
+            body=change,
+        )
+
+    return await _alert_act(call)
 
 
 @router.get("/logs/{log_id}")
@@ -1199,6 +1341,15 @@ async def smtp_test(request: Request) -> dict[str, Any]:
     service.cache.forget(("probe_records",))
     if record is None:
         return _err(503, "probe_failed")
+    if record["status"] in ("ok", "warn") and service.available:
+        # A passing check ends the "alert email is not being delivered" state
+        # left by failed sends; pending alerts are retried at the next cycle.
+        try:
+            await ops_alerts.clear_send_failures(service.store, service)
+        except Exception as e:
+            logger.warning(
+                "Ops alert email state could not be cleared (%s)", type(e).__name__
+            )
     return {
         "generated_at": _generated_at(),
         "ok": record["status"] in ("ok", "warn"),
@@ -1723,6 +1874,423 @@ async def audit_export(
         headers={
             "Content-Disposition": f'attachment; filename="ops-audit-{stamp}.csv"',
             "X-Ops-Export-Rows": str(len(items)),
+            "X-Ops-Audit-Id": str(audit_id),
+        },
+    )
+
+
+# -- Alerts, maintenance and the incident export (Activity tab) ---------------------------
+
+ALERTS_PAGE_DEFAULT = 50
+ALERT_HISTORY = 20
+ALERTS_PAGE_MAX = 200
+_ALERT_STATES = ("open", "resolved", "all")
+
+
+def _alert_actions(request: Request) -> ops_alerts.AlertActions:
+    service = _service(request)
+    actions = getattr(service, "alert_actions", None)
+    if not isinstance(actions, ops_alerts.AlertActions):
+        actions = service.alert_actions = ops_alerts.AlertActions(service)
+    return actions
+
+
+async def _alert_act(call: Callable[[], Any]) -> Any:
+    """Run one alert action and map its refusals to the ops error shape."""
+    try:
+        body = await call()
+    except ops_alerts.AlertActionRefused as e:
+        if e.status == 429:
+            return _rate_limited(e.retry_after or 60)
+        return _err(e.status, e.code)
+    except OpsDataUnavailable:
+        return _err(503, "data_unavailable")
+    return {"generated_at": _generated_at(), **body}
+
+
+async def _alert_meta(service: OpsService, now: float) -> dict[str, Any]:
+    """Maintenance, mutes and the email channel, for every alerts payload."""
+    mutes = await ops_alerts.mutes_state(service, now)
+    channel = await ops_alerts.channel_state(service)
+    return {
+        "enabled": ops_alerts.alerts_enabled(),
+        "email_enabled": ops_alerts.email_enabled(),
+        "maintenance": await ops_alerts.maintenance_state(service, now),
+        "mutes": sorted(mutes.values(), key=lambda m: m["rule"]),
+        "channel": channel,
+        "email": channel,
+    }
+
+
+def _view(row: dict[str, Any], meta: dict[str, Any], now: float) -> dict[str, Any]:
+    mutes = {m["rule"]: m for m in meta.get("mutes") or []}
+    channel = meta.get("channel") or {}
+    return ops_alerts.alert_view(
+        row,
+        mutes,
+        now,
+        email_on=bool(meta.get("email_enabled")),
+        maintenance=meta.get("maintenance") is not None,
+        failing=bool(channel.get("failures")),
+    )
+
+
+def _alert_counts(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    by_severity = {s: 0 for s in ("critical", "serious", "warning")}
+    for row in rows:
+        if row.get("severity") in by_severity:
+            by_severity[row["severity"]] += 1
+    return {
+        "open": len(rows),
+        "acked": sum(1 for r in rows if r.get("acked_at") is not None),
+        "by_severity": by_severity,
+    }
+
+
+def _empty_alert_meta() -> dict[str, Any]:
+    return {
+        "enabled": ops_alerts.alerts_enabled(),
+        "email_enabled": ops_alerts.email_enabled(),
+        "maintenance": None,
+        "mutes": [],
+        "channel": None,
+        "email": None,
+    }
+
+
+@router.get("/alerts")
+async def alerts(
+    request: Request,
+    state: str = Query("open", max_length=8),
+    before: Optional[int] = Query(None, ge=1),
+    limit: int = Query(ALERTS_PAGE_DEFAULT, ge=1, le=ALERTS_PAGE_MAX),
+) -> dict[str, Any]:
+    """Alert rows, newest first on the ``id`` keyset (``next_before`` pages
+    back): ``open`` (default), ``resolved`` (history, 180 days) or ``all``;
+    with maintenance, mutes, the email channel and open counts."""
+    service = _service(request)
+
+    async def call() -> dict[str, Any]:
+        if state not in _ALERT_STATES:
+            raise OpsBadRequest("invalid_state")
+        now = time.time()
+        store = service.store
+        rows = await service._q(
+            lambda: store.alerts_page(
+                None if state == "all" else state, before, limit + 1
+            )
+        )
+        meta = await _alert_meta(service, now)
+        items = [_view(r, meta, now) for r in rows[:limit]]
+        open_rows = await service._q(lambda: store.alerts_open(ops_alerts.OPEN_LIMIT))
+        return {
+            "items": items,
+            "next_before": items[-1]["id"] if len(rows) > limit else None,
+            "state": state,
+            "limit": limit,
+            "counts": _alert_counts(open_rows),
+            **meta,
+        }
+
+    return await _answer(
+        service,
+        call,
+        {
+            "items": [],
+            "next_before": None,
+            "state": state,
+            "limit": limit,
+            "counts": _alert_counts([]),
+            **_empty_alert_meta(),
+        },
+        needs_docs=False,
+    )
+
+
+@router.get("/alerts/rules")
+async def alert_rules(
+    request: Request, user: UserInfo = Depends(require_admin)
+) -> dict[str, Any]:
+    """Every rule with its condition, severities, whether it is emailed, its
+    runbook (and link), current thresholds with their bounds, and its mute."""
+    service = _service(request)
+
+    async def call() -> dict[str, Any]:
+        now = time.time()
+        thresholds = await service.thresholds()
+        stored = await service._q(lambda: service.store.kv_get("thresholds"))
+        mutes = await ops_alerts.mutes_state(service, now)
+        return {
+            "rules": ops_alerts.rules_view(thresholds, stored, mutes),
+            "operator": is_operator(user),
+            **(await _alert_meta(service, now)),
+        }
+
+    return await _answer(
+        service,
+        call,
+        {
+            "rules": ops_alerts.rules_view(dict(DEFAULT_THRESHOLDS), {}, {}),
+            "operator": is_operator(user),
+            **_empty_alert_meta(),
+        },
+        needs_docs=False,
+    )
+
+
+class ThresholdsRequest(BaseModel):
+    # Flat ``{key: value}`` and/or per rule ``{rule: {key: value}}``.
+    thresholds: Optional[dict[str, Any]] = Field(None, max_length=64)
+    rules: Optional[dict[str, Any]] = Field(None, max_length=64)
+    reason: str = Field(..., min_length=3, max_length=512)
+
+
+@router.put("/alerts/rules", dependencies=[*_POST_GUARDS, Depends(require_operator)])
+async def update_alert_rules(
+    request: Request,
+    body: ThresholdsRequest = Body(...),
+    user: UserInfo = Depends(require_live_admin),
+) -> Any:
+    """Edit thresholds (operator, audited): a number overrides the default,
+    null restores it; unknown keys and values outside their bounds are
+    refused. Every worker uses the new values within a minute."""
+    actions = _alert_actions(request)
+    service = _service(request)
+
+    async def call() -> dict[str, Any]:
+        try:
+            changes = ops_alerts.flatten_changes(body.thresholds, body.rules)
+        except ops_alerts.ThresholdError as e:
+            raise ops_alerts.AlertActionRefused(400, e.code) from e
+        out = await actions.update_thresholds(
+            user=user, request=request, changes=changes, reason=body.reason
+        )
+        thresholds = await service.thresholds()
+        stored = await service._q(lambda: service.store.kv_get("thresholds"))
+        mutes = await ops_alerts.mutes_state(service, time.time())
+        return {**out, "rules": ops_alerts.rules_view(thresholds, stored, mutes)}
+
+    return await _alert_act(call)
+
+
+@router.get("/alerts/{alert_id}")
+async def alert_detail(
+    request: Request, alert_id: int = Path(..., ge=1)
+) -> dict[str, Any]:
+    """One alert (the Alert drawer, and the target of email links)."""
+    service = _service(request)
+
+    async def call() -> dict[str, Any]:
+        now = time.time()
+        store = service.store
+        row = await service._q(lambda: store.alert_get(alert_id))
+        if row is None:
+            raise OpsNotFound()
+        meta = await _alert_meta(service, now)
+        history = await service._q(
+            lambda: store.alerts_history(row["fingerprint"], ALERT_HISTORY + 1)
+        )
+        thresholds = await service.thresholds()
+        stored = await service._q(lambda: store.kv_get("thresholds"))
+        mutes = {m["rule"]: m for m in meta["mutes"]}
+        rule = next(
+            (
+                r
+                for r in ops_alerts.rules_view(thresholds, stored, mutes)
+                if r["rule"] == row["rule"]
+            ),
+            None,
+        )
+        return {
+            "alert": _view(row, meta, now),
+            "rule": rule,
+            # Earlier occurrences of the same fingerprint, newest first.
+            "history": [
+                _view(r, meta, now) for r in history if int(r["id"]) != alert_id
+            ][:ALERT_HISTORY],
+            **meta,
+        }
+
+    return await _answer(
+        service,
+        call,
+        {"alert": None, "rule": None, "history": [], **_empty_alert_meta()},
+        needs_docs=False,
+    )
+
+
+class AckRequest(BaseModel):
+    reason: str = Field(..., min_length=3, max_length=512)
+
+
+@router.post("/alerts/{alert_id}/ack", dependencies=_POST_GUARDS)
+async def ack_alert(
+    request: Request,
+    alert_id: int = Path(..., ge=1),
+    body: AckRequest = Body(...),
+    user: UserInfo = Depends(require_live_admin),
+) -> Any:
+    """Acknowledge an open alert: records who and the note; the alert stays
+    firing (no reminders are emailed for it) until its rule clears."""
+    actions = _alert_actions(request)
+    return await _alert_act(
+        lambda: actions.ack(
+            user=user, request=request, alert_id=alert_id, reason=body.reason
+        )
+    )
+
+
+class MuteRequest(BaseModel):
+    minutes: int = Field(..., ge=0, le=ops_alerts.MUTE_MAX_MINUTES)
+    reason: str = Field(..., min_length=3, max_length=512)
+
+
+@router.post("/alerts/rules/{rule}/mute", dependencies=_POST_GUARDS)
+async def mute_rule(
+    request: Request,
+    rule: str = Path(..., max_length=64),
+    body: MuteRequest = Body(...),
+    user: UserInfo = Depends(require_live_admin),
+) -> Any:
+    """Mute a rule's email for ``minutes`` (at most 7 days; 0 unmutes).
+    Muted alerts are still recorded and shown."""
+    actions = _alert_actions(request)
+    return await _alert_act(
+        lambda: actions.mute(
+            user=user,
+            request=request,
+            rule=rule,
+            minutes=body.minutes,
+            reason=body.reason,
+        )
+    )
+
+
+class MaintenanceRequest(BaseModel):
+    # 0 ends maintenance mode (as POST /maintenance/end does).
+    minutes: int = Field(..., ge=0, le=ops_alerts.MAINTENANCE_MAX_MINUTES)
+    reason: str = Field(..., min_length=3, max_length=512)
+
+
+@router.post("/maintenance", dependencies=_POST_GUARDS)
+async def start_maintenance(
+    request: Request,
+    body: MaintenanceRequest = Body(...),
+    user: UserInfo = Depends(require_live_admin),
+) -> Any:
+    """Maintenance mode for ``minutes`` (0 ends it): no alert email (alerts
+    are still recorded) and the Overview shows Maintenance. Starting it
+    again replaces the window."""
+    actions = _alert_actions(request)
+    return await _alert_act(
+        lambda: actions.maintenance(
+            user=user, request=request, minutes=body.minutes, reason=body.reason
+        )
+    )
+
+
+@router.post("/maintenance/end", dependencies=_POST_GUARDS)
+async def end_maintenance(
+    request: Request,
+    body: AckRequest = Body(...),
+    user: UserInfo = Depends(require_live_admin),
+) -> Any:
+    """End maintenance mode now (``not_active`` when none runs)."""
+    actions = _alert_actions(request)
+    return await _alert_act(
+        lambda: actions.maintenance(
+            user=user, request=request, minutes=0, reason=body.reason
+        )
+    )
+
+
+class ActivityExportRequest(BaseModel):
+    from_: Optional[str] = Field(None, alias="from", max_length=40)
+    to: Optional[str] = Field(None, max_length=40)
+    reason: str = Field(..., min_length=3, max_length=512)
+
+    model_config = {"populate_by_name": True}
+
+
+@router.post(
+    "/activity/export",
+    dependencies=[*_POST_GUARDS, Depends(require_operator)],
+)
+async def activity_export(
+    request: Request,
+    body: ActivityExportRequest = Body(...),
+    user: UserInfo = Depends(require_live_admin),
+) -> Response:
+    """Incident timeline as NDJSON (operator, audited): a meta line, then
+    alerts, audit rows, runs and markers in the window (default the last
+    24 h, at most 31 days), oldest first, at most 10 000 lines. No log text;
+    already redacted. Refused when its intent row cannot be written."""
+    service = _service(request)
+    if not service.available:
+        return _err(503, "data_unavailable")
+    retry_after = await _export_retry_after(service, user.username)
+    if retry_after is not None:
+        return _rate_limited(retry_after)
+    now = datetime.now(timezone.utc)
+    try:
+        start = _parse_time(body.from_, None) if body.from_ else None
+        end = _parse_time(body.to, now) if body.to else None
+        start, end = ops_alerts.export_window(start, end, now)
+        reason = ops_alerts.clean_reason(body.reason)
+    except OpsBadRequest as e:
+        return _err(400, e.code)
+    except ops_alerts.AlertActionRefused as e:
+        return _err(e.status, e.code)
+    params = {"window_s": int((end - start).total_seconds()), "format": "ndjson"}
+    try:
+        audit_id = await write_audit(
+            service.store,
+            user=user,
+            action="activity_export",
+            phase="intent",
+            request=request,
+            params=params,
+            reason=reason,
+        )
+    except Exception as e:
+        logger.warning(
+            "Ops activity export refused: audit failed (%s)", type(e).__name__
+        )
+        return _err(503, "audit_unavailable")
+    try:
+        lines, meta = await ops_alerts.timeline_lines(service, start, end)
+        outcome = "ok"
+    except OpsDataUnavailable:
+        lines, meta, outcome = None, None, "failed"
+    try:
+        await write_audit(
+            service.store,
+            user=user,
+            action="activity_export",
+            phase="result",
+            request=request,
+            params={
+                **params,
+                "intent_id": audit_id,
+                "rows": len(lines or []),
+                "truncated": (meta or {}).get("truncated") or [],
+            },
+            reason=reason,
+            outcome=outcome,
+        )
+    except Exception as e:
+        logger.warning("Ops activity export result audit failed (%s)", type(e).__name__)
+    if lines is None or meta is None:
+        return _err(503, "data_unavailable")
+    meta["audit_id"] = audit_id
+    content = await asyncio.to_thread(ops_alerts.ndjson, lines, meta)
+    stamp = now.strftime("%Y%m%d-%H%M%S")
+    return Response(
+        content=content,
+        media_type="application/x-ndjson",
+        headers={
+            "Content-Disposition": f'attachment; filename="ops-incident-{stamp}.ndjson"',
+            "X-Ops-Export-Rows": str(len(lines)),
             "X-Ops-Audit-Id": str(audit_id),
         },
     )

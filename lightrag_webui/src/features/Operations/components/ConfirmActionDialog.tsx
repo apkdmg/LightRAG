@@ -12,7 +12,7 @@ import {
 import Input from '@/components/ui/Input'
 import Textarea from '@/components/ui/Textarea'
 import { cn } from '@/lib/utils'
-import { ActionKind, ActionOutcome, ConfirmFields, EMPTY_FIELDS, REASON_MAX, confirmGate, outcomeMessage, outcomeOfError } from '../actions'
+import { ActionOutcome, ConfirmFields, EMPTY_FIELDS, OutcomeAction, REASON_MAX, confirmGate, outcomeMessage, outcomeOfError } from '../actions'
 import { showOutcomeToast } from '../actionToast'
 import { RequestRef } from './ErrorPanel'
 
@@ -144,7 +144,7 @@ export function ConfirmActionPanel({
 export type ConfirmActionDialogProps = Omit<ConfirmPanelProps, 'fields' | 'onFields' | 'pending' | 'refusal' | 'onCancel' | 'onSubmit'> & {
   open: boolean
   onOpenChange: (open: boolean) => void
-  action: ActionKind | 'reveal'
+  action: OutcomeAction
   /**
    * Sends the action. A final outcome closes the dialog (or keeps it open
    * with the cause, for a refusal) and shows the toast; null means "stay

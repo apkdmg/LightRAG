@@ -74,6 +74,7 @@ def _concrete(path: str) -> str:
         .replace("{worker_id}", WORKER_ID)
         .replace("{run_id}", RUN_ID)
         .replace("{log_id}", "1")
+        .replace("{alert_id}", "1")
     )
 
 

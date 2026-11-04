@@ -1,4 +1,4 @@
-"""Leased host-wide reconciliation and evaluation of the attention rules.
+"""Leased host-wide reconciliation of runs, busy flags and reservations.
 
 One worker per host (the holder of ``ops:reconcile``) runs this cycle once a
 minute:
@@ -29,10 +29,10 @@ minute:
    pauses that shared state no longer holds are closed.
 3. **Retention**, hourly: runs after 30 days, failure rows after 90 days,
    ``child_exit`` markers after two days.
-4. **Attention**: every attention rule is evaluated and the result stored in
-   KV ``attention``; the Overview of every worker reads that snapshot. When
-   the snapshot is missing or older than three cycles, the Overview falls
-   back to evaluating the rules itself.
+
+The attention rules read these KV results; they are evaluated (and the
+attention snapshot written) by the alerts evaluator alone, under its own
+lease ``ops:alerts`` (:mod:`lightrag.api.ops.alerts`).
 
 Reconciliation **never** clears ``busy`` or a reservation: it only reports
 them, with restart guidance.
@@ -48,7 +48,6 @@ from lightrag.api.ops import runs as run_hooks
 from lightrag.api.ops.heartbeat import process_alive
 from lightrag.api.ops.leases import LeasedLoop
 from lightrag.api.ops.service import (
-    ATTENTION_KEY,
     BUSY_WITHOUT_RUN_KEY,
     RESERVATIONS_KEY,
 )
@@ -699,18 +698,3 @@ async def reconcile_cycle(
     ):
         service.cache.forget(key)
     return out
-
-
-async def attention_cycle(
-    loop: LeasedLoop, *, service: Any, process: Callable[[], dict[str, Any]]
-) -> None:
-    """Reconcile, evaluate the rules and publish the snapshot while the lease is ours."""
-    try:
-        await reconcile_cycle(loop, service=service, process=process)
-    except Exception as e:
-        logger.warning("Ops reconcile failed (%s)", type(e).__name__)
-    snapshot = await service.compute_attention_snapshot(process(), loop.holder)
-    if not await loop.still_held():
-        return
-    await service.store.kv_put(ATTENTION_KEY, snapshot)
-    service.cache.forget(("attention",))

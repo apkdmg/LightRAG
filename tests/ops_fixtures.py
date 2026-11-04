@@ -154,6 +154,26 @@ def seeded_store() -> MemoryOpsStore:
             "detail": {"version": "0295", "secret": "x"},
         }
     )
+    store.alert_rows.append(
+        {
+            "id": 1,
+            "rule": "stale_docs",
+            "fingerprint": "stale_docs",
+            "severity": "serious",
+            "state": "firing",
+            "title": "1 document(s) in progress for over 60 min",
+            "scope": {"count": 1, "threshold_min": 60},
+            "link": "#/?ops=1&otab=processing&osub=stuck",
+            "runbook": None,
+            "first_seen": datetime.now(timezone.utc) - timedelta(minutes=40),
+            "last_seen": datetime.now(timezone.utc) - timedelta(minutes=1),
+            "resolved_at": None,
+            "acked_by": None,
+            "acked_at": None,
+            "ack_note": None,
+            "last_emailed_at": None,
+        }
+    )
     store.audit_rows.append(
         {
             "id": 1,

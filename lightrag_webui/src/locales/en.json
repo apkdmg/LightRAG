@@ -1462,7 +1462,17 @@
       "invalid_workspace": "The workspace name is not valid.",
       "workspace_not_served": "This server does not serve that workspace.",
       "queue_unavailable": "The email queue could not be read on this server.",
-      "invalid_range": "The date range is not valid: the end must be after the start, and the range not too long."
+      "invalid_range": "The date range is not valid: the end must be after the start, and the range not too long.",
+      "invalid_minutes": "The duration is outside what the server allows.",
+      "invalid_thresholds": "The server rejected the thresholds.",
+      "invalid_module": "This module may not be captured. Pick one from the list.",
+      "unknown_rule": "The server does not know this rule.",
+      "unknown_threshold": "The server does not know one of these thresholds.",
+      "invalid_threshold": "A threshold value is not a valid number.",
+      "conflicting_thresholds": "The same threshold was given two different values.",
+      "threshold_order": "A serious level may not come before its warning level.",
+      "threshold_out_of_bounds": "A threshold is outside the range the server allows.",
+      "log_sink_off": "This server does not store log lines (OPS_LOG_SINK is off), so nothing would be captured."
     },
     "system": {
       "title": "This server",
@@ -1495,13 +1505,6 @@
       "later": "Not available yet",
       "multiWorkerOnly": "Multi-worker only",
       "metrics": "Performance metrics"
-    },
-    "later": {
-      "note": "This section arrives in a later release.",
-      "activity": {
-        "title": "Alerts and system events",
-        "body": "Alerts, system events and the incident export will appear here."
-      }
     },
     "unavailableShort": "Not available: this view needs PostgreSQL KV storage (LIGHTRAG_KV_STORAGE=PGKVStorage).",
     "maskNote": "File names are masked on the server. Revealing one is an audited action that arrives in a later release.",
@@ -1591,7 +1594,14 @@
       "none": "No issues. Checked doc status for {{workspaces}} workspaces, {{active}} active runs and the email queue at {{time}}.",
       "noneSimple": "No issues found in the checks that ran at {{time}}.",
       "next": "Next: {{step}}",
-      "resolved": "resolved"
+      "resolved": "resolved",
+      "openAlert": "Open the alert for {{title}}",
+      "allAlerts": "Alerts",
+      "resolved24h_one": "{{countText}} alert resolved in the last 24 h.",
+      "resolved24h_other": "{{countText}} alerts resolved in the last 24 h.",
+      "showResolved": "Show",
+      "ackedBy": "acked by {{by}}",
+      "muted": "muted"
     },
     "rule": {
       "workers_below_expected": {
@@ -2147,7 +2157,6 @@
       "breadcrumb": "Drill-down path",
       "workspaceTitle": "Workspace {{id}}",
       "documentTitle": "Document {{id}}",
-      "later": "The {{kind}} view arrives in a later release.",
       "kind": {
         "workspace": "workspace",
         "document": "document",
@@ -2160,7 +2169,8 @@
       "dependencyTitle": "Dependency {{name}}",
       "workerTitle": "Worker {{id}}",
       "runTitle": "Run {{id}}",
-      "logTitle": "Log entry #{{id}}"
+      "logTitle": "Log entry #{{id}}",
+      "alertTitle": "Alert #{{id}}"
     },
     "workspace": {
       "owner": "Owner {{owner}}",
@@ -3169,7 +3179,21 @@
         "nothing_to_reveal": "This field is empty: there is nothing to reveal.",
         "unknown": "Done (the server answered \"{{code}}\").",
         "nothing_to_process": "Nothing to process: no pending or failed documents.",
-        "notBusyRelease": "The pipeline is not busy: there is nothing to release."
+        "notBusyRelease": "The pipeline is not busy: there is nothing to release.",
+        "acked": "Acked. The alert stays open until its rule clears.",
+        "muted": "Muted. Alerts of this rule are still recorded; no email is sent until the mute ends.",
+        "unmuted": "Mute ended. Email for this rule resumes.",
+        "maintenance_started": "Maintenance mode is on. Alerts are recorded; alert email is held.",
+        "maintenance_ended": "Maintenance mode ended. Alert email resumes for what is still open.",
+        "capture_started": "INFO capture started on every worker.",
+        "capture_stopped": "INFO capture stopped.",
+        "rules_saved": "Thresholds saved. The next evaluation uses them.",
+        "already_acked": "Someone already acked this alert.",
+        "not_muted": "This rule was not muted.",
+        "not_in_maintenance": "Maintenance mode was not on.",
+        "no_capture": "No INFO capture was running.",
+        "no_change": "Nothing changed.",
+        "alert_resolved": "This alert has already resolved; nothing to ack."
       },
       "cancel": {
         "title": "Cancel processing in {{workspace}}",
@@ -3286,6 +3310,300 @@
         "submit": "Export CSV"
       },
       "newer": "Newer"
+    },
+    "tabBadge_one": "{{count}} item needs attention",
+    "tabBadge_other": "{{count}} items need attention",
+    "activity": {
+      "sub": {
+        "label": "Activity section",
+        "alerts": "Alerts",
+        "audit": "Audit",
+        "events": "System events",
+        "export": "Incident export"
+      }
+    },
+    "alerts": {
+      "title": "Alerts",
+      "off": "Alerts are turned off on this server (OPS_ALERTS_ENABLED=false): no alert history is recorded and no alert email is sent.",
+      "sub": {
+        "label": "Alert views",
+        "open": "Open",
+        "history": "History",
+        "mutes": "Mutes",
+        "rules": "Rules",
+        "maintenance": "Maintenance",
+        "on": "on"
+      },
+      "emailMode": {
+        "recordOnly": "Record only: alert email is off (OPS_ALERT_EMAIL=false). Alerts are recorded here and nobody is emailed.",
+        "noRecipients": "Alert email is on, but no recipients are set (OPS_ALERT_EMAIL_TO or ALERT_EMAIL_TO), so nobody is emailed.",
+        "on_one": "Critical and serious alerts are emailed to {{count}} recipient: once when an alert opens and once when it resolves.",
+        "on_other": "Critical and serious alerts are emailed to {{count}} recipients: once when an alert opens and once when it resolves.",
+        "onUnknown": "Critical and serious alerts are emailed: once when an alert opens and once when it resolves.",
+        "failures_one": "{{count}} send failed since the last success.",
+        "failures_other": "{{count}} sends failed since the last success."
+      },
+      "scope": {
+        "worker": "worker {{id}}",
+        "run": "run {{id}}",
+        "host": "Host-wide"
+      },
+      "email": {
+        "sent": "Emailed",
+        "pending": "Not emailed yet",
+        "in_app_only": "In app only",
+        "record_only": "Record only",
+        "muted": "Held (muted)",
+        "maintenance": "Held (maintenance)",
+        "suppressed": "Not sent (acked first)",
+        "failed": "Email failed"
+      },
+      "runbookLink": "Runbook",
+      "col": {
+        "severity": "Severity",
+        "alert": "Alert",
+        "scope": "Scope",
+        "seen": "First seen",
+        "opened": "Opened",
+        "resolved": "Resolved",
+        "notified": "Notified",
+        "acked": "Acked by",
+        "runbook": "Next step",
+        "actions": "Actions"
+      },
+      "goTo": "Go to what “{{title}}” is about",
+      "mutedUntil": "muted until {{time}}",
+      "lastSeen": "last seen {{age}} ago",
+      "openFor": "open {{age}}",
+      "openTitle": "Open alerts",
+      "openSub": "Worst first. An ack records who is on it; the alert stays open until its rule clears.",
+      "historyTitle": "Resolved alerts",
+      "historySub": "Newest first, kept 180 days. A rule that fires again after resolving opens a new alert.",
+      "noneOpen": "No open alerts.",
+      "noneHistory": "No resolved alerts in the last 180 days.",
+      "mutesTitle": "Muted rules",
+      "rulesTitle": "Rules",
+      "maintenanceTitle": "Maintenance mode",
+      "mutes": {
+        "none": "No rule is muted.",
+        "until": "Muted until {{time}} ({{left}} left)",
+        "by": "by {{by}}: “{{reason}}”"
+      },
+      "threshold": {
+        "stale_doc_minutes": "Document in progress, warning",
+        "stale_doc_serious_minutes": "Document in progress, serious",
+        "hung_minutes": "Run without progress, warning",
+        "hung_serious_minutes": "Run without progress, serious",
+        "orphan_seconds": "Owner gone before orphaned",
+        "reservation_minutes": "Reservation without owner",
+        "busy_without_run_minutes": "Busy without a run",
+        "oldest_pending_minutes": "Oldest pending, warning",
+        "oldest_pending_serious_minutes": "Oldest pending, serious",
+        "email_waiting_minutes": "No successful drain, warning",
+        "email_waiting_serious_minutes": "No successful drain, serious",
+        "llm_error_rate": "Error rate, warning (0 to 1)",
+        "llm_error_rate_serious": "Error rate, serious (0 to 1)",
+        "llm_min_calls": "Minimum calls",
+        "llm_p95_ratio_warn": "p95 vs baseline, warning (×)",
+        "llm_p95_ratio_serious": "p95 vs baseline, serious (×)",
+        "llm_p95_serious_ms": "p95, serious above",
+        "http_5xx_warn": "5xx rate, warning (0 to 1)",
+        "http_5xx_serious": "5xx rate, serious (0 to 1)",
+        "http_5xx_min_requests": "Minimum requests",
+        "dep_error_warn": "Error rate, warning (0 to 1)",
+        "dep_error_serious": "Error rate, serious (0 to 1)",
+        "dep_error_min_calls": "Minimum calls",
+        "signin_sso_warn": "SSO errors, warning",
+        "signin_lockout_warn": "Lockouts, warning",
+        "signin_serious": "Failures, serious"
+      },
+      "thresholdError": {
+        "required": "Enter a value.",
+        "number": "Enter a number.",
+        "positive": "Must be above 0.",
+        "integer": "Use a whole number.",
+        "min": "At least {{min}}.",
+        "max": "At most {{max}}.",
+        "order": "Must be past the warning level."
+      },
+      "rules": {
+        "sub": "The §1.7 defaults, with any server-wide changes. Changes apply from the next evaluation and are audited.",
+        "col": {
+          "rule": "Rule",
+          "severity": "Can raise",
+          "email": "Email",
+          "thresholds": "Thresholds",
+          "runbook": "Runbook",
+          "mute": "Mute"
+        },
+        "operatorOnly": "Only operators can change thresholds.",
+        "emailed": "Emailed (critical and serious)",
+        "inAppOnly": "In app only",
+        "default": "default {{value}}",
+        "fixed": "Fixed condition",
+        "errors_one": "{{count}} value needs fixing before saving.",
+        "errors_other": "{{count}} values need fixing before saving.",
+        "changed_one": "{{count}} change not saved yet.",
+        "changed_other": "{{count}} changes not saved yet.",
+        "reset": "Reset",
+        "save": "Save…",
+        "saveTitle": "Save threshold changes",
+        "saveBody": "These thresholds apply on every worker from the next evaluation (within a minute). The change and its reason are recorded in the audit log.",
+        "saveConfirm": "Save thresholds"
+      },
+      "ack": {
+        "button": "Ack…",
+        "title": "Ack “{{title}}”",
+        "body": "Records that you are on it. The alert stays open until its rule clears, and its resolve email is still sent.",
+        "confirm": "Ack"
+      },
+      "mute": {
+        "button": "Mute",
+        "menuLabel": "Mute {{rule}}",
+        "for": "Mute for {{duration}}",
+        "title": "Mute “{{rule}}” for {{duration}}",
+        "body": "The rule is still evaluated and its alerts are still recorded and listed. No alert email is sent for it until the mute ends.",
+        "confirm": "Mute"
+      },
+      "unmute": {
+        "button": "Unmute…",
+        "title": "End the mute of “{{rule}}”",
+        "body": "Alert email for this rule resumes from the next evaluation.",
+        "confirm": "End mute"
+      },
+      "duration": {
+        "minutes_one": "{{count}} min",
+        "minutes_other": "{{count}} min",
+        "hours_one": "{{count}} h",
+        "hours_other": "{{count}} h",
+        "days_one": "{{count}} day",
+        "days_other": "{{count}} days"
+      },
+      "state": {
+        "firing": "Firing",
+        "resolved": "Resolved"
+      }
+    },
+    "maintenance": {
+      "explain": "While maintenance mode is on, alerts are still evaluated and recorded, but no alert email is sent and the header reads Maintenance. It ends by itself.",
+      "duration": "Duration",
+      "endsAt": "Ends at about {{time}}.",
+      "start": {
+        "title": "Start maintenance mode",
+        "body": "Use it for a deploy or a planned change. Alerts are still recorded; alert email is held until it ends.",
+        "confirm": "Start maintenance"
+      },
+      "end": {
+        "title": "End maintenance mode",
+        "body": "Alert email resumes for alerts that are still open.",
+        "confirm": "End maintenance"
+      },
+      "onUntil": "On until {{time}}",
+      "setBy": "set by {{by}}: “{{reason}}”",
+      "endButton": "End…",
+      "off": "Maintenance mode is off.",
+      "startButton": "Start maintenance…"
+    },
+    "banner": {
+      "email": {
+        "title": "Alert email is NOT being delivered.",
+        "reason": {
+          "smtp_probe_failing": "The SMTP probe is failing",
+          "smtp_not_configured": "SMTP is not configured",
+          "send_failed": "Recent alert emails failed to send",
+          "no_recipients": "No recipients are set (OPS_ALERT_EMAIL_TO or ALERT_EMAIL_TO)",
+          "unknown": "The alert channel reports a problem"
+        },
+        "since": "(since {{time}})",
+        "failures_one": "{{countText}} send failed.",
+        "failures_other": "{{countText}} sends failed.",
+        "open": "Open SMTP"
+      },
+      "maintenance": {
+        "title": "Maintenance mode until {{time}}",
+        "by": "(set by {{by}}: “{{reason}}”).",
+        "effect": "Alerts are still recorded; alert email is held."
+      }
+    },
+    "alertDrawer": {
+      "rule": "Rule",
+      "workspace": "Workspace",
+      "dependency": "Dependency",
+      "worker": "Worker",
+      "run": "Run",
+      "firstSeen": "First seen",
+      "lastSeen": "Last seen",
+      "resolved": "Resolved",
+      "openFor": "Open for",
+      "wasOpen": "Was open",
+      "notified": "Notified",
+      "acked": "Acked by",
+      "history_one": "Earlier occurrence",
+      "history_other": "Earlier occurrences ({{count}})",
+      "notFound": "This alert no longer exists. Alert history is kept 180 days.",
+      "whatToDo": "What to do",
+      "open": "Go to the affected view",
+      "retention": "Alert history is kept 180 days."
+    },
+    "incident": {
+      "title": "Export incident timeline",
+      "body": "Downloads the alerts, audit rows, runs and system markers in a window as NDJSON. No log text is included, everything is redacted on the server and the rows are capped. The export and its reason are recorded in the audit log.",
+      "from": "From",
+      "to": "To",
+      "problem": {
+        "malformed": "Enter both times.",
+        "order": "The end must be after the start.",
+        "too_long": "The window can span at most 31 days."
+      },
+      "submit": "Export",
+      "button": "Export incident timeline…",
+      "operatorOnly": "Only operators can export the incident timeline."
+    },
+    "events": {
+      "title": "System events",
+      "sub": "Deployments, model changes, provider rejections, ingestion, orphaned runs and admin actions, merged from usage events, the audit log and runs.",
+      "windowLabel": "Window",
+      "window": {
+        "6h": "6 h",
+        "24h": "24 h",
+        "7d": "7 days"
+      },
+      "none": "No system events in the last {{window}}.",
+      "col": {
+        "time": "Time",
+        "event": "Event",
+        "workspace": "Workspace",
+        "source": "Source"
+      },
+      "source": {
+        "usage_events": "usage events",
+        "audit": "audit log",
+        "runs": "runs"
+      }
+    },
+    "capture": {
+      "title": "Capture INFO lines",
+      "body": "Stores INFO lines from one module, on every worker, for at most 60 minutes. The capture stops by itself and its volume is capped. Lines are redacted like every other stored line. The capture and its reason are recorded in the audit log.",
+      "module": "Module",
+      "modulePlaceholder": "pipeline",
+      "moduleHint": "A module or logger name, as in the Module filter. The server accepts only modules on its allowlist.",
+      "duration": "For",
+      "confirm": "Start capture",
+      "stopTitle": "Stop the INFO capture of {{module}}",
+      "stopBody": "New INFO lines stop being stored on every worker. Lines already stored stay until retention removes them.",
+      "stopConfirm": "Stop capture",
+      "active": "INFO capture: {{module}}",
+      "ended": "ended",
+      "left": "{{time}} left",
+      "leftLabel": "{{time}} left in the INFO capture",
+      "by": "by {{by}}",
+      "show": "Show INFO lines",
+      "stop": "Stop…",
+      "none": "INFO lines are not stored by default.",
+      "start": "Capture INFO…",
+      "operatorOnly": "Only operators can capture INFO lines.",
+      "emptyAction": "Capture INFO for 60 min…",
+      "sinkOff": "This server does not store log lines (OPS_LOG_SINK is off)."
     }
   }
 }

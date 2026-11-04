@@ -12,7 +12,7 @@ from fastapi.testclient import TestClient
 
 from lightrag.api.ops import auth as ops_auth
 from lightrag.api.ops.leases import LeasedLoop
-from lightrag.api.ops.reconcile import attention_cycle
+from lightrag.api.ops.alerts import AlertEvaluator
 from tests.ops_fixtures import (
     OTHER_WORKER_ID,
     WORKER_ID,
@@ -212,11 +212,12 @@ async def test_attention_cycle_publishes_under_the_lease_with_streaks(app, store
     service = app.state.ops.service
     service.started_at = time.time() - 600
     process = {"mode": "gunicorn", "expected": 2, "live": None}
+    evaluator = AlertEvaluator(service, process=lambda: process)
     loop = LeasedLoop(
         store,
-        "ops:reconcile",
+        "ops:alerts",
         WORKER_ID,
-        lambda lp: attention_cycle(lp, service=service, process=lambda: process),
+        evaluator.cycle,
         ttl_s=120,
         interval_s=60,
         cycle_timeout_s=90,
@@ -234,7 +235,7 @@ async def test_attention_cycle_publishes_under_the_lease_with_streaks(app, store
     assert rules["workers_below_expected"]["severity"] == "warning"
     assert rules["workers_below_expected"]["params"] == {"live": 1, "expected": 2}
     # Another worker holds the lease: nothing is written.
-    store.kv["lease:ops:reconcile"] = {"holder": "other", "exp": time.time() + 120}
+    store.kv["lease:ops:alerts"] = {"holder": "other", "exp": time.time() + 120}
     store.kv["attention"] = {"marker": True}
     assert not await loop.run_once()
     assert store.kv["attention"] == {"marker": True}

@@ -12,6 +12,7 @@ from typing import Optional
 from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import OAuth2PasswordBearer
 
+from .ops.context import mark_request_authenticated
 from .workspace_manager import WorkspaceManager, sanitize_workspace_id
 
 logger = logging.getLogger("lightrag.api.dependencies")
@@ -391,7 +392,9 @@ async def get_current_user(
     else:
         logger.debug(f"  Using header token, length: {len(token)}")
 
-    return await _resolve_user(token, request)
+    user = await _resolve_user(token, request)
+    mark_request_authenticated()
+    return user
 
 
 async def get_current_workspace(

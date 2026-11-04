@@ -3,8 +3,10 @@ import { useTranslation } from 'react-i18next'
 import { DownloadIcon } from 'lucide-react'
 import Input from '@/components/ui/Input'
 import { cn } from '@/lib/utils'
-import { AuditPage, AuditRow, opsApi } from '../api'
+import { AuditRow, opsApi } from '../api'
 import AuditExportDialog from '../components/AuditExportDialog'
+import KeysetPager from '../components/KeysetPager'
+import { Cursor, FIRST_PAGE } from '../keyset'
 import { Panel } from '../components/Panel'
 import { StatusChip } from '../components/StatusChip'
 import { useOpsNav, useOpsShell } from '../context'
@@ -14,10 +16,6 @@ import { AuditDraft, EMPTY_AUDIT_DRAFT, actionSuggestions, auditActor, auditFilt
 
 /** §3.10: Activity refreshes every 60 s. */
 const ACTIVITY_SECONDS = 60
-
-/** The keyset position: `before` is the server's `next_before` of the page above; `trail` walks back. */
-type Cursor = { before: string | null; trail: string[] }
-const FIRST: Cursor = { before: null, trail: [] }
 
 /** The audit table (§2.8): time, actor, auth kind, action, target, reason, outcome and request ID. */
 export function AuditTable({ rows, now }: { rows: AuditRow[]; now: number | null }) {
@@ -92,38 +90,6 @@ export function AuditTable({ rows, now }: { rows: AuditRow[]; now: number | null
   )
 }
 
-/** "Older" pages back on the server's `(ts, id)` keyset; "Newer" and "Newest" walk back up. */
-function AuditPager({ data, cursor, onCursor }: { data: AuditPage; cursor: Cursor; onCursor: (c: Cursor) => void }) {
-  const { t } = useTranslation()
-  if (!data.next_before && !cursor.before) return null
-  const newer = () => {
-    const trail = cursor.trail.slice(0, -1)
-    onCursor({ before: trail.length ? trail[trail.length - 1] : null, trail })
-  }
-  return (
-    <div className="flex flex-wrap items-center justify-end gap-2 text-xs">
-      {cursor.before ? (
-        <>
-          <button type="button" className="hover:bg-muted min-h-8 rounded-lg border px-3 text-[13px]" onClick={() => onCursor(FIRST)}>
-            {t('operations.audit.newest')}
-          </button>
-          <button type="button" className="hover:bg-muted min-h-8 rounded-lg border px-3 text-[13px]" onClick={newer}>
-            {t('operations.audit.newer')}
-          </button>
-        </>
-      ) : null}
-      <button
-        type="button"
-        className="hover:bg-muted min-h-8 rounded-lg border px-3 text-[13px] disabled:opacity-50"
-        disabled={!data.next_before}
-        onClick={() => data.next_before && onCursor({ before: data.next_before, trail: [...cursor.trail, data.next_before] })}
-      >
-        {t('operations.audit.older')}
-      </button>
-    </div>
-  )
-}
-
 /**
  * The Audit section of Activity (§2.8, FR-75): every console action, reveal,
  * export and log search, plus the existing admin changes (impersonation,
@@ -137,7 +103,7 @@ export default function AuditView() {
   const listId = useId()
   const [draft, setDraft] = useState<AuditDraft>(EMPTY_AUDIT_DRAFT)
   const [applied, setApplied] = useState<AuditDraft>(EMPTY_AUDIT_DRAFT)
-  const [cursor, setCursor] = useState<Cursor>(FIRST)
+  const [cursor, setCursor] = useState<Cursor>(FIRST_PAGE)
   const [exporting, setExporting] = useState(false)
   const poll = useOpsPoll((signal) => opsApi.audit(auditParams(applied, cursor.before), signal), [applied, cursor.before], ACTIVITY_SECONDS)
   const invalid = draftInvalid(draft)
@@ -146,12 +112,12 @@ export default function AuditView() {
     e.preventDefault()
     if (invalid) return
     setApplied({ ...draft, actor: draft.actor.trim(), action: draft.action.trim() })
-    setCursor(FIRST)
+    setCursor(FIRST_PAGE)
   }
   const clear = () => {
     setDraft(EMPTY_AUDIT_DRAFT)
     setApplied(EMPTY_AUDIT_DRAFT)
-    setCursor(FIRST)
+    setCursor(FIRST_PAGE)
   }
   const active = Object.entries(auditFilters(applied))
   const summary = active.length
@@ -216,7 +182,7 @@ export default function AuditView() {
             ) : (
               <p className="text-muted-foreground m-0 text-sm">{active.length ? t('operations.audit.emptyFiltered') : t('operations.audit.empty')}</p>
             )}
-            <AuditPager data={data} cursor={cursor} onCursor={setCursor} />
+            <KeysetPager next={data.next_before} cursor={cursor} onCursor={setCursor} />
             <p className="text-muted-foreground m-0 text-xs">{t('operations.audit.note')}</p>
           </div>
         )}

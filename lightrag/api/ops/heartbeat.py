@@ -349,6 +349,7 @@ class Heartbeat:
         self._sink_dropped = _DropWindow()
         self._sink_limited = _DropWindow()
         self._sink_failures = _DropWindow()
+        self._sink_unauth = _DropWindow()
         self.snapshot: dict[str, Any] = {}
         self.last_beat_at: Optional[float] = None
         self.last_write_ok_at: Optional[float] = None
@@ -524,6 +525,9 @@ class Heartbeat:
             "dropped_5m": self._sink_dropped.add(now, dropped),
             "rate_limited_5m": self._sink_limited.add(now, limited),
             "write_failures_5m": self._sink_failures.add(now, failures),
+            "unauth_warnings_5m": self._sink_unauth.add(
+                now, int(stats.get("unauth_warnings") or 0)
+            ),
         }
 
     def _drainers(self) -> list[dict[str, Any]]:
