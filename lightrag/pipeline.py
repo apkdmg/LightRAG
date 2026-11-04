@@ -1017,7 +1017,8 @@ class _PipelineMixin:
             # Log each error for debugging
             for doc_id, error_doc in error_docs.items():
                 logger.error(
-                    f"File processing error: - ID: {doc_id} {error_doc['file_path']}"
+                    f"File processing error: - ID: {doc_id} "
+                    f"{mask_path(error_doc['file_path'])}"
                 )
 
     async def apipeline_process_enqueue_documents(self) -> None:

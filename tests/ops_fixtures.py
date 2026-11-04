@@ -476,3 +476,80 @@ def seed_runs(store: MemoryOpsStore, worker_id: str = WORKER_ID) -> None:
         await store.runs_orphan([ORPHAN_RUN_ID])
 
     asyncio.run(write())
+
+
+LOG_REQUEST_ID = "3c9e41d0a1b2c3d4e5f60718293a4b5c"
+LOG_TRACK_ID = "upload_20261103_101010_aaaa0004"
+
+
+def seed_logs(store: MemoryOpsStore, worker_id: str = WORKER_ID) -> list[int]:
+    """Stored log rows (already redacted, as the sink writes them): an error
+    with a traceback in fsktm for a request, run, track and document, a
+    warning in space1 and an uvicorn.error line without a workspace."""
+    import asyncio
+
+    now = time.time()
+    base = {
+        "worker_id": worker_id,
+        "pid": 4242,
+        "client_request_id": None,
+        "operation": None,
+        "source": None,
+        "exc_type": None,
+        "exc": None,
+        "repeat_count": 1,
+    }
+    rows = [
+        {
+            **base,
+            "ts": now - 120,
+            "level": 40,
+            "logger": "lightrag",
+            "module": "pipeline",
+            "lineno": 2596,
+            "workspace": "fsktm",
+            "request_id": LOG_REQUEST_ID,
+            "run_id": RUN_ID,
+            "track_id": LOG_TRACK_ID,
+            "doc_id": "doc-aaaa0004",
+            "msg": "Failed to extract document doc-aaaa0004: RateLimitError <redacted>",
+            "exc_type": "RateLimitError",
+            "exc": "Traceback (most recent call last):\n  ...\nRateLimitError: 429",
+            "fingerprint": "a1a1a1a1a1a1a1a1",
+        },
+        {
+            **base,
+            "ts": now - 60,
+            "level": 30,
+            "logger": "lightrag",
+            "module": "operate",
+            "lineno": 1195,
+            "workspace": "space1",
+            "request_id": None,
+            "run_id": None,
+            "track_id": None,
+            "doc_id": None,
+            "msg": "RateLimitError, retry 2/3 in 8s",
+            "fingerprint": "b2b2b2b2b2b2b2b2",
+            "repeat_count": 4,
+        },
+        {
+            **base,
+            "ts": now - 30,
+            "level": 40,
+            "logger": "uvicorn.error",
+            "module": "httptools_impl",
+            "lineno": 414,
+            "workspace": None,
+            "request_id": "0f8d2c1e9a7b4c3d8e6f5a4b3c2d1e0f",
+            "run_id": None,
+            "track_id": None,
+            "doc_id": None,
+            "msg": "Exception in ASGI application",
+            "exc_type": "RuntimeError",
+            "exc": "Traceback (most recent call last):\nRuntimeError: boom",
+            "fingerprint": "c3c3c3c3c3c3c3c3",
+        },
+    ]
+    asyncio.run(store.logs_write(rows))
+    return [r["id"] for r in store.log_rows]

@@ -321,3 +321,56 @@ def test_strip_cells():
     assert cells[-1]["status"] == "down" and cells[-1]["failed"] == 2
     assert cells[1]["status"] == "unknown"
     assert cells[-1]["start"] == current * 1800 * 1000
+
+
+def test_log_sink_drops_and_stale_flushes_raise_the_drops_rule():
+    process = {"mode": "uvicorn", "expected": 1, "live": 1}
+    sink = {"buffer": 0, "dropped_5m": 12, "rate_limited_5m": 400}
+    items, _ = _evaluate(workers=[_worker(1, log_sink=sink)], process=process)
+    item = items["log_sink_or_recorder_drops_5m"]
+    assert item["severity"] == "warning"
+    assert item["params"]["log_lines_5m"] == 12
+    assert item["params"]["records_5m"] == 0
+    # Rate-limited lines are by design, not drops.
+    sink = {"buffer": 0, "dropped_5m": 0, "rate_limited_5m": 4000}
+    items, _ = _evaluate(workers=[_worker(1, log_sink=sink)], process=process)
+    assert "log_sink_or_recorder_drops_5m" not in items
+    # Rows waiting with no successful write for over a minute: serious.
+    sink = {"buffer": 300, "dropped_5m": 0, "last_flush_age_s": 90.0}
+    items, _ = _evaluate(workers=[_worker(1, log_sink=sink)], process=process)
+    item = items["log_sink_or_recorder_drops_5m"]
+    assert item["severity"] == "serious"
+    assert item["params"]["stale_sinks"] == [1]
+    sink = {"buffer": 3, "last_flush_age_s": None, "write_failures_5m": 2}
+    items, _ = _evaluate(workers=[_worker(1, log_sink=sink)], process=process)
+    assert items["log_sink_or_recorder_drops_5m"]["severity"] == "serious"
+    # Recorder and sink drops add up.
+    items, _ = _evaluate(
+        workers=[
+            _worker(1, log_sink={"dropped_5m": 600}, recorder={"lost_5m": 500}),
+        ],
+        process=process,
+    )
+    item = items["log_sink_or_recorder_drops_5m"]
+    assert item["severity"] == "serious"
+    assert item["params"]["records_5m"] == 500
+    assert item["params"]["log_lines_5m"] == 600
+
+
+def test_log_sink_health_card():
+    workers = [
+        _worker(1, log_sink={"buffer": 4, "dropped_5m": 0, "rate_limited_5m": 9}),
+        _worker(
+            2, log_sink={"buffer": 1, "write_failures_5m": 1, "last_flush_age_s": 5.0}
+        ),
+        _worker(3, alive=False, log_sink={"dropped_5m": 99999}),
+    ]
+    cards = {c["id"]: c for c in derived_deps(workers, "uvicorn", NOW)}
+    card = cards["log_sink"]
+    assert card["status"] == "warn"
+    assert card["detail"]["workers"] == 2 and card["detail"]["buffer"] == 5
+    assert card["detail"]["rate_limited_5m"] == 9
+    workers = [_worker(1, log_sink={"buffer": 0, "dropped_5m": 0})]
+    assert {c["id"]: c for c in derived_deps(workers, "uvicorn", NOW)}["log_sink"][
+        "status"
+    ] == "ok"

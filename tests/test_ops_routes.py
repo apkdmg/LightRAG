@@ -61,6 +61,7 @@ def _route_path(route) -> str:
         .replace("{dep}", "postgres")
         .replace("{worker_id}", "w")
         .replace("{id}", "1")
+        .replace("{log_id}", "1")
         .replace("{rule}", "x")
     )
 
@@ -117,6 +118,7 @@ def test_status_payload_shape(monkeypatch):
         "processing": False,
         "runs": False,
         "logs": False,
+        "log_sink": False,
         "probes": False,
         "heartbeats": False,
         "alerts": False,

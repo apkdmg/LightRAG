@@ -231,11 +231,35 @@ def _derived_card(
     }
 
 
+def _flush_stale(health: dict[str, Any]) -> bool:
+    """Rows wait while the last successful flush pass is over a minute old
+    (or never happened although writes failed). Recorders and the log sink
+    stamp every pass that failed nothing, empty ones included, so a quiet
+    spell followed by one new row does not read as stuck."""
+    if not (health.get("buffer") or 0) > 0:
+        return False
+    age = health.get("last_flush_age_s")
+    if isinstance(age, (int, float)):
+        return age > RECORDER_FLUSH_STALE_S
+    return bool(health.get("write_failures_5m") or health.get("flush_failures"))
+
+
+def _worst_age(items: list[dict[str, Any]]) -> Optional[float]:
+    return max(
+        (
+            i["last_flush_age_s"]
+            for i in items
+            if isinstance(i.get("last_flush_age_s"), (int, float))
+        ),
+        default=None,
+    )
+
+
 def derived_deps(
     workers: list[dict[str, Any]], mode: str, now: float
 ) -> list[dict[str, Any]]:
     """Cards read from heartbeats: the shared-state Manager (multi-worker
-    only) and the Insights recorder."""
+    only), the Insights recorder and the ops log sink."""
     alive = [w for w in workers if w.get("alive")]
     cards: list[dict[str, Any]] = []
     if mode == "gunicorn" and alive:
@@ -271,12 +295,7 @@ def derived_deps(
             int(r.get("lost_5m") or 0) + int(r.get("dropped_5m") or 0)
             for r in recorders
         )
-        stale = any(
-            (r.get("buffer") or 0) > 0
-            and isinstance(r.get("last_flush_age_s"), (int, float))
-            and r["last_flush_age_s"] > RECORDER_FLUSH_STALE_S
-            for r in recorders
-        )
+        stale = any(_flush_stale(r) for r in recorders)
         status = "down" if stale or drops > DROPS_SERIOUS else "warn" if drops else "ok"
         cards.append(
             _derived_card(
@@ -288,14 +307,36 @@ def derived_deps(
                     "buffer": sum(int(r.get("buffer") or 0) for r in recorders),
                     "lost_5m": sum(int(r.get("lost_5m") or 0) for r in recorders),
                     "dropped_5m": sum(int(r.get("dropped_5m") or 0) for r in recorders),
-                    "last_flush_age_s": max(
-                        (
-                            r["last_flush_age_s"]
-                            for r in recorders
-                            if isinstance(r.get("last_flush_age_s"), (int, float))
-                        ),
-                        default=None,
+                    "last_flush_age_s": _worst_age(recorders),
+                },
+                now,
+            )
+        )
+    sinks = [w["snapshot"].get("log_sink") for w in alive]
+    sinks = [s for s in sinks if isinstance(s, dict)]
+    if sinks:
+        drops = sum(int(s.get("dropped_5m") or 0) for s in sinks)
+        failures = sum(int(s.get("write_failures_5m") or 0) for s in sinks)
+        stale = any(_flush_stale(s) for s in sinks)
+        if stale or drops > DROPS_SERIOUS:
+            status = "down"
+        else:
+            status = "warn" if drops or failures else "ok"
+        cards.append(
+            _derived_card(
+                "log_sink",
+                "Ops log sink",
+                "internal",
+                status,
+                {
+                    "workers": len(sinks),
+                    "buffer": sum(int(s.get("buffer") or 0) for s in sinks),
+                    "dropped_5m": drops,
+                    "rate_limited_5m": sum(
+                        int(s.get("rate_limited_5m") or 0) for s in sinks
                     ),
+                    "write_failures_5m": failures,
+                    "last_flush_age_s": _worst_age(sinks),
                 },
                 now,
             )
@@ -682,26 +723,38 @@ def health_attention(
         for w in alive
         if isinstance(w["snapshot"].get("recorder"), dict)
     ]
-    if recorders:
-        drops = sum(
-            int(r.get("lost_5m") or 0) + int(r.get("dropped_5m") or 0)
-            for _, r in recorders
+    sinks = [
+        (w["pid"], w["snapshot"].get("log_sink"))
+        for w in alive
+        if isinstance(w["snapshot"].get("log_sink"), dict)
+    ]
+    record_drops = sum(
+        int(r.get("lost_5m") or 0) + int(r.get("dropped_5m") or 0) for _, r in recorders
+    )
+    line_drops = sum(int(s.get("dropped_5m") or 0) for _, s in sinks)
+    stale = [pid for pid, r in recorders if _flush_stale(r)]
+    sink_stale = [pid for pid, s in sinks if _flush_stale(s)]
+    drops = record_drops + line_drops
+    if drops or stale or sink_stale:
+        if record_drops:
+            title = f"Usage records dropped in the last 5 min: {record_drops}"
+        elif stale:
+            title = "Usage records have not been written for over a minute"
+        elif line_drops:
+            title = f"Log lines dropped in the last 5 min: {line_drops}"
+        else:
+            title = "Log lines have not been written for over a minute"
+        add(
+            "log_sink_or_recorder_drops_5m",
+            "serious" if stale or sink_stale or drops > DROPS_SERIOUS else "warning",
+            title,
+            health_link(odep="recorder" if record_drops or stale else "log_sink"),
+            params={
+                "drops_5m": drops,
+                "records_5m": record_drops,
+                "log_lines_5m": line_drops,
+                "stale_workers": stale,
+                "stale_sinks": sink_stale,
+            },
         )
-        stale = [
-            pid
-            for pid, r in recorders
-            if (r.get("buffer") or 0) > 0
-            and isinstance(r.get("last_flush_age_s"), (int, float))
-            and r["last_flush_age_s"] > RECORDER_FLUSH_STALE_S
-        ]
-        if drops or stale:
-            add(
-                "log_sink_or_recorder_drops_5m",
-                "serious" if stale or drops > DROPS_SERIOUS else "warning",
-                f"Usage records dropped in the last 5 min: {drops}"
-                if drops
-                else "Usage records have not been written for over a minute",
-                health_link(odep="recorder"),
-                params={"drops_5m": drops, "stale_workers": stale},
-            )
     return new_streaks

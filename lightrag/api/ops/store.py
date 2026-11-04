@@ -5,9 +5,10 @@
 (``kv_storage == "PGKVStorage"``): ``LIGHTRAG_OPS_KV`` (small JSON values,
 renewable leases), ``LIGHTRAG_OPS_AUDIT``, the worker heartbeat tables
 (``LIGHTRAG_OPS_WORKERS``, ``LIGHTRAG_OPS_WORKER_SAMPLES``), the dependency
-probe history (``LIGHTRAG_OPS_PROBES``) and run tracking
-(``LIGHTRAG_OPS_RUNS``, ``LIGHTRAG_OPS_DOC_FAILURES``); the other ops tables
-arrive with the features that write them. Indexes on the large existing tables are never built
+probe history (``LIGHTRAG_OPS_PROBES``), run tracking
+(``LIGHTRAG_OPS_RUNS``, ``LIGHTRAG_OPS_DOC_FAILURES``) and the structured
+WARNING+ log store (``LIGHTRAG_OPS_LOGS``); the other ops tables arrive with
+the features that write them. Indexes on the large existing tables are never built
 here: :mod:`lightrag.api.ops.indexes` builds them in the background.
 
 Rules every query follows:
@@ -33,6 +34,7 @@ import json
 import logging
 import re
 import time
+import uuid
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from contextlib import asynccontextmanager
@@ -59,6 +61,61 @@ TABLE_DOC_FAILURES = "LIGHTRAG_OPS_DOC_FAILURES"
 TABLE_WORKERS = "LIGHTRAG_OPS_WORKERS"
 TABLE_WORKER_SAMPLES = "LIGHTRAG_OPS_WORKER_SAMPLES"
 TABLE_PROBES = "LIGHTRAG_OPS_PROBES"
+TABLE_LOGS = "LIGHTRAG_OPS_LOGS"
+# Built by ops/indexes.py; correlate reads doc status by id only through it.
+DOC_STATUS_ID_INDEX = "idx_lightrag_doc_status_id"
+# Columns the log sink writes, in COPY order.
+LOG_COLUMNS = (
+    "ts",
+    "level",
+    "logger",
+    "worker_id",
+    "pid",
+    "module",
+    "lineno",
+    "workspace",
+    "request_id",
+    "client_request_id",
+    "run_id",
+    "track_id",
+    "doc_id",
+    "operation",
+    "source",
+    "msg",
+    "exc_type",
+    "exc",
+    "fingerprint",
+    "repeat_count",
+)
+# Retention deletes at most this many batches per cycle; the rest waits for
+# the next cycle, so one cycle never runs long on a busy table.
+LOG_RETENTION_MAX_BATCHES = 200
+# Weekly audit: what must never be found in stored log text (FR-72).
+LOG_AUDIT_PATTERNS = {
+    "email": (
+        r"[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}",
+        False,
+    ),
+    "bearer": (r"bearer\s+[A-Za-z0-9._~+/=-]{6,}", True),
+    "sk_key": (r"sk-[A-Za-z0-9_-]{8,}", False),
+    "jwt": (r"eyJ[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}\.", False),
+    "ic_number": (
+        r"(^|[^0-9A-Za-z])[0-9]{6}-?[0-9]{2}-?[0-9]{4}([^0-9A-Za-z]|$)",
+        False,
+    ),
+    "phone": (
+        r"(^|[^0-9A-Za-z+])\+?6?0[ -]?1[0-9][ -]?[0-9]{3,4}[ -]?[0-9]{4}"
+        r"([^0-9A-Za-z]|$)",
+        False,
+    ),
+    # A name whose last three characters before the extension are not part
+    # of a mask: a masked name keeps at most two ("Min\u2022\u2022\u2022an.pdf"), so
+    # an unmasked name is counted even in a row that holds masked ones.
+    "file_name": (
+        "[^\\s\u2022]{3}\\.(pdf|docx?|xlsx?|pptx?|eml|msg)([^A-Za-z0-9]|$)",
+        True,
+    ),
+}
 
 READ_TIMEOUT_MS = 3000
 DEDICATED_QUERY_TIMEOUT_S = 5.0
@@ -235,6 +292,32 @@ _EXAMPLE_ORDER = "ORDER BY updated_at DESC, workspace, id"
 class Page:
     limit: int
     offset: int
+
+
+@dataclass(frozen=True)
+class LogFilter:
+    """One ``LIGHTRAG_OPS_LOGS`` query: a time window plus optional filters.
+
+    ``level`` is a minimum (logging level number). ``logger`` matches a
+    logger-name prefix; ``module`` matches the module *or* the logger name
+    exactly (the viewer shows the logger only when it is not ``lightrag``).
+    ``q`` is a case-insensitive substring of the message. ``run_id`` and
+    ``worker_id`` are 32 hex characters.
+    """
+
+    start: datetime
+    end: datetime
+    level: int = 30
+    workspace: Optional[str] = None
+    logger: Optional[str] = None
+    module: Optional[str] = None
+    request_id: Optional[str] = None
+    run_id: Optional[str] = None
+    track_id: Optional[str] = None
+    doc_id: Optional[str] = None
+    fingerprint: Optional[str] = None
+    worker_id: Optional[str] = None
+    q: Optional[str] = None
 
 
 class OpsStore(ABC):
@@ -548,6 +631,74 @@ class OpsStore(ABC):
     ) -> list[dict[str, Any]]:
         """Orphaned runs in a window, for the timeline."""
 
+    # -- audit -------------------------------------------------------------------
+    @abstractmethod
+    async def audit_write(self, row: dict[str, Any]) -> int:
+        """Insert one ``LIGHTRAG_OPS_AUDIT`` row; returns its id."""
+
+    # -- logs (writes come from the buffered log sink) -----------------------------
+    @abstractmethod
+    async def logs_write(self, rows: list[dict[str, Any]]) -> None:
+        """Insert log rows (epoch-second ``ts``, columns of :data:`LOG_COLUMNS`)."""
+
+    @abstractmethod
+    async def logs_page(
+        self,
+        f: LogFilter,
+        *,
+        before: Optional[tuple[datetime, int]],
+        after: Optional[datetime],
+        limit: int,
+        with_exc: bool = False,
+    ) -> list[dict[str, Any]]:
+        """Newest first, keyset on ``(ts, id)`` below ``before``; ``after``
+        (follow mode) keeps only rows at or after that time. ``with_exc``
+        adds the traceback column (exports)."""
+
+    @abstractmethod
+    async def logs_groups(self, f: LogFilter, limit: int) -> list[dict[str, Any]]:
+        """Rows grouped by call-site fingerprint, largest first, each with the
+        newest row's message as its sample."""
+
+    @abstractmethod
+    async def log_get(self, log_id: int) -> Optional[dict[str, Any]]: ...
+
+    @abstractmethod
+    async def logs_count(self, f: LogFilter, cap: int) -> int:
+        """Matching rows, counted up to ``cap + 1``."""
+
+    @abstractmethod
+    async def logs_cleanup(self, days: int) -> int:
+        """Delete rows older than ``days`` in batches; returns rows deleted."""
+
+    @abstractmethod
+    async def logs_redaction_audit(self, days: int) -> dict[str, int]:
+        """Rows of the last ``days`` whose text still matches a pattern of
+        :data:`LOG_AUDIT_PATTERNS` (counts only, never the text)."""
+
+    # -- correlation (≤ ``limit`` rows each, all on indexes) ---------------------------
+    @abstractmethod
+    async def correlate_requests(
+        self, request_id: str, limit: int
+    ) -> list[dict[str, Any]]:
+        """Log lines of one request ID, per workspace: ``n``, ``first_ts``, ``last_ts``."""
+
+    @abstractmethod
+    async def correlate_tracks(self, track_id: str, limit: int) -> list[dict[str, Any]]:
+        """Workspaces holding documents or log lines of a track ID."""
+
+    @abstractmethod
+    async def correlate_docs(self, doc_id: str, limit: int) -> list[dict[str, Any]]:
+        """Workspaces holding a document ID (doc status, failures, log lines)."""
+
+    @abstractmethod
+    async def owners_by_email(self, email: str, limit: int) -> dict[str, str]:
+        """Workspaces whose registered owner email or identity is ``email``."""
+
+    @abstractmethod
+    async def workspace_presence(self, workspace: str) -> dict[str, bool]:
+        """Whether a workspace has documents, runs or log lines."""
+
 
 def _workspace_keys(workspace: str) -> list[str]:
     return [template.format(ws=workspace) for template in WORKSPACE_KV_KEYS]
@@ -569,6 +720,7 @@ class PostgresOpsStore(OpsStore):
         self._beat_lock: Optional[asyncio.Lock] = None
         self._tables: set[str] = set()
         self._tables_at = 0.0
+        self._index_checks: dict[str, tuple[bool, float]] = {}
         self.ready = False
         self.doc_status_ready = False
 
@@ -688,6 +840,44 @@ class PostgresOpsStore(OpsStore):
             f"CREATE INDEX IF NOT EXISTS idx_ops_fail_docid ON {TABLE_DOC_FAILURES} (doc_id)",
             f"""CREATE INDEX IF NOT EXISTS idx_ops_fail_run ON {TABLE_DOC_FAILURES}
                 (run_id) WHERE run_id IS NOT NULL""",
+            # Plain table (v1); partition only if volume exceeds ~1M rows/day.
+            f"""CREATE TABLE IF NOT EXISTS {TABLE_LOGS} (
+                id BIGSERIAL PRIMARY KEY,
+                ts TIMESTAMPTZ NOT NULL,
+                level SMALLINT NOT NULL,
+                logger VARCHAR(128) NOT NULL,
+                worker_id UUID,
+                pid INT,
+                module VARCHAR(128),
+                lineno INT,
+                workspace VARCHAR(255),
+                request_id VARCHAR(64),
+                client_request_id VARCHAR(64),
+                run_id UUID,
+                track_id VARCHAR(255),
+                doc_id VARCHAR(255),
+                operation VARCHAR(64),
+                source VARCHAR(32),
+                msg TEXT NOT NULL,
+                exc_type VARCHAR(128),
+                exc TEXT,
+                fingerprint CHAR(16) NOT NULL,
+                repeat_count INT NOT NULL DEFAULT 1
+            )""",
+            f"CREATE INDEX IF NOT EXISTS idx_ops_logs_ts ON {TABLE_LOGS} (ts DESC, id DESC)",
+            f"""CREATE INDEX IF NOT EXISTS idx_ops_logs_ws ON {TABLE_LOGS}
+                (workspace, ts DESC, id DESC)""",
+            f"""CREATE INDEX IF NOT EXISTS idx_ops_logs_lvl ON {TABLE_LOGS}
+                (level, ts DESC, id DESC) WHERE level >= 40""",
+            f"CREATE INDEX IF NOT EXISTS idx_ops_logs_fp ON {TABLE_LOGS} (fingerprint, ts DESC)",
+            f"""CREATE INDEX IF NOT EXISTS idx_ops_logs_req ON {TABLE_LOGS}
+                (request_id) WHERE request_id IS NOT NULL""",
+            f"""CREATE INDEX IF NOT EXISTS idx_ops_logs_run ON {TABLE_LOGS}
+                (run_id) WHERE run_id IS NOT NULL""",
+            f"""CREATE INDEX IF NOT EXISTS idx_ops_logs_doc ON {TABLE_LOGS}
+                (doc_id, ts) WHERE doc_id IS NOT NULL""",
+            f"""CREATE INDEX IF NOT EXISTS idx_ops_logs_track ON {TABLE_LOGS}
+                (track_id) WHERE track_id IS NOT NULL""",
         ):
             await self._db.execute(statement)
         await self._refresh_tables(force=True)
@@ -1197,8 +1387,7 @@ class PostgresOpsStore(OpsStore):
             args = [int(hours), key]
         elif group == "workspace":
             condition = (
-                f"{base} AND NOT {_CANCELLED} AND {_NO_FAILURE_META} "
-                "AND workspace = $2"
+                f"{base} AND NOT {_CANCELLED} AND {_NO_FAILURE_META} AND workspace = $2"
             )
             args = [int(hours), key]
         else:
@@ -2095,6 +2284,284 @@ class PostgresOpsStore(OpsStore):
             row["run_id"] = _uuid_hex(row["run_id"])
         return rows
 
+    # -- audit ---------------------------------------------------------------------------
+    async def audit_write(self, row):
+        rows = await self._write(
+            f"""INSERT INTO {TABLE_AUDIT} (actor, auth_kind, impersonated_by, action,
+                workspace, target, params, reason, phase, outcome, request_id,
+                client_ip_hash)
+            VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, $10, $11, $12)
+            RETURNING id""",
+            *_audit_values(row),
+        )
+        return int(rows[0]["id"])
+
+    # -- logs ----------------------------------------------------------------------------
+    async def logs_write(self, rows):
+        if not rows:
+            return
+        records = [_log_record(r) for r in rows]
+        async with self._conn() as conn:
+            async with conn.transaction():
+                await conn.execute(f"SET LOCAL statement_timeout = {WRITE_TIMEOUT_MS}")
+                # Unquoted DDL names fold to lower case; COPY quotes its target.
+                await conn.copy_records_to_table(
+                    TABLE_LOGS.lower(), records=records, columns=list(LOG_COLUMNS)
+                )
+
+    _LOG_SELECT = """id, ts, level, logger, worker_id, pid, module, lineno, workspace,
+        request_id, client_request_id, run_id, track_id, doc_id, operation, source,
+        msg, exc_type, (exc IS NOT NULL AND exc <> '') AS has_exc, fingerprint,
+        repeat_count"""
+
+    @staticmethod
+    def _log_view(row: dict[str, Any]) -> dict[str, Any]:
+        for key in ("worker_id", "run_id"):
+            if row.get(key) is not None:
+                row[key] = _uuid_hex(row[key])
+        if isinstance(row.get("fingerprint"), str):
+            row["fingerprint"] = row["fingerprint"].strip()
+        return row
+
+    async def logs_page(self, f, *, before, after, limit, with_exc=False):
+        args: list[Any] = []
+        where = _log_conditions(f, args)
+        if after is not None:
+            args.append(after)
+            where.append(f"ts >= ${len(args)}")
+        if before is not None:
+            args.extend(before)
+            where.append(
+                f"(ts, id) < (${len(args) - 1}::timestamptz, ${len(args)}::bigint)"
+            )
+        args.append(int(limit))
+        rows = await self._read(
+            f"""SELECT {self._LOG_SELECT}{", exc" if with_exc else ""} FROM {TABLE_LOGS}
+            WHERE {" AND ".join(where)} ORDER BY ts DESC, id DESC LIMIT ${len(args)}""",
+            *args,
+        )
+        return [self._log_view(r) for r in rows]
+
+    async def logs_groups(self, f, limit):
+        args: list[Any] = []
+        where = " AND ".join(_log_conditions(f, args))
+        args.append(int(limit))
+        rows = await self._read(
+            f"""WITH g AS (
+                SELECT fingerprint, count(*)::bigint AS rows,
+                    sum(repeat_count)::bigint AS count, min(ts) AS first_seen,
+                    max(ts) AS last_seen, count(DISTINCT workspace)::int AS workspaces,
+                    max(level)::int AS level
+                FROM {TABLE_LOGS} WHERE {where}
+                GROUP BY fingerprint
+                ORDER BY count DESC, last_seen DESC LIMIT ${len(args)})
+            SELECT g.*, s.id AS sample_id, s.logger, s.module, s.lineno, s.exc_type,
+                s.msg AS sample
+            FROM g LEFT JOIN LATERAL (
+                SELECT id, logger, module, lineno, exc_type, msg FROM {TABLE_LOGS} l
+                WHERE l.fingerprint = g.fingerprint AND l.ts = g.last_seen
+                ORDER BY l.id DESC LIMIT 1) s ON true
+            ORDER BY g.count DESC, g.last_seen DESC""",
+            *args,
+        )
+        for row in rows:
+            row["fingerprint"] = str(row["fingerprint"]).strip()
+        return rows
+
+    async def log_get(self, log_id):
+        rows = await self._read(
+            f"SELECT {self._LOG_SELECT}, exc FROM {TABLE_LOGS} WHERE id = $1",
+            int(log_id),
+        )
+        return self._log_view(rows[0]) if rows else None
+
+    async def logs_count(self, f, cap):
+        args: list[Any] = []
+        where = " AND ".join(_log_conditions(f, args))
+        rows = await self._read(
+            f"""SELECT count(*)::int AS n FROM (
+                SELECT 1 FROM {TABLE_LOGS} WHERE {where} LIMIT {int(cap) + 1}) t""",
+            *args,
+        )
+        return int(rows[0]["n"]) if rows else 0
+
+    async def logs_cleanup(self, days):
+        deleted = 0
+        for _ in range(LOG_RETENTION_MAX_BATCHES):
+            # Batched so retention never holds long locks on the busiest table.
+            rows = await self._write(
+                f"""DELETE FROM {TABLE_LOGS} WHERE id IN (
+                    SELECT id FROM {TABLE_LOGS}
+                    WHERE ts < now() - make_interval(days => $1::int)
+                    LIMIT {RETENTION_BATCH})
+                RETURNING 1""",
+                int(days),
+            )
+            deleted += len(rows)
+            if len(rows) < RETENTION_BATCH:
+                break
+        return deleted
+
+    async def logs_redaction_audit(self, days):
+        text = "(msg || ' ' || COALESCE(exc, ''))"
+        counts = []
+        for name, (pattern, insensitive) in LOG_AUDIT_PATTERNS.items():
+            op = "~*" if insensitive else "~"
+            counts.append(
+                f"count(*) FILTER (WHERE {text} {op} '{pattern}')::int AS {name}"
+            )
+        async with self._conn() as conn:
+            async with conn.transaction(readonly=True):
+                # A weekly scan over days of rows: a longer budget than reads.
+                await conn.execute("SET LOCAL statement_timeout = 120000")
+                row = await conn.fetchrow(
+                    f"""SELECT count(*)::int AS rows, {", ".join(counts)}
+                    FROM {TABLE_LOGS}
+                    WHERE ts >= now() - make_interval(days => $1::int)""",
+                    int(days),
+                )
+        return dict(row) if row else {}
+
+    # -- correlation ---------------------------------------------------------------------
+    async def correlate_requests(self, request_id, limit):
+        return await self._read(
+            f"""SELECT workspace, count(*)::int AS n, min(ts) AS first_ts,
+                max(ts) AS last_ts
+            FROM {TABLE_LOGS} WHERE request_id = $1
+            GROUP BY workspace ORDER BY max(ts) DESC LIMIT $2""",
+            request_id,
+            int(limit),
+        )
+
+    async def correlate_tracks(self, track_id, limit):
+        found: dict[Any, dict[str, Any]] = {}
+        if self.doc_status_ready and await self._has_table(TABLE_DOC_STATUS):
+            for row in await self._read(
+                f"""SELECT workspace, count(*)::int AS docs, max(updated_at) AS ts
+                FROM {TABLE_DOC_STATUS} WHERE track_id = $1
+                GROUP BY workspace ORDER BY max(updated_at) DESC LIMIT $2""",
+                track_id,
+                int(limit),
+            ):
+                found[row["workspace"]] = {
+                    "workspace": row["workspace"],
+                    "docs": row["docs"],
+                    "log_lines": 0,
+                    "ts": as_utc(row["ts"]),
+                }
+        for row in await self._read(
+            f"""SELECT workspace, count(*)::int AS n, max(ts) AS ts
+            FROM {TABLE_LOGS} WHERE track_id = $1
+            GROUP BY workspace ORDER BY max(ts) DESC LIMIT $2""",
+            track_id,
+            int(limit),
+        ):
+            item = found.setdefault(
+                row["workspace"],
+                {"workspace": row["workspace"], "docs": 0, "log_lines": 0, "ts": None},
+            )
+            item["log_lines"] = row["n"]
+            item["ts"] = _later(item["ts"], as_utc(row["ts"]))
+        return _newest(found.values(), limit)
+
+    async def _index_valid(self, name: str) -> bool:
+        """Whether an index exists and is valid (cached; the builder makes it)."""
+        cached = self._index_checks.get(name)
+        now = time.monotonic()
+        if cached is not None and now - cached[1] < _TABLES_TTL_S:
+            return cached[0]
+        rows = await self._read(
+            """SELECT i.indisvalid FROM pg_class c
+            JOIN pg_index i ON i.indexrelid = c.oid WHERE c.relname = $1""",
+            name,
+        )
+        valid = bool(rows and rows[0]["indisvalid"])
+        self._index_checks[name] = (valid, now)
+        return valid
+
+    async def correlate_docs(self, doc_id, limit):
+        found: dict[Any, dict[str, Any]] = {}
+
+        def item(workspace: Any) -> dict[str, Any]:
+            return found.setdefault(
+                workspace,
+                {
+                    "workspace": workspace,
+                    "doc_id": doc_id,
+                    "status": None,
+                    "file_path": None,
+                    "failures": 0,
+                    "log_lines": 0,
+                    "ts": None,
+                },
+            )
+
+        # Without its (id) index the doc-status lookup would scan the table.
+        if (
+            self.doc_status_ready
+            and await self._has_table(TABLE_DOC_STATUS)
+            and await self._index_valid(DOC_STATUS_ID_INDEX)
+        ):
+            for row in await self._read(
+                f"""SELECT workspace, status, file_path, updated_at
+                FROM {TABLE_DOC_STATUS} WHERE id = $1 LIMIT $2""",
+                doc_id,
+                int(limit),
+            ):
+                entry = item(row["workspace"])
+                entry["status"] = row["status"]
+                entry["file_path"] = row["file_path"]
+                entry["ts"] = as_utc(row["updated_at"])
+        for table, column, key in (
+            (TABLE_DOC_FAILURES, "ts", "failures"),
+            (TABLE_LOGS, "ts", "log_lines"),
+        ):
+            for row in await self._read(
+                f"""SELECT workspace, count(*)::int AS n, max({column}) AS ts
+                FROM {table} WHERE doc_id = $1
+                GROUP BY workspace ORDER BY max({column}) DESC LIMIT $2""",
+                doc_id,
+                int(limit),
+            ):
+                entry = item(row["workspace"])
+                entry[key] = row["n"]
+                entry["ts"] = _later(entry["ts"], as_utc(row["ts"]))
+        return _newest(found.values(), limit)
+
+    async def owners_by_email(self, email, limit):
+        if not await self._has_table(TABLE_OWNERS):
+            return {}
+        # The registry holds a few thousand rows: a scan is cheap.
+        rows = await self._read(
+            f"""SELECT workspace_id, COALESCE(email, identity) AS owner
+            FROM {TABLE_OWNERS}
+            WHERE lower(email) = lower($1) OR lower(identity) = lower($1)
+            ORDER BY workspace_id LIMIT $2""",
+            email,
+            int(limit),
+        )
+        return {r["workspace_id"]: r["owner"] for r in rows}
+
+    async def workspace_presence(self, workspace):
+        docs = False
+        if self.doc_status_ready and await self._has_table(TABLE_DOC_STATUS):
+            rows = await self._read(
+                f"SELECT EXISTS (SELECT 1 FROM {TABLE_DOC_STATUS} WHERE workspace = $1) AS e",
+                workspace,
+            )
+            docs = bool(rows and rows[0]["e"])
+        rows = await self._read(
+            f"""SELECT EXISTS (SELECT 1 FROM {TABLE_RUNS} WHERE workspace = $1) AS runs,
+                EXISTS (SELECT 1 FROM {TABLE_LOGS} WHERE workspace = $1) AS logs""",
+            workspace,
+        )
+        row = rows[0] if rows else {}
+        return {
+            "docs": docs,
+            "runs": bool(row.get("runs")),
+            "logs": bool(row.get("logs")),
+        }
+
 
 def _still_running(
     alive: Optional[Callable[[Any, Any], bool]], pid, create_time
@@ -2112,6 +2579,108 @@ def _uuid_hex(value: Any) -> str:
     """Worker IDs travel as 32 hex characters; asyncpg returns ``uuid.UUID``."""
     hex_value = getattr(value, "hex", None)
     return hex_value if isinstance(hex_value, str) else str(value).replace("-", "")
+
+
+def _epoch_dt(value: Any) -> datetime:
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    return datetime.fromtimestamp(float(value), timezone.utc)
+
+
+def _uuid_value(value: Any) -> Any:
+    """A UUID column value from 32 hex characters (None when not a UUID)."""
+    if value is None or value == "":
+        return None
+    try:
+        return uuid.UUID(str(value))
+    except (ValueError, AttributeError, TypeError):
+        return None
+
+
+def _log_record(r: dict[str, Any]) -> tuple:
+    """One COPY record in :data:`LOG_COLUMNS` order."""
+    return (
+        _epoch_dt(r["ts"]),
+        int(r.get("level") or 0),
+        pg_text(r.get("logger"), 128) or "-",
+        _uuid_value(r.get("worker_id")),
+        r.get("pid"),
+        pg_text(r.get("module"), 128),
+        r.get("lineno"),
+        pg_text(r.get("workspace"), 255),
+        pg_text(r.get("request_id"), 64),
+        pg_text(r.get("client_request_id"), 64),
+        _uuid_value(r.get("run_id")),
+        pg_text(r.get("track_id"), 255),
+        pg_text(r.get("doc_id"), 255),
+        pg_text(r.get("operation"), 64),
+        pg_text(r.get("source"), 32),
+        pg_text(r.get("msg"), 1 << 20) or "",
+        pg_text(r.get("exc_type"), 128),
+        pg_text(r.get("exc"), 1 << 20),
+        (r.get("fingerprint") or "0" * 16)[:16],
+        max(1, int(r.get("repeat_count") or 1)),
+    )
+
+
+def _log_conditions(f: LogFilter, args: list[Any]) -> list[str]:
+    """WHERE clauses of a log query; every value is a bound parameter except
+    the level, an integer inlined so the partial level index can match."""
+
+    def bind(value: Any, cast: str = "") -> str:
+        args.append(value)
+        return f"${len(args)}{cast}"
+
+    clauses = [f"ts >= {bind(f.start)}", f"ts < {bind(f.end)}"]
+    if f.level:
+        clauses.append(f"level >= {int(f.level)}")
+    if f.workspace is not None:
+        clauses.append(f"workspace = {bind(f.workspace)}")
+    for column in ("request_id", "track_id", "doc_id", "fingerprint"):
+        value = getattr(f, column)
+        if value is not None:
+            clauses.append(f"{column} = {bind(value)}")
+    for column in ("run_id", "worker_id"):
+        value = getattr(f, column)
+        if value is not None:
+            clauses.append(f"{column} = {bind(value, '::uuid')}")
+    if f.logger:
+        clauses.append(f"logger LIKE {bind(like_escape(f.logger) + '%')}")
+    if f.module:
+        name = bind(f.module)
+        clauses.append(f"(module = {name} OR logger = {name})")
+    if f.q:
+        clauses.append(f"msg ILIKE {bind('%' + like_escape(f.q) + '%')}")
+    return clauses
+
+
+def _later(a: Optional[datetime], b: Optional[datetime]) -> Optional[datetime]:
+    """The later of two optional moments."""
+    if a is None:
+        return b
+    return a if b is None or a >= b else b
+
+
+def _newest(items: Iterable[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
+    epoch = datetime.fromtimestamp(0, timezone.utc)
+    return sorted(items, key=lambda i: i.get("ts") or epoch, reverse=True)[:limit]
+
+
+def _audit_values(row: dict[str, Any]) -> tuple:
+    return (
+        pg_text(row.get("actor"), 255) or "-",
+        pg_text(row.get("auth_kind"), 16),
+        pg_text(row.get("impersonated_by"), 255),
+        pg_text(row.get("action"), 48) or "-",
+        pg_text(row.get("workspace"), 255),
+        pg_text(row.get("target"), 255),
+        json.dumps(row.get("params") or {}, default=str),
+        pg_text(row.get("reason"), 512),
+        pg_text(row.get("phase"), 8) or "result",
+        pg_text(row.get("outcome"), 24),
+        pg_text(row.get("request_id"), 64),
+        pg_text(row.get("client_ip_hash"), 16),
+    )
 
 
 async def _close_quietly(conn: Any) -> None:
@@ -2202,6 +2771,8 @@ class MemoryOpsStore(OpsStore):
         # Run tracking tables, and switches for the writer tests.
         self.run_rows: dict[str, dict[str, Any]] = {}
         self.failure_rows: list[dict[str, Any]] = []
+        self.log_rows: list[dict[str, Any]] = []
+        self._log_seq = 0
         self.fail_writes: Optional[BaseException] = None
         self.write_delay_s: float = 0.0
         self.ready = True
@@ -2719,6 +3290,7 @@ class MemoryOpsStore(OpsStore):
         self.failure_rows = [
             r for r in self.failure_rows if r["workspace"] != workspace
         ]
+        self.log_rows = [r for r in self.log_rows if r.get("workspace") != workspace]
         for alert in self.alert_rows:
             if (alert.get("scope") or {}).get("workspace") == workspace:
                 alert["title"] = alert["title"].replace(workspace, hashed)
@@ -3298,3 +3870,264 @@ class MemoryOpsStore(OpsStore):
         ]
         rows.sort(key=lambda r: r["ts"], reverse=True)
         return rows[:limit]
+
+    # -- audit ---------------------------------------------------------------------------
+    async def audit_write(self, row):
+        await self._write_gate()
+        values = _audit_values(row)
+        audit_id = max((int(a.get("id") or 0) for a in self.audit_rows), default=0) + 1
+        self.audit_rows.append(
+            {
+                "id": audit_id,
+                "ts": self._aware_now(),
+                **dict(
+                    zip(
+                        (
+                            "actor",
+                            "auth_kind",
+                            "impersonated_by",
+                            "action",
+                            "workspace",
+                            "target",
+                            "params",
+                            "reason",
+                            "phase",
+                            "outcome",
+                            "request_id",
+                            "client_ip_hash",
+                        ),
+                        values,
+                    )
+                ),
+            }
+        )
+        self.audit_rows[-1]["params"] = json.loads(self.audit_rows[-1]["params"])
+        return audit_id
+
+    # -- logs ----------------------------------------------------------------------------
+    async def logs_write(self, rows):
+        await self._write_gate()
+        records = [_log_record(r) for r in rows]
+        for record in records:
+            self._log_seq += 1
+            row = dict(zip(LOG_COLUMNS, record))
+            row["id"] = self._log_seq
+            for key in ("worker_id", "run_id"):
+                if row[key] is not None:
+                    row[key] = row[key].hex
+            self.log_rows.append(row)
+
+    @staticmethod
+    def _log_matches(row: dict[str, Any], f: LogFilter) -> bool:
+        if not (f.start <= row["ts"] < f.end) or row["level"] < (f.level or 0):
+            return False
+        for column in (
+            "workspace",
+            "request_id",
+            "track_id",
+            "doc_id",
+            "fingerprint",
+            "run_id",
+            "worker_id",
+        ):
+            wanted = getattr(f, column)
+            if wanted is not None and row.get(column) != wanted:
+                return False
+        if f.logger and not (row["logger"] or "").startswith(f.logger):
+            return False
+        if f.module and f.module not in (row.get("module"), row["logger"]):
+            return False
+        if f.q and f.q.lower() not in (row["msg"] or "").lower():
+            return False
+        return True
+
+    @staticmethod
+    def _log_out(row: dict[str, Any], with_exc: bool = False) -> dict[str, Any]:
+        out = {k: v for k, v in row.items() if k != "exc"}
+        out["has_exc"] = bool(row.get("exc"))
+        if with_exc:
+            out["exc"] = row.get("exc")
+        return out
+
+    async def logs_page(self, f, *, before, after, limit, with_exc=False):
+        self._check()
+        rows = [r for r in self.log_rows if self._log_matches(r, f)]
+        if after is not None:
+            rows = [r for r in rows if r["ts"] >= after]
+        rows.sort(key=lambda r: (r["ts"], r["id"]), reverse=True)
+        if before is not None:
+            rows = [r for r in rows if (r["ts"], r["id"]) < tuple(before)]
+        return [self._log_out(r, with_exc=with_exc) for r in rows[:limit]]
+
+    async def logs_groups(self, f, limit):
+        self._check()
+        groups: dict[str, dict[str, Any]] = {}
+        for row in sorted(self.log_rows, key=lambda r: (r["ts"], r["id"])):
+            if not self._log_matches(row, f):
+                continue
+            g = groups.setdefault(
+                row["fingerprint"],
+                {
+                    "fingerprint": row["fingerprint"],
+                    "rows": 0,
+                    "count": 0,
+                    "first_seen": row["ts"],
+                    "_workspaces": set(),
+                    "level": row["level"],
+                },
+            )
+            g["rows"] += 1
+            g["count"] += int(row["repeat_count"])
+            g["last_seen"] = row["ts"]
+            g["level"] = max(g["level"], row["level"])
+            g["_workspaces"].add(row.get("workspace"))
+            g.update(
+                sample_id=row["id"],
+                logger=row["logger"],
+                module=row.get("module"),
+                lineno=row.get("lineno"),
+                exc_type=row.get("exc_type"),
+                sample=row["msg"],
+            )
+        out = []
+        for g in groups.values():
+            workspaces = g.pop("_workspaces")
+            g["workspaces"] = len({w for w in workspaces if w is not None})
+            out.append(g)
+        out.sort(key=lambda g: (g["count"], g["last_seen"]), reverse=True)
+        return out[:limit]
+
+    async def log_get(self, log_id):
+        self._check()
+        for row in self.log_rows:
+            if row["id"] == int(log_id):
+                return self._log_out(row, with_exc=True)
+        return None
+
+    async def logs_count(self, f, cap):
+        self._check()
+        return min(cap + 1, sum(1 for r in self.log_rows if self._log_matches(r, f)))
+
+    async def logs_cleanup(self, days):
+        cutoff = self._aware_now() - timedelta(days=days)
+        before = len(self.log_rows)
+        self.log_rows = [r for r in self.log_rows if r["ts"] >= cutoff]
+        return before - len(self.log_rows)
+
+    async def logs_redaction_audit(self, days):
+        self._check()
+        cutoff = self._aware_now() - timedelta(days=days)
+        compiled = {
+            name: re.compile(pattern, re.IGNORECASE if insensitive else 0)
+            for name, (pattern, insensitive) in LOG_AUDIT_PATTERNS.items()
+        }
+        counts = {"rows": 0, **{name: 0 for name in compiled}}
+        for row in self.log_rows:
+            if row["ts"] < cutoff:
+                continue
+            counts["rows"] += 1
+            text = f"{row['msg']} {row.get('exc') or ''}"
+            for name, pattern in compiled.items():
+                if pattern.search(text):
+                    counts[name] += 1
+        return counts
+
+    # -- correlation ---------------------------------------------------------------------
+    async def correlate_requests(self, request_id, limit):
+        self._check()
+        found: dict[Any, dict[str, Any]] = {}
+        for row in self.log_rows:
+            if row.get("request_id") != request_id:
+                continue
+            item = found.setdefault(
+                row.get("workspace"),
+                {
+                    "workspace": row.get("workspace"),
+                    "n": 0,
+                    "first_ts": row["ts"],
+                    "last_ts": row["ts"],
+                },
+            )
+            item["n"] += 1
+            item["first_ts"] = min(item["first_ts"], row["ts"])
+            item["last_ts"] = max(item["last_ts"], row["ts"])
+        return sorted(found.values(), key=lambda i: i["last_ts"], reverse=True)[:limit]
+
+    async def correlate_tracks(self, track_id, limit):
+        self._check()
+        found: dict[Any, dict[str, Any]] = {}
+
+        def item(workspace: Any) -> dict[str, Any]:
+            return found.setdefault(
+                workspace,
+                {"workspace": workspace, "docs": 0, "log_lines": 0, "ts": None},
+            )
+
+        for row in self.doc_rows:
+            if row.get("track_id") == track_id:
+                entry = item(row["workspace"])
+                entry["docs"] += 1
+                entry["ts"] = _later(entry["ts"], as_utc(row.get("updated_at")))
+        for row in self.log_rows:
+            if row.get("track_id") == track_id:
+                entry = item(row.get("workspace"))
+                entry["log_lines"] += 1
+                entry["ts"] = _later(entry["ts"], row["ts"])
+        return _newest(found.values(), limit)
+
+    async def correlate_docs(self, doc_id, limit):
+        self._check()
+        found: dict[Any, dict[str, Any]] = {}
+
+        def item(workspace: Any) -> dict[str, Any]:
+            return found.setdefault(
+                workspace,
+                {
+                    "workspace": workspace,
+                    "doc_id": doc_id,
+                    "status": None,
+                    "file_path": None,
+                    "failures": 0,
+                    "log_lines": 0,
+                    "ts": None,
+                },
+            )
+
+        for row in self.doc_rows:
+            if row["id"] == doc_id:
+                entry = item(row["workspace"])
+                entry["status"] = row["status"]
+                entry["file_path"] = row.get("file_path")
+                entry["ts"] = as_utc(row.get("updated_at"))
+        for row in self.failure_rows:
+            if row["doc_id"] == doc_id:
+                entry = item(row["workspace"])
+                entry["failures"] += 1
+                entry["ts"] = _later(entry["ts"], row["ts"])
+        for row in self.log_rows:
+            if row.get("doc_id") == doc_id:
+                entry = item(row.get("workspace"))
+                entry["log_lines"] += 1
+                entry["ts"] = _later(entry["ts"], row["ts"])
+        return _newest(found.values(), limit)
+
+    async def owners_by_email(self, email, limit):
+        self._check()
+        wanted = email.lower()
+        return (
+            {
+                ws: owner
+                for ws, owner in sorted(self.owner_rows.items())
+                if (owner or "").lower() == wanted
+            }
+            if wanted
+            else {}
+        )
+
+    async def workspace_presence(self, workspace):
+        self._check()
+        return {
+            "docs": any(r["workspace"] == workspace for r in self.doc_rows),
+            "runs": any(r["workspace"] == workspace for r in self.run_rows.values()),
+            "logs": any(r.get("workspace") == workspace for r in self.log_rows),
+        }

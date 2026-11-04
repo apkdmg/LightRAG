@@ -1,7 +1,8 @@
 import { useTranslation } from 'react-i18next'
 import { Kv } from '@/features/TokenInsights/ui'
-import { opsApi } from '../api'
+import { LogEntry, opsApi } from '../api'
 import ErrorPanel from '../components/ErrorPanel'
+import LogSection from '../components/LogSection'
 import { StaleChip } from '../components/Panel'
 import Skeleton from '../components/Skeleton'
 import StageTimeline from '../components/StageTimeline'
@@ -9,10 +10,20 @@ import { StatusChip } from '../components/StatusChip'
 import { useOpsNav, useOpsShell } from '../context'
 import { fmtClock, fmtCount, fmtLatency, shortId, utcTitle } from '../format'
 import { useStale } from '../hooks'
+import { normalizeLogEntry } from '../logsNormalize'
 import { useOpsPoll } from '../poll'
 import { docStatusState } from '../severity'
 import { ErrorKindText } from './RunDrawer'
 import Section from './Section'
+
+/** The doc's log lines when the server sent them with the drawer (§3.7 `logs{count,first[≤50]}`); null otherwise. */
+function drawerLogs(raw: unknown): { count: number | null; rows: LogEntry[] } | null {
+  if (!raw || typeof raw !== 'object') return null
+  const o = raw as { available?: unknown; count?: unknown; first?: unknown }
+  if (o.available === false || !Array.isArray(o.first)) return null
+  const rows = o.first.map(normalizeLogEntry).filter((e): e is LogEntry => e !== null)
+  return { count: typeof o.count === 'number' ? o.count : null, rows }
+}
 
 const DETAIL_SECONDS = 15
 
@@ -21,7 +32,9 @@ const DETAIL_SECONDS = 15
  * number of a failed doc), the stage timeline from the doc-status metadata
  * timings, the current classified failure (stage, kind, model, the run that
  * hit it), the redacted error, the failure history across attempts and up
- * to 50 LLM calls for this doc. Runs open the Run drawer on the breadcrumb.
+ * to 50 LLM calls for this doc, and its WARNING+ log lines (from the
+ * drawer's own answer when the server includes them, else one doc_id
+ * query). Runs open the Run drawer on the breadcrumb.
  * The file name stays masked; revealing it is an audited action of a later
  * release.
  */
@@ -36,6 +49,7 @@ export default function DocumentDrawer({ workspace, docId }: { workspace: string
   const calls = data?.calls ?? []
   const failures = data?.failures ?? []
   const failure = doc?.failure ?? null
+  const logs = drawerLogs(data?.logs)
   const openRun = (runId: string) => nav.openDrawer({ kind: 'run', id: runId }, { push: true })
   const inStack = nav.stack.some((d) => d.kind === 'workspace' && d.id === workspace)
   return (
@@ -216,6 +230,11 @@ export default function DocumentDrawer({ workspace, docId }: { workspace: string
             )}
             <p className="text-muted-foreground m-0 text-xs">{t('operations.document.callsNote')}</p>
           </Section>
+          <LogSection
+            title={typeof logs?.count === 'number' ? t('operations.document.logsCount', { count: logs.count }) : t('operations.document.logs')}
+            filter={{ doc_id: docId, window: '7d' }}
+            preloaded={logs?.rows}
+          />
         </div>
       ) : null}
       <p className="text-muted-foreground m-0 pb-2 text-xs">{t('operations.maskNote')}</p>

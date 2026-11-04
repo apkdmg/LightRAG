@@ -18,6 +18,7 @@ function DrawerLabel({ drawer }: { drawer: Drawer }) {
   if (drawer.kind === 'run') return <>{t('operations.drawer.runTitle', { id: shortId(drawer.id, 8) })}</>
   if (drawer.kind === 'dependency') return <>{t('operations.drawer.dependencyTitle', { name: t(`operations.dep.${drawer.id}`, { defaultValue: drawer.id }) })}</>
   if (drawer.kind === 'worker') return <>{t('operations.drawer.workerTitle', { id: shortId(drawer.id, 8) })}</>
+  if (drawer.kind === 'log') return <>{t('operations.drawer.logTitle', { id: shortId(drawer.id, 12) })}</>
   return <>{t(`operations.drawer.kind.${drawer.kind}`)}</>
 }
 

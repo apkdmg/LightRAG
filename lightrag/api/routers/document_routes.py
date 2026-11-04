@@ -46,7 +46,7 @@ from lightrag.utils import (
 )
 from lightrag.api.ops import runs as ops_runs
 from lightrag.api.ops.context import bind_log_workspace
-from lightrag.api.ops.redact import mask_path
+from lightrag.api.ops.redact import mask_path, mask_pipeline_paths
 from lightrag.api.utils_api import get_combined_auth_dependency
 from ..config import global_args
 
@@ -2580,7 +2580,13 @@ async def background_delete_documents(
                                 )
                             )
                             for file_delete_error in file_delete_errors:
-                                logger.warning(file_delete_error)
+                                # The owner's feed keeps the name; the log
+                                # masks it whole (any extension, spaces).
+                                logger.warning(
+                                    mask_pipeline_paths(
+                                        file_delete_error, (result.file_path,)
+                                    )
+                                )
                                 async with pipeline_status_lock:
                                     pipeline_status["latest_message"] = (
                                         file_delete_error
@@ -2605,7 +2611,10 @@ async def background_delete_documents(
                                     "File deletion skipped, missing or unsafe file: "
                                     f"{result.file_path}"
                                 )
-                                logger.warning(file_error_msg)
+                                logger.warning(
+                                    "File deletion skipped, missing or unsafe file: "
+                                    f"{doc_id} ({mask_path(result.file_path)})"
+                                )
                                 async with pipeline_status_lock:
                                     pipeline_status["latest_message"] = file_error_msg
                                     pipeline_status["history_messages"].append(
@@ -2614,7 +2623,12 @@ async def background_delete_documents(
 
                         except Exception as file_error:
                             file_error_msg = f"Failed to delete file {result.file_path}: {str(file_error)}"
-                            logger.error(file_error_msg)
+                            logger.error(
+                                f"Failed to delete file {mask_path(result.file_path)}: "
+                                + mask_pipeline_paths(
+                                    str(file_error), (result.file_path,)
+                                )
+                            )
                             async with pipeline_status_lock:
                                 pipeline_status["latest_message"] = file_error_msg
                                 pipeline_status["history_messages"].append(
@@ -2632,7 +2646,11 @@ async def background_delete_documents(
                     failed_deletions.append(doc_id)
                     ops_runs.progress(run_id, failed=1, stage="delete")
                     error_msg = f"Failed to delete {i}/{total_docs}: {doc_id}[{file_path}] - {result.message}"
-                    logger.error(error_msg)
+                    logger.error(
+                        f"Failed to delete {i}/{total_docs}: "
+                        f"{doc_id}[{mask_path(file_path)}] - "
+                        + mask_pipeline_paths(str(result.message), (file_path,))
+                    )
                     async with pipeline_status_lock:
                         pipeline_status["latest_message"] = error_msg
                         pipeline_status["history_messages"].append(error_msg)
@@ -2641,7 +2659,11 @@ async def background_delete_documents(
                 failed_deletions.append(doc_id)
                 ops_runs.progress(run_id, failed=1, stage="delete")
                 error_msg = f"Error deleting document {i}/{total_docs}: {doc_id}[{file_path}] - {str(e)}"
-                logger.error(error_msg)
+                logger.error(
+                    f"Error deleting document {i}/{total_docs}: "
+                    f"{doc_id}[{mask_path(file_path)}] - "
+                    + mask_pipeline_paths(str(e), (file_path,))
+                )
                 logger.error(traceback.format_exc())
                 async with pipeline_status_lock:
                     pipeline_status["latest_message"] = error_msg

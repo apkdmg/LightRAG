@@ -3,6 +3,7 @@ import StatusCard from '@/components/status/StatusCard'
 import { Kv } from '@/features/TokenInsights/ui'
 import { OpsWorker, WorkerSample, opsApi } from '../api'
 import ErrorPanel from '../components/ErrorPanel'
+import LogSection from '../components/LogSection'
 import { StaleChip } from '../components/Panel'
 import Skeleton from '../components/Skeleton'
 import Sparkline from '../components/Sparkline'
@@ -200,6 +201,7 @@ export default function WorkerDrawer({ workerId }: { workerId: string }) {
         </div>
       ) : null}
       {w ? <History workerId={workerId} /> : null}
+      {w ? <LogSection title={t('operations.workerDrawer.logs')} filter={{ worker_id: workerId, window: '24h' }} pid={typeof w.pid === 'number' ? w.pid : null} /> : null}
       {w ? <ConfigAndQueues worker={w} /> : null}
       <p className="text-muted-foreground m-0 pb-2 text-xs">{t('operations.workerDrawer.privacy')}</p>
     </>

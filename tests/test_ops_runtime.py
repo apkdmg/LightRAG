@@ -129,7 +129,12 @@ async def test_postgres_starts_builder_and_scan_loop(monkeypatch, tmp_path):
         await asyncio.sleep(0)
         assert rt.index_outcome == {"idx": "valid"}
         loops = {loop.name: loop for loop in rt.loops}
-        assert set(loops) == {"ops:scan", "ops:probes", "ops:reconcile"}
+        assert set(loops) == {
+            "ops:scan",
+            "ops:probes",
+            "ops:reconcile",
+            "ops:log-retention",
+        }
         assert all(loop.holder == rt.worker_id for loop in loops.values())
         assert all(loop.store is rt.store for loop in loops.values())
         assert rt.heartbeat is not None and rt.heartbeat.store is rt.store
@@ -155,7 +160,7 @@ async def test_flags_turn_off_builder_and_scan(monkeypatch, tmp_path):
     app = _app(email_resync_queue=SimpleNamespace(base_dir=tmp_path))
     rt = await runtime.start_ops(app, None, SimpleNamespace(kv_storage="PGKVStorage"))
     assert rt.index_task is None
-    assert [loop.name for loop in rt.loops] == ["ops:reconcile"]
+    assert [loop.name for loop in rt.loops] == ["ops:reconcile", "ops:log-retention"]
     assert rt.probes is None and rt.service.probes is None
     await runtime.stop_ops(app)
 

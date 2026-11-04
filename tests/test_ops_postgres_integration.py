@@ -55,15 +55,20 @@ from lightrag.api.ops import indexes  # noqa: E402
 from lightrag.api.ops.service import OpsService  # noqa: E402
 from lightrag.api.ops.snapshot import NamespaceReader  # noqa: E402
 from lightrag.api.ops.store import (  # noqa: E402
+    LOG_COLUMNS,
+    LogFilter,
     MemoryOpsStore,
     Page,
     PostgresOpsStore,
+    _log_record,
     deleted_key,
     workspace_hash,
 )
 
 WORKSPACES = int(os.getenv("OPS_IT_WORKSPACES", "3000"))
 DOCS_PER_WS = int(os.getenv("OPS_IT_DOCS_PER_WS", "300"))
+# §3.11: the log budget is measured on 3M rows (14 days at release scale).
+LOG_ROWS = int(os.getenv("OPS_IT_LOG_ROWS", "3000000"))
 BUDGET_SLACK = 3.0
 COLUMNS = [
     "workspace",
@@ -181,6 +186,7 @@ async def _reset(store: PostgresOpsStore) -> None:
         await conn.execute("TRUNCATE lightrag_ops_probes")
         await conn.execute("TRUNCATE lightrag_ops_runs")
         await conn.execute("TRUNCATE lightrag_ops_doc_failures")
+        await conn.execute("TRUNCATE lightrag_ops_logs")
 
 
 # -- small dataset: Postgres and the memory store must agree ---------------------
@@ -954,3 +960,325 @@ async def _overview_cold(service: OpsService, workers: dict) -> None:
     # Every query runs: what the first viewer after a cache expiry waits for.
     service.cache.clear()
     await service.overview(workers)
+
+
+# -- logs ------------------------------------------------------------------------------
+
+
+def _log_rows(count: int, rng: random.Random, now: float):
+    """``count`` log rows over 13.5 days: 3000 workspaces, 500 call sites,
+    10 % ERROR, a request ID on a third, run and document IDs on some."""
+    for i in range(count):
+        ts = now - rng.random() * 13.5 * 86400
+        ws = f"user{rng.randrange(WORKSPACES):04d}_unimas_my" if i % 10 else None
+        yield {
+            "ts": ts,
+            "level": 40 if i % 10 == 0 else 30,
+            "logger": "lightrag",
+            "worker_id": "0123456789abcdef0123456789abcdef",
+            "pid": 7,
+            "module": "pipeline",
+            "lineno": 100 + i % 500,
+            "workspace": ws,
+            "request_id": f"{rng.getrandbits(128):032x}" if i % 3 == 0 else None,
+            "run_id": f"{rng.getrandbits(128):032x}" if i % 7 == 0 else None,
+            "track_id": f"upload_20261103_101010_{i:08x}" if i % 11 == 0 else None,
+            "doc_id": f"doc-{rng.getrandbits(128):032x}" if i % 5 == 0 else None,
+            "msg": f"Extraction failed for chunk {i}: RateLimitError <redacted>",
+            "fingerprint": f"{i % 500:016x}",
+            "repeat_count": 1,
+        }
+
+
+async def test_logs_keyset_plans_and_queries(pg):
+    await _reset(pg)
+    rng = random.Random(7)
+    now = time.time()
+    started = time.perf_counter()
+    async with pg.dedicated_connection() as conn:
+        batch = []
+        for row in _log_rows(LOG_ROWS, rng, now):
+            batch.append(_log_record(row))
+            if len(batch) >= 50_000:
+                await conn.copy_records_to_table(
+                    "lightrag_ops_logs", records=batch, columns=list(LOG_COLUMNS)
+                )
+                batch = []
+        if batch:
+            await conn.copy_records_to_table(
+                "lightrag_ops_logs", records=batch, columns=list(LOG_COLUMNS)
+            )
+    seed_s = time.perf_counter() - started
+    # 150 rows sharing one timestamp in one workspace, written through the
+    # sink's own path (COPY on the pool), plus rows past the retention.
+    same = now - 120
+    await pg.logs_write(
+        [
+            {
+                "ts": same,
+                "level": 40,
+                "logger": "lightrag",
+                "workspace": "user0042_unimas_my",
+                "msg": f"same moment {i}",
+                "fingerprint": "a" * 16,
+            }
+            for i in range(150)
+        ]
+        + [
+            {
+                "ts": now - 20 * 86400,
+                "level": 30,
+                "logger": "lightrag",
+                "msg": "expired",
+                "fingerprint": "b" * 16,
+            }
+            for _ in range(5)
+        ]
+    )
+    async with pg.dedicated_connection() as conn:
+        await conn.execute("VACUUM ANALYZE lightrag_ops_logs")
+        total = await conn.fetchval("SELECT count(*) FROM lightrag_ops_logs")
+        sample = await conn.fetchrow(
+            """SELECT request_id, run_id, doc_id, track_id, workspace FROM lightrag_ops_logs
+            WHERE request_id IS NOT NULL AND run_id IS NOT NULL AND doc_id IS NOT NULL
+              AND track_id IS NOT NULL AND workspace IS NOT NULL LIMIT 1"""
+        )
+    assert total == LOG_ROWS + 155
+    assert sample is not None
+
+    end = datetime.now(timezone.utc) + timedelta(minutes=2)
+    day = end - timedelta(days=1, minutes=2)
+    hour = end - timedelta(hours=1, minutes=2)
+    week = end - timedelta(days=7)
+    run_id = sample["run_id"].hex
+    capture = _Capture(pg)
+    cursor = (datetime.now(timezone.utc) - timedelta(minutes=30), 10**12)
+    queries = [
+        LogFilter(start=hour, end=end),
+        LogFilter(start=day, end=end, level=40),
+        LogFilter(start=day, end=end, workspace="user0042_unimas_my"),
+        LogFilter(start=week, end=end, request_id=sample["request_id"]),
+        LogFilter(start=week, end=end, run_id=run_id),
+        LogFilter(start=week, end=end, doc_id=sample["doc_id"]),
+        LogFilter(start=week, end=end, track_id=sample["track_id"]),
+        LogFilter(start=day, end=end, fingerprint="0" * 15 + "7"),
+        LogFilter(start=day, end=end, q="chunk 12345"),
+    ]
+    for f in queries:
+        await capture.logs_page(f, before=None, after=None, limit=101)
+        await capture.logs_page(f, before=cursor, after=None, limit=101)
+        await capture.logs_count(f, 10000)
+    await capture.logs_page(
+        LogFilter(start=hour, end=end),
+        before=None,
+        after=datetime.now(timezone.utc) - timedelta(seconds=15),
+        limit=501,
+    )
+    await capture.logs_groups(LogFilter(start=hour, end=end), 100)
+    await capture.correlate_requests(sample["request_id"], 10)
+    await capture.correlate_docs(sample["doc_id"], 10)
+    await capture.correlate_tracks(sample["track_id"], 10)
+    async with pg.dedicated_connection() as conn:
+        for sql, args in capture.statements:
+            if "lightrag_ops_logs" not in sql.lower():
+                continue
+            for generic in (False, True):
+                scans = await _explain(conn, sql, args, generic)
+                assert "lightrag_ops_logs" not in [s.lower() for s in scans], (
+                    " ".join(sql.split())[:160],
+                    generic,
+                    scans,
+                )
+
+    # Keyset paging over equal timestamps: every row once, in (ts, id) order.
+    f = LogFilter(start=hour, end=end, workspace="user0042_unimas_my", level=40)
+    seen, before = [], None
+    while True:
+        rows = await pg.logs_page(f, before=before, after=None, limit=40)
+        seen.extend((r["ts"], r["id"]) for r in rows)
+        if len(rows) < 40:
+            break
+        before = (rows[-1]["ts"], rows[-1]["id"])
+    ids = [i for _, i in seen]
+    assert len(ids) == len(set(ids)) and len(ids) >= 150
+    assert seen == sorted(seen, reverse=True)
+    # Follow: rows at or after a time, newest first.
+    follow = await pg.logs_page(
+        LogFilter(start=hour, end=end), before=None, after=same_dt(same), limit=500
+    )
+    assert follow and all(r["ts"] >= same_dt(same) for r in follow)
+
+    measured = {
+        "logs workspace+24h+level": await _median_ms(
+            lambda: pg.logs_page(
+                LogFilter(start=day, end=end, workspace="user0042_unimas_my", level=30),
+                before=None,
+                after=None,
+                limit=101,
+            )
+        ),
+        "logs 1h head": await _median_ms(
+            lambda: pg.logs_page(
+                LogFilter(start=hour, end=end), before=None, after=None, limit=101
+            )
+        ),
+        "logs groups 1h": await _median_ms(
+            lambda: pg.logs_groups(LogFilter(start=hour, end=end), 100)
+        ),
+        "correlate request": await _median_ms(
+            lambda: pg.correlate_requests(sample["request_id"], 10)
+        ),
+    }
+    print(
+        f"\n[ops-it] log_rows={total} seed={seed_s:.1f}s "
+        + ", ".join(f"{k}={v:.1f}ms" for k, v in measured.items()),
+        file=sys.stderr,
+    )
+    # US-6: under 1 s for workspace + 24 h + level, no slack.
+    assert measured["logs workspace+24h+level"] < 1000
+    assert measured["correlate request"] < 500 * BUDGET_SLACK
+
+    # Entry, counts, groups and correlation agree with the rows.
+    entry = await pg.log_get(ids[0])
+    assert entry["id"] == ids[0] and entry["run_id"] is None
+    retained = end - timedelta(days=15)
+    assert (
+        await pg.logs_count(LogFilter(start=retained, end=end, run_id=run_id), 10) == 1
+    )
+    groups = await pg.logs_groups(
+        LogFilter(start=hour, end=end, workspace="user0042_unimas_my"), 10
+    )
+    assert groups[0]["fingerprint"] == "a" * 16 and groups[0]["count"] >= 150
+    found = await pg.correlate_requests(sample["request_id"], 10)
+    assert found and found[0]["n"] >= 1
+    docs = await pg.correlate_docs(sample["doc_id"], 10)
+    assert [d["workspace"] for d in docs] == [sample["workspace"]]
+    tracks = await pg.correlate_tracks(sample["track_id"], 10)
+    assert [(t["workspace"], t["log_lines"]) for t in tracks] == [
+        (sample["workspace"], 1)
+    ]
+    presence = await pg.workspace_presence("user0042_unimas_my")
+    assert presence["logs"] is True and presence["runs"] is False
+    async with pg.dedicated_connection() as conn:
+        await conn.execute(
+            """INSERT INTO lightrag_workspace_owners
+               (workspace_id, identity, email, created_at, last_login_at)
+               VALUES ('user0042_unimas_my', 'sso:42', 'User.42@unimas.my', 0, 0)"""
+        )
+    assert await pg.owners_by_email("user.42@UNIMAS.my", 10) == {
+        "user0042_unimas_my": "User.42@unimas.my"
+    }
+
+    # Audit rows, the redaction audit and retention.
+    audit_id = await pg.audit_write(
+        {"actor": "root", "action": "log_export", "phase": "intent", "params": {"x": 1}}
+    )
+    assert audit_id > 0
+    clean = await pg.logs_redaction_audit(7)
+    assert {k: v for k, v in clean.items() if k != "rows" and v} == {}
+    await pg.logs_write(
+        [
+            {
+                "ts": now - 10,
+                "level": 40,
+                "logger": "lightrag",
+                "msg": "leak eve@unimas.my IC 900101-13-5678 Laporan.pdf",
+                "fingerprint": "c" * 16,
+            }
+        ]
+    )
+    dirty = await pg.logs_redaction_audit(7)
+    assert dirty["email"] == 1 and dirty["ic_number"] == 1
+    assert dirty["file_name"] == 1
+    # A masked name in the row no longer hides an unmasked one; masked
+    # names alone are clean.
+    await pg.logs_write(
+        [
+            {
+                "ts": now - 9,
+                "level": 40,
+                "logger": "lightrag",
+                "msg": "Lap\u2022\u2022\u2022an.pdf next to Senarai Gaji.docx",
+                "fingerprint": "c" * 16,
+            },
+            {
+                "ts": now - 8,
+                "level": 40,
+                "logger": "lightrag",
+                "msg": "Lap\u2022\u2022\u2022an.pdf and Sen\u2022\u2022\u2022.docx",
+                "fingerprint": "c" * 16,
+            },
+        ]
+    )
+    assert (await pg.logs_redaction_audit(7))["file_name"] == 2
+    assert await pg.logs_cleanup(14) == 5
+    # Workspace deletion removes the workspace's lines.
+    await pg.forget_workspace("user0042_unimas_my")
+    async with pg.dedicated_connection() as conn:
+        left = await conn.fetchval(
+            "SELECT count(*) FROM lightrag_ops_logs WHERE workspace = $1",
+            "user0042_unimas_my",
+        )
+    assert left == 0
+
+
+async def test_log_follow_sees_late_commits_from_another_connection(pg):
+    """FR-22: a row committed late by another worker (or a retried batch)
+    with an older timestamp is still returned by the next follow query
+    (after_ts = newest - 10 s), so the overlap skips nothing."""
+    await _reset(pg)
+    base = time.time()
+    ws = "follow_ws"
+    f = LogFilter(
+        start=datetime.now(timezone.utc) - timedelta(hours=1),
+        end=datetime.now(timezone.utc) + timedelta(minutes=2),
+        workspace=ws,
+    )
+
+    def record(ts: float, msg: str):
+        return _log_record(
+            {
+                "ts": ts,
+                "level": 30,
+                "logger": "lightrag",
+                "workspace": ws,
+                "msg": msg,
+                "fingerprint": "f" * 16,
+            }
+        )
+
+    async with pg.dedicated_connection() as late, pg.dedicated_connection() as early:
+        tx = late.transaction()
+        await tx.start()
+        try:
+            # B (older ts) is written first but commits last.
+            await late.copy_records_to_table(
+                "lightrag_ops_logs",
+                records=[record(base - 5, "B late")],
+                columns=list(LOG_COLUMNS),
+            )
+            await early.copy_records_to_table(
+                "lightrag_ops_logs",
+                records=[record(base, "A early")],
+                columns=list(LOG_COLUMNS),
+            )
+            first = await pg.logs_page(
+                f, before=None, after=same_dt(base - 60), limit=500
+            )
+            assert [r["msg"] for r in first] == ["A early"]
+            newest = max(r["ts"] for r in first)
+        except BaseException:
+            await tx.rollback()
+            raise
+        await tx.commit()
+    follow = await pg.logs_page(
+        f, before=None, after=newest - timedelta(seconds=10), limit=500
+    )
+    assert sorted(r["msg"] for r in follow) == ["A early", "B late"]
+    # De-duplicated by id the way the WebUI merges, nothing is shown twice.
+    ids = [r["id"] for r in first] + [r["id"] for r in follow]
+    assert len(set(ids)) == 2
+
+
+def same_dt(epoch: float) -> datetime:
+    return datetime.fromtimestamp(epoch, timezone.utc)

@@ -20,6 +20,7 @@ from tests.ops_fixtures import (
     build_app,
     ops_routes,
     seed_health,
+    seed_logs,
     seed_runs,
     seeded_store,
     shared_state,
@@ -60,7 +61,8 @@ def guarded(monkeypatch):
 
 # Routes that need a parameter to name something.
 _PARAMS = {
-    "/admin/ops/processing/failures/docs": {"key": "fsktm", "group": "workspace"}
+    "/admin/ops/processing/failures/docs": {"key": "fsktm", "group": "workspace"},
+    "/admin/ops/correlate": {"id": "fsktm"},
 }
 
 
@@ -71,6 +73,7 @@ def _concrete(path: str) -> str:
         .replace("{dep}", "postgres")
         .replace("{worker_id}", WORKER_ID)
         .replace("{run_id}", RUN_ID)
+        .replace("{log_id}", "1")
     )
 
 
@@ -87,6 +90,8 @@ def test_every_get_answers_without_instantiating(guarded, tracking):
     seed_health(app, store)
     # Durable runs and failures, read by the same routes with tracking on.
     seed_runs(store)
+    # Stored log lines, read by the Logs routes and the drawers' log sections.
+    seed_logs(store)
     app.state.ops.service.run_tracking = tracking
     client = TestClient(app, raise_server_exceptions=True)
     gets = [r for r in ops_routes.router.routes if "GET" in r.methods]

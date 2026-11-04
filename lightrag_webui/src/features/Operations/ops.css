@@ -4,7 +4,8 @@
  * icon and a label; the *-fg tokens keep text at >= 4.5:1 on their soft fill
  * in both themes.
  */
-.ops-root {
+.ops-root,
+.ops-portal {
   --ops-ok: #2f8a4d;
   --ops-ok-soft: #e3f2e7;
   --ops-warn: #a86a00;
@@ -36,7 +37,8 @@
   --ops-ease-loop: ease-in-out;
   --ops-ease-flow: linear;
 }
-.dark .ops-root {
+.dark .ops-root,
+.dark .ops-portal {
   --ops-ok: #5fc27e;
   --ops-ok-soft: #173022;
   --ops-warn: #e2a93b;
@@ -328,6 +330,67 @@
 .ops-topo.is-mon .ops-te-data,
 .ops-topo.is-mon .ops-te-bypass,
 .ops-topo.is-mon .ops-te-lab:not(.is-mon) { opacity: 0.25; }
+
+/*
+ * Logs (§2.5, §2.12 "Follow-mode log rows"). Rows never move: no FLIP, no
+ * layout animation, no will-change. A row from the latest follow batch fades
+ * in over 150 ms and keeps a static 2 px marker until the next batch; under
+ * reduced motion the fade is removed and the marker stays. The list scrolls
+ * in its own box with overflow-anchor off, because the page corrects the
+ * scroll position itself (Safari has no overflow-anchor).
+ */
+.ops-log-scroll { max-height: min(70vh, 880px); overflow-anchor: none; }
+.ops-log-row { position: relative; border-bottom: 1px solid var(--border); }
+.ops-log-row:last-child { border-bottom: 0; }
+.ops-log-row[data-new]::before {
+  content: "";
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 2px;
+  background: var(--ops-info);
+  pointer-events: none;
+}
+.ops-log-enter { animation: ops-fade-in var(--ops-dur-fast) var(--ops-ease-out); }
+.ops-log-main,
+.ops-log-head {
+  display: grid;
+  grid-template-columns: 92px 84px 44px minmax(0, 130px) minmax(0, 110px) minmax(0, 1fr);
+  gap: 0 10px;
+  align-items: baseline;
+  padding: 6px 10px;
+}
+.ops-log-main { color: inherit; text-decoration: none; }
+.ops-log-main:hover { background: var(--muted); }
+.ops-log-main:focus-visible { outline: 2px solid var(--ring); outline-offset: -2px; }
+.ops-log-main-nows { grid-template-columns: 92px 84px 44px minmax(0, 130px) minmax(0, 1fr); }
+/* In a drawer and on narrow screens a row is a three-line card. */
+.ops-log-compact .ops-log-main,
+.ops-log-compact .ops-log-main-nows {
+  grid-template-columns: auto auto minmax(0, 1fr);
+  grid-template-areas: "time level src" "msg msg msg";
+  gap: 2px 8px;
+}
+.ops-log-compact .ops-log-time { grid-area: time; }
+.ops-log-compact .ops-log-level { grid-area: level; }
+.ops-log-compact .ops-log-src { grid-area: src; }
+.ops-log-compact .ops-log-msg { grid-area: msg; }
+.ops-log-compact .ops-log-pid,
+.ops-log-compact .ops-log-ws { display: none; }
+@media (max-width: 767px) {
+  .ops-log-head { display: none; }
+  .ops-log-main,
+  .ops-log-main-nows {
+    grid-template-columns: auto auto minmax(0, 1fr);
+    grid-template-areas: "time level src" "ws ws pid" "msg msg msg";
+    gap: 2px 8px;
+  }
+  .ops-log-time { grid-area: time; }
+  .ops-log-level { grid-area: level; }
+  .ops-log-src { grid-area: src; }
+  .ops-log-ws { grid-area: ws; }
+  .ops-log-pid { grid-area: pid; justify-self: end; }
+  .ops-log-msg { grid-area: msg; }
+}
 
 /* "⏸ auto" and stale panels stop every loop. */
 .ops-root[data-paused] .ops-loop,
