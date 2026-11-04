@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { RefObject, useEffect, useState } from 'react'
 import { useDocumentHidden } from './poll'
 import { isStale } from './severity'
 
@@ -39,4 +39,21 @@ export function useStale(updatedAt: number | null, freshnessSeconds: number): { 
     }
   }, [updatedAt, freshnessSeconds, stale])
   return { stale, ageSeconds: updatedAt === null ? null : Math.max(0, (now - updatedAt) / 1000) }
+}
+
+/**
+ * Whether at least `threshold` of the element is inside the viewport. Without
+ * IntersectionObserver (server rendering, tests) it reports true, so a
+ * missing API never hides live state; the first observer callback corrects it.
+ */
+export function useInView<T extends Element>(ref: RefObject<T | null>, threshold = 0.5): boolean {
+  const [inView, setInView] = useState(true)
+  useEffect(() => {
+    const el = ref.current
+    if (!el || typeof IntersectionObserver === 'undefined') return
+    const io = new IntersectionObserver(([entry]) => setInView(!!entry && entry.intersectionRatio >= threshold), { threshold: [0, threshold, 1] })
+    io.observe(el)
+    return () => io.disconnect()
+  }, [ref, threshold])
+  return inView
 }

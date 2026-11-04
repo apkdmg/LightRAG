@@ -2,11 +2,11 @@ import { useEffect, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { Seg } from '@/features/TokenInsights/ui'
 import { OpsHealth, opsApi } from './api'
-import ComingLater from './components/ComingLater'
 import { useOpsNav, useOpsShell } from './context'
 import { useHealthChanged } from './health/actions'
 import ConfigView from './health/ConfigView'
 import DepsView from './health/DepsView'
+import SigninView from './health/SigninView'
 import { PROBE_INTERVAL_SECONDS, depCounts } from './health/model'
 import { HostView, WORKERS_SECONDS, WorkersView } from './health/WorkersView'
 import { OPS_SUBS } from './hashState'
@@ -29,8 +29,9 @@ function useProcessLabel(): string | null {
 }
 
 /**
- * Health (§2.6, §2.13): the topology map and dependency grid, the workers
- * table, host numbers and the redacted config. The probe results refresh
+ * Health (§2.6, §2.13): the topology map (with live edge flow) and the
+ * dependency grid, sign-in health, the workers table, host numbers and the
+ * redacted config. The probe results refresh
  * every 30 s, aligned to the probe cycle; only the visible view polls, and
  * the config is read once. A dependency that has just gone down offers its
  * topology node one ring to the page's attention slot (§2.12 rule 2).
@@ -72,10 +73,10 @@ export default function HealthTab() {
   const counts = health.data ? depCounts(health.data.deps) : null
   const options: { value: Sub; label: string }[] = [
     { value: 'deps', label: counts && counts.total ? `${t('operations.health.sub.deps')} ${counts.ok}/${counts.total}` : t('operations.health.sub.deps') },
+    { value: 'signin', label: t('operations.health.sub.signin') },
     { value: 'workers', label: t('operations.health.sub.workers') },
     { value: 'host', label: t('operations.health.sub.host') },
-    { value: 'config', label: t('operations.health.sub.config') },
-    { value: 'signin', label: t('operations.health.sub.signin') }
+    { value: 'config', label: t('operations.health.sub.config') }
   ]
 
   return (
@@ -84,11 +85,18 @@ export default function HealthTab() {
         <Seg value={sub} onChange={selectSub} options={options} label={t('operations.health.sub.label')} />
       </div>
       <div key={sub} className={fadeSub === sub ? 'ops-fade-in' : undefined}>
-        {sub === 'deps' ? <DepsView poll={health} processLabel={processLabel} probesOff={probesOff || health.data?.enabled === false} /> : null}
+        {sub === 'deps' ? (
+          <DepsView
+            poll={health}
+            processLabel={processLabel}
+            probesOff={probesOff || health.data?.enabled === false}
+            flow={{ enabled: status?.available === true, metrics: status?.features?.metrics !== false }}
+          />
+        ) : null}
         {sub === 'workers' ? <WorkersView poll={workers} multiWorker={multiWorker} expected={status?.process.expected_workers ?? null} /> : null}
         {sub === 'host' ? <HostView poll={workers} deps={health.data?.deps ?? null} /> : null}
         {sub === 'config' ? <ConfigView poll={config} /> : null}
-        {sub === 'signin' ? <ComingLater title={t('operations.later.signin.title')} body={t('operations.later.signin.body')} /> : null}
+        {sub === 'signin' ? <SigninView metricsOff={status?.features?.metrics === false} /> : null}
       </div>
     </div>
   )

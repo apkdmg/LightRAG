@@ -22,6 +22,10 @@ probes) and ``OPS_RUN_TRACKING`` (run and failure tracking; off makes
 every pipeline hook a no-op). ``OPS_LOG_SINK`` (default **off** until the
 write volume has been measured) stores WARNING+ log lines in
 ``LIGHTRAG_OPS_LOGS``; off means no handler is attached at all.
+``OPS_METRICS_ENABLED`` (default on) records HTTP, embed, rerank and
+sign-in metrics (this worker's histograms and flusher, plus the leased
+hourly rollup/retention and LLM p95 baseline jobs); off makes every
+hot-path hook a no-op.
 """
 
 from __future__ import annotations
@@ -71,6 +75,7 @@ class OpsRuntime:
     probes: Any = None
     run_tracker: Any = None
     log_sink: Any = None
+    metrics: Any = None
 
     def leases_held(self) -> list[str]:
         return [
@@ -302,6 +307,58 @@ def _start_log_retention(runtime: OpsRuntime) -> None:
     runtime.loops.append(loop)
 
 
+def _start_metrics(runtime: OpsRuntime) -> None:
+    """This worker's histograms and flusher, plus the leased hourly jobs."""
+    from lightrag.api.ops import metrics
+
+    bins = metrics.MetricBins(runtime.store, runtime.worker_id)
+    bins.start()
+    metrics.install(bins)
+    runtime.metrics = bins
+
+    async def rollup(loop: LeasedLoop) -> None:
+        await metrics.rollup_cycle(loop, store=runtime.store)
+
+    loop = LeasedLoop(
+        runtime.store,
+        metrics.ROLLUP_LEASE,
+        runtime.worker_id,
+        rollup,
+        ttl_s=metrics.ROLLUP_LEASE_TTL_S,
+        interval_s=metrics.ROLLUP_INTERVAL_S,
+        cycle_timeout_s=metrics.ROLLUP_CYCLE_TIMEOUT_S,
+        initial_delay_s=random.uniform(120.0, 420.0),
+    )
+    loop.start()
+    runtime.loops.append(loop)
+    logger.info("Operations console: performance metrics on")
+
+
+def _start_baselines(app: Any, runtime: OpsRuntime) -> None:
+    """Hourly 7-day same-hour LLM p95 baseline (needs Token Insights)."""
+    from lightrag.api.ops import perf
+
+    def usage_store() -> Any:
+        insights = getattr(app.state, "insights", None)
+        return getattr(insights, "store", None)
+
+    async def cycle(loop: LeasedLoop) -> None:
+        await perf.baseline_cycle(loop, store=runtime.store, usage_store=usage_store)
+
+    loop = LeasedLoop(
+        runtime.store,
+        perf.BASELINE_LEASE,
+        runtime.worker_id,
+        cycle,
+        ttl_s=perf.BASELINE_LEASE_TTL_S,
+        interval_s=perf.BASELINE_INTERVAL_S,
+        cycle_timeout_s=perf.BASELINE_CYCLE_TIMEOUT_S,
+        initial_delay_s=random.uniform(60.0, 180.0),
+    )
+    loop.start()
+    runtime.loops.append(loop)
+
+
 def _start_reconcile(app: Any, runtime: OpsRuntime) -> None:
     from lightrag.api.ops import reconcile
 
@@ -429,6 +486,22 @@ async def _start(app: Any, rag: Any, args: Any) -> OpsRuntime:
         _start_log_retention(runtime)
     except Exception:
         logger.error("Operations console log retention could not start", exc_info=True)
+    if env_flag("OPS_METRICS_ENABLED"):
+        try:
+            _start_metrics(runtime)
+        except Exception:
+            logger.error("Operations console metrics could not start", exc_info=True)
+        try:
+            _start_baselines(app, runtime)
+        except Exception:
+            logger.error(
+                "Operations console LLM baselines could not start", exc_info=True
+            )
+    else:
+        logger.info(
+            "Operations console: performance metrics disabled by "
+            "OPS_METRICS_ENABLED=false"
+        )
 
     add_event_sink(runtime.on_event)
     if env_flag("OPS_INDEX_BUILD"):
@@ -475,6 +548,15 @@ async def stop_ops(app: Any) -> None:
             await runtime.log_sink.stop()
         except Exception:
             logger.debug("Ops log sink did not stop cleanly", exc_info=True)
+    if runtime.metrics is not None:
+        from lightrag.api.ops import metrics
+
+        if metrics.current() is runtime.metrics:
+            metrics.install(None)
+        try:
+            await runtime.metrics.stop()
+        except Exception:
+            logger.debug("Ops metrics did not stop cleanly", exc_info=True)
     if runtime.run_tracker is not None:
         from lightrag.api.ops import runs
 

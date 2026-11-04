@@ -70,7 +70,7 @@ const PROD: DepHealth[] = [
   dep('tls', 'ok', { detail: { days_left: 115 } })
 ]
 
-describe('TopologyMap (§2.13, static in this release)', () => {
+describe('TopologyMap (§2.13, without rates)', () => {
   const render = (patch: { reduceMotion?: boolean; paused?: boolean } = {}) =>
     withPrefs(<TopologyMap deps={PROD} processLabel="uvicorn · 1 process" />, patch)
 
@@ -91,7 +91,7 @@ describe('TopologyMap (§2.13, static in this release)', () => {
     expect(a).toBe(b)
     expect(animated(a)).toEqual([])
     expect(hasTransform(a)).toBe(false)
-    // Static until the rate series exist (PR-6): no edge flows.
+    // Without rates no edge flows (flow.test.tsx covers the live edges).
     expect(a).not.toContain('ops-flow')
   })
 

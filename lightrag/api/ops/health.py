@@ -344,6 +344,30 @@ def derived_deps(
     return cards
 
 
+# Sign-in counts a card may show (never who signed in).
+SIGNIN_DETAIL_KEYS = ("sso_errors", "token_401", "lockouts")
+_SIGNIN_STATUS = {None: "ok", "warning": "warn", "serious": "down"}
+
+
+def signin_dep(
+    counts: Optional[dict[str, Any]], severity: Optional[str], now: float
+) -> dict[str, Any]:
+    """The passive Sign-in card (FR-30) from the last 15 minutes of the auth
+    counters; its state is the ``signin_failures_15m`` rule's. ``counts`` is
+    None when the counters could not be read (unknown, not zero)."""
+    if counts is None:
+        status, detail = "unknown", {"window": "15m"}
+    else:
+        status = _SIGNIN_STATUS.get(severity, "warn")
+        detail = {
+            "window": "15m",
+            **{k: int(counts.get(k) or 0) for k in SIGNIN_DETAIL_KEYS},
+        }
+    card = _derived_card("signin", "Sign-in", "internal", status, detail, now)
+    card["source"] = "metrics"
+    return card
+
+
 def deps_summary(cards: list[dict[str, Any]]) -> dict[str, Any]:
     """OK count over the dependencies that are checked."""
     checked = [c for c in cards if c.get("probed") and c.get("status") != "unprobed"]

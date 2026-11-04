@@ -15,6 +15,7 @@ import { useNow, useStale } from '../hooks'
 import { OpsPoll } from '../poll'
 import { lookOf } from '../severity'
 import { useProbeActions } from './actions'
+import { useFlowRates } from './useFlowRates'
 import { PROBE_INTERVAL_SECONDS, depInterval, inRecheckAll, depIsStale, depState, detailParts, sortDeps, stripUptime } from './model'
 
 /** "Probed by pid 812 (lease holder) every 30 s · last cycle 12:04:20 (1.4 s)". */
@@ -87,12 +88,24 @@ function DepCard({ dep, now, fallbackAt, baseline }: { dep: DepHealth; now: numb
 }
 
 /**
- * Health › Dependencies (§2.6): the topology map, who ran the last probe
+ * Health › Dependencies (§2.6): the topology map with live edge rates, who ran the last probe
  * cycle and when, Re-check all and the SMTP test, and one card per
  * dependency with its 48-cell availability strip.
  */
-export default function DepsView({ poll, processLabel, probesOff }: { poll: OpsPoll<OpsHealth>; processLabel: string | null; probesOff: boolean }) {
+export default function DepsView({
+  poll,
+  processLabel,
+  probesOff,
+  flow = { enabled: false, metrics: false }
+}: {
+  poll: OpsPoll<OpsHealth>
+  processLabel: string | null
+  probesOff: boolean
+  /** Live edge rates (PR-6): `enabled` when the server has the ops store, `metrics` when OPS_METRICS_ENABLED is on. */
+  flow?: { enabled: boolean; metrics: boolean }
+}) {
   const { t } = useTranslation()
+  const rates = useFlowRates(flow.enabled, flow.metrics)
   const now = useNow(15_000)
   const { busy, recheckAll, smtp, smtpTest } = useProbeActions()
   // Same payload, same array: the topology is not rebuilt when the 15 s clock ticks.
@@ -107,7 +120,7 @@ export default function DepsView({ poll, processLabel, probesOff }: { poll: OpsP
       ) : null}
       {poll.data ? (
         <div className={stale || poll.error ? 'ops-stale' : undefined}>
-          <TopologyMap deps={deps} processLabel={processLabel} />
+          <TopologyMap deps={deps} processLabel={processLabel} flows={rates.rates} stale={stale || !!poll.error || rates.stale} />
         </div>
       ) : poll.error ? null : (
         <Skeleton className="h-[420px] w-full" />

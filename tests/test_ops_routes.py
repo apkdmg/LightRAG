@@ -125,6 +125,7 @@ def test_status_payload_shape(monkeypatch):
         "insights": True,
         "release_busy": False,
         "gpu": False,
+        "metrics": False,
     }
     assert body["process"] == {
         "mode": "uvicorn",

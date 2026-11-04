@@ -134,6 +134,7 @@ from dotenv import load_dotenv
 from lightrag.pipeline import _PipelineMixin
 from lightrag.usage import emit_event, run_in_usage_scope
 from lightrag.api.ops import runs as ops_runs
+from lightrag.api.ops.metrics import wrap_dep_latency as _record_dep_latency
 from lightrag.kg.factory import get_storage_class
 from lightrag.addon_params import (
     ObservableAddonParams,
@@ -909,11 +910,14 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
             )
 
         if self.rerank_model_func is not None:
+            # Ops latency/error timing goes INSIDE the queue wrapper (queue
+            # wait is not rerank latency); get_queue_stats/shutdown stay on
+            # the outer wrapper.
             self.rerank_model_func = priority_limit_async_func_call(
                 self.rerank_model_max_async,
                 llm_timeout=self.default_rerank_timeout,
                 queue_name="Rerank func",
-            )(self.rerank_model_func)
+            )(_record_dep_latency(self.rerank_model_func, "rerank"))
 
         # Init Embedding
         # Step 1: Capture embedding_func and max_token_size before applying rate_limit decorator
@@ -939,11 +943,19 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
         # This ensures _generate_collection_suffix can still access attributes (model_name, embedding_dim)
         # while preventing side effects when the same EmbeddingFunc is reused across multiple LightRAG instances
         if self.embedding_func is not None:
+            # Ops timing wraps the raw .func inside the queue wrapper, so
+            # embedding_func.func stays the queue wrapper (get_queue_stats).
             wrapped_func = priority_limit_async_func_call(
                 self.embedding_func_max_async,
                 llm_timeout=self.default_embedding_timeout,
                 queue_name="Embedding func",
-            )(self.embedding_func.func)
+            )(
+                _record_dep_latency(
+                    self.embedding_func.func,
+                    "embed",
+                    getattr(self.embedding_func, "model_name", None),
+                )
+            )
             # Use dataclasses.replace() to create a new instance, leaving the original unchanged
             self.embedding_func = replace(self.embedding_func, func=wrapped_func)
 

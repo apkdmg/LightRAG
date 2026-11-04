@@ -135,3 +135,16 @@ export const fmtStamp = (at: string | number | null | undefined, now: number = D
   const md = `${pad(d.getMonth() + 1)}-${pad(d.getDate())}`
   return d.getFullYear() === today.getFullYear() ? `${md} ${hm}` : `${d.getFullYear()}-${md} ${hm}`
 }
+
+/**
+ * A ratio 0..1 as a percentage with one decimal below 10 %: 0.004 → "0.4%",
+ * 0.183 → "18%". For error and truncation rates, where 0.4 % and 0 % differ.
+ */
+export const fmtRatePct = (ratio: number | null | undefined) => {
+  if (!isNum(ratio)) return DASH
+  const pct = Math.max(0, ratio) * 100
+  if (pct === 0) return '0%'
+  if (pct < 0.1) return '<0.1%'
+  if (pct < 10) return `${(Math.round(pct * 10) / 10).toFixed(1)}%`
+  return `${Math.round(pct)}%`
+}

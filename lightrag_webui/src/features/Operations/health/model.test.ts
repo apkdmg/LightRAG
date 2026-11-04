@@ -199,6 +199,14 @@ describe('/health', () => {
     expect(detailParts(odd)).toEqual([])
   })
 
+  test('the passive Sign-in card: 15-minute counts, passive, never who', () => {
+    const signin = normalizeDep({ id: 'signin', name: 'Sign-in', kind: 'internal', passive: true, status: 'warn', detail: { window: '15m', sso_errors: 6, token_401: 3, lockouts: 0 } })!
+    expect(signin.passive).toBe(true)
+    expect(canRecheck(signin)).toBe(false)
+    expect(detailParts(signin)).toEqual([['operations.health.detail.signin', { sso: 6, token401: 3, lockouts: 0 }]])
+    expect(detailParts(normalizeDep({ id: 'signin', status: 'unknown', detail: { window: '15m' } })!)).toEqual([])
+  })
+
   test('the server card shape: target, not-probed flag, stale without a result', () => {
     const etcd = normalizeDep({ id: 'etcd', name: 'etcd', kind: 'vector_backend', probed: false, status: 'unknown', strip: [] })!
     expect(etcd.status).toBe('unprobed')

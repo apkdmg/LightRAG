@@ -19,6 +19,18 @@ import {
 import { normalizeConfig, normalizeDepDetail, normalizeHealth, normalizeProbeResult, normalizeSmtpTest, normalizeWorkerHistory, normalizeWorkers } from './health/model'
 import { filenameFromDisposition } from './logs'
 import { normalizeCorrelate, normalizeLogDetail, normalizeLogGroups, normalizeLogPage } from './logsNormalize'
+import {
+  LlmGroup,
+  PerfWindow,
+  TopMetric,
+  normalizePerfConcurrency,
+  normalizePerfDeps,
+  normalizePerfHttp,
+  normalizePerfLlm,
+  normalizePerfThroughput,
+  normalizeSignin,
+  normalizeTopWorkspaces
+} from './performance/model'
 
 /**
  * Operations API client. Every route lives under /admin/ops behind the
@@ -59,6 +71,8 @@ export type OpsFeatures = {
   insights: boolean
   release_busy: boolean
   gpu: boolean
+  /** HTTP, embed/rerank and sign-in counters are recorded (OPS_METRICS_ENABLED). */
+  metrics: boolean
 }
 
 export type OpsStatus = {
@@ -929,7 +943,23 @@ export const opsApi = {
   exportLogs: (body: LogExportRequest) =>
     postDownload('/logs/export', body, `ops-logs-${new Date().toISOString().slice(0, 10)}.${body.format === 'csv' ? 'csv' : 'ndjson'}`),
   /** Resolves a pasted ID or owner email to what it names (FR-50). */
-  correlate: async (id: string, signal?: AbortSignal) => normalizeCorrelate(await get('/correlate', { id }, signal))
+  correlate: async (id: string, signal?: AbortSignal) => normalizeCorrelate(await get('/correlate', { id }, signal)),
+  /** LLM latency percentiles and rates from the usage table (≤24 h; 7 d is hourly average and max, FR-40). */
+  perfLlm: async (window: PerfWindow, group: LlmGroup, signal?: AbortSignal) =>
+    normalizePerfLlm(await get('/performance/llm', { window, group }, signal), window, group),
+  /** Embed and rerank latency and errors plus vLLM running/waiting/KV cache (FR-41). */
+  perfDeps: async (window: PerfWindow, signal?: AbortSignal) => normalizePerfDeps(await get('/performance/deps', { window }, signal), window),
+  /** HTTP latency and 5xx by route template (FR-42). */
+  perfHttp: async (window: PerfWindow, signal?: AbortSignal) => normalizePerfHttp(await get('/performance/http', { window }, signal), window),
+  /** Summed queues across loaded instances and the top 10 by queued (FR-44). */
+  perfConcurrency: async (signal?: AbortSignal) => normalizePerfConcurrency(await get('/performance/concurrency', undefined, signal)),
+  /** Docs per hour, LLM calls per minute, email batches per hour (FR-43). */
+  perfThroughput: async (days: number, signal?: AbortSignal) => normalizePerfThroughput(await get('/performance/throughput', { days }, signal), days),
+  /** The 20 busiest workspaces by a metric in the window (FR-45). */
+  perfTopWorkspaces: async (metric: TopMetric, window: PerfWindow, signal?: AbortSignal) =>
+    normalizeTopWorkspaces(await get('/performance/top-workspaces', { metric, window }, signal), metric),
+  /** Sign-in health: SSO callback errors, 401s and lockouts, outcomes only (FR-35). */
+  signin: async (window: '15m' | '24h', signal?: AbortSignal) => normalizeSignin(await get('/signin', { window }, signal), window)
 }
 
 /** Pause counts as flat rows, whichever of the two server shapes arrives. */

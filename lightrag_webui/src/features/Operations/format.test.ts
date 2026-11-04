@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test'
-import { DASH, ageSeconds, bytesUnit, fmtAge, fmtBytes, fmtClock, fmtCount, fmtDuration, fmtLatency, fmtPercent, shortId } from './format'
+import { DASH, ageSeconds, bytesUnit, fmtAge, fmtBytes, fmtClock, fmtCount, fmtDuration, fmtLatency, fmtPercent, fmtRatePct, shortId } from './format'
 
 describe('format', () => {
   test('every formatter prints a dash for missing values', () => {
@@ -72,5 +72,13 @@ describe('format', () => {
   test('shortId keeps short ids whole', () => {
     expect(shortId('7f3a')).toBe('7f3a')
     expect(shortId('7f3a9c2e1b44')).toBe('7f3a9c2e…')
+  })
+
+  test('fmtRatePct keeps one decimal below 10 % so 0.4 % and 0 % differ', () => {
+    expect(fmtRatePct(0.004)).toBe('0.4%')
+    expect(fmtRatePct(0)).toBe('0%')
+    expect(fmtRatePct(0.0004)).toBe('<0.1%')
+    expect(fmtRatePct(0.182)).toBe('18%')
+    expect(fmtRatePct(null)).toBe(DASH)
   })
 })

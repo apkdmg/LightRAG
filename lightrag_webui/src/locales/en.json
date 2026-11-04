@@ -1060,7 +1060,8 @@
       "noCalls": "No individual calls in the last 90 days.",
       "maskNote": "Document names are partly hidden, here and in exports. The # code is the start of the document ID, which the owner can look up on the Documents page.",
       "leafNote": "Click a name to see its individual calls: time, tokens, status and latency. Prompt and answer text is never stored.",
-      "note": "Click a name to go one level deeper. Click a chip to step back."
+      "note": "Click a name to go one level deeper. Click a chip to step back.",
+      "docCalls": "Calls for {{id}}"
     },
     "operation": {
       "extraction": "Chunk extraction",
@@ -1478,21 +1479,14 @@
       "on": "On",
       "off": "Off",
       "later": "Not available yet",
-      "multiWorkerOnly": "Multi-worker only"
+      "multiWorkerOnly": "Multi-worker only",
+      "metrics": "Performance metrics"
     },
     "later": {
       "note": "This section arrives in a later release.",
-      "performance": {
-        "title": "Performance",
-        "body": "LLM, embedding and rerank latency, HTTP routes, throughput and concurrency will appear here. Token use and cost stay in Token Insights."
-      },
       "activity": {
         "title": "Activity",
         "body": "Alerts, the audit log of admin actions, system events and incident export will appear here."
-      },
-      "signin": {
-        "title": "Sign-in health",
-        "body": "SSO callback errors, rejected tokens and login lockouts per 15 minutes and 24 hours arrive with the Performance release. Counts carry outcomes only, never usernames."
       }
     },
     "unavailableShort": "Not available: this view needs PostgreSQL KV storage (LIGHTRAG_KV_STORAGE=PGKVStorage).",
@@ -2352,6 +2346,7 @@
         "diskFree": "{{pct}} free",
         "rtt": "round trip {{rtt}}",
         "recorder": "buffer {{buffer}} · lost +{{lost}} · dropped +{{dropped}} (5 min)",
+        "signin": "15m: {{sso}} SSO errors · {{token401}} 401s · {{lockouts}} lockouts",
         "reason": {
           "covered_by_postgres": "stored in PostgreSQL (see its card)",
           "local_storage": "local files on this server",
@@ -2365,7 +2360,7 @@
       "layer": "Topology layer",
       "traffic": "Traffic",
       "monitoring": "Monitoring layer",
-      "staticNote": "Lines are static for now; live traffic rates arrive with the Performance release.",
+      "staticNote": "Lines are still: no live traffic rates from this server yet.",
       "svgLabel": "System topology: callers reach the LightRAG server, which depends on {{deps}}.",
       "noDeps": "no probed dependencies yet",
       "notProbed": "Not probed",
@@ -2384,11 +2379,12 @@
         "probes": "probes"
       },
       "legend": {
-        "connection": "Connection (static until live rates arrive)",
+        "connection": "Connection",
         "unprobed": "Not probed (shown dashed)",
         "down": "Target down, marked ✖",
         "bypass": "Callers reaching vLLM through the proxy, bypassing LightRAG",
-        "probe": "Probe (Monitoring layer)"
+        "probe": "Probe (Monitoring layer)",
+        "traffic": "Live traffic: thicker and faster means busier than that link’s usual (24 h)"
       },
       "info": {
         "role": "Role",
@@ -2431,7 +2427,7 @@
           "label": "API clients",
           "sub": "/query · /v1 · /api",
           "role": "REST, Ollama-compatible and OpenAI-compatible callers.",
-          "watch": "Request IDs on every response; HTTP latency per route arrives with the Performance release."
+          "watch": "Request IDs on every response; HTTP latency and 5xx per route under Performance › HTTP."
         },
         "proxy": {
           "label": "Reverse proxy",
@@ -2535,6 +2531,30 @@
           "sub": "key-value store",
           "role": "Key-value storage, when configured.",
           "watch": "PING every 30 seconds."
+        }
+      },
+      "flowNote": "Moving dashes show live traffic over the last minute; faster means busier than usual for that link.",
+      "flow": {
+        "title": "Live traffic, last complete minute",
+        "source": {
+          "http": "HTTP requests",
+          "embed": "Embedding calls",
+          "rerank": "Rerank calls",
+          "llm": "LLM calls"
+        },
+        "bucket": {
+          "idle": "idle",
+          "low": "below usual",
+          "medium": "usual",
+          "high": "busy"
+        },
+        "moving": "Dashes move with the traffic. Speed and thickness show the same bucket as the text.",
+        "still": {
+          "reduced": "Dashes are still because motion is reduced; the rates and line thickness above carry the same information.",
+          "paused": "Dashes are still while auto-refresh is paused: paused data cannot show that traffic is still flowing.",
+          "stale": "Dashes are still because the data is stale.",
+          "hidden": "Dashes are still while this browser tab is hidden.",
+          "offscreen": "Dashes are still while the map is mostly off screen."
         }
       }
     },
@@ -2914,6 +2934,177 @@
         "doc": "Document",
         "workspace": "Workspace",
         "owner": "Owner’s workspace"
+      }
+    },
+    "signin": {
+      "title": "Sign-in health",
+      "sub": "SSO callback errors, rejected tokens (401) and login lockouts.",
+      "sso_errors": "SSO errors",
+      "token_401": "401s",
+      "lockouts": "Lockouts",
+      "last15m": "Last 15 minutes",
+      "last24h": "Last 24 hours",
+      "chartTitle": "Sign-in failures, last 24 hours",
+      "perBucket": "Per bucket",
+      "none": "No sign-in failures in the last 24 hours.",
+      "privacy": "Counts carry outcomes only, never usernames or addresses. 401s include expired sessions, so a steady trickle is normal.",
+      "state": {
+        "ok": "Normal",
+        "warning": "Elevated failures",
+        "serious": "Many failures",
+        "unknown": "No data"
+      }
+    },
+    "perf": {
+      "window": "Window",
+      "windows": {
+        "15m": "15 min",
+        "1h": "1 hour",
+        "24h": "24 hours",
+        "7d": "7 days"
+      },
+      "sectionLabel": "Section",
+      "section": {
+        "llm": "LLM",
+        "deps": "Embed & Rerank",
+        "http": "HTTP",
+        "throughput": "Throughput",
+        "concurrency": "Concurrency",
+        "top": "Top workspaces"
+      },
+      "autoNote": "Refreshes every 60 s.",
+      "manualNote": "Long windows refresh only when you press Refresh.",
+      "manualHint": "Re-read this window now",
+      "nowNote": "Current values, refreshed every 60 s.",
+      "metricsOff": "Performance counters are switched off on this server (OPS_METRICS_ENABLED=false), so HTTP, embed, rerank and sign-in numbers are not recorded.",
+      "time": "Time",
+      "calls": "Calls",
+      "callsPerMin": "Calls per minute",
+      "running": "Running",
+      "queued": "Queued",
+      "workspace": "Workspace",
+      "avg": "Average",
+      "max": "Max",
+      "errorPct": "Error %",
+      "truncatedPct": "Cut off %",
+      "viewTable": "View as table",
+      "viewChart": "View as chart",
+      "noPoints": "Nothing recorded in this window.",
+      "markers": "Events in this window",
+      "moreMarkers": "and {{count}} more",
+      "llm": {
+        "title": "LLM latency and rates",
+        "liveNote": "From recorded LLM calls (cache hits excluded); live, up to 24 hours.",
+        "rollupNote": "Hourly average and max: percentiles need a window of 24 hours or less.",
+        "groupBy": "Group by",
+        "group": {
+          "purpose": "Purpose",
+          "model": "Model"
+        },
+        "chartTitle": "{{name}} latency",
+        "moreKeys": "{{count}} more in the table below.",
+        "queueTitle": "LLM calls running and queued, all instances",
+        "queueNow": "Now: {{running}} running · {{queued}} queued across every loaded instance.",
+        "queueUnknown": "Queue counts are not available yet (they come from worker heartbeats).",
+        "queue": "Running/queued",
+        "explore": "Explore in Insights →",
+        "tableCaption": "LLM calls, latency and error rates in the window",
+        "noCalls": "No LLM calls recorded in this window.",
+        "unknownModel": "(unknown model)",
+        "insightsOff": "LLM latency comes from the Token Insights recorder, which is off on this server."
+      },
+      "deps": {
+        "title": "Embedding and rerank",
+        "sub": "Timed inside the queue wrapper, so queue wait is not included. vLLM counts come from its /metrics.",
+        "role": {
+          "embed": "Embedding",
+          "rerank": "Rerank"
+        },
+        "roleCol": "Service",
+        "latency": "{{name}} latency",
+        "rate": "{{name}} calls per minute",
+        "noCalls": "No {{name}} calls recorded in this window.",
+        "vllmTitle": "vLLM requests running and waiting",
+        "vllmNote": "Waiting includes callers that reach vLLM through the proxy, not only LightRAG.",
+        "kvTitle": "vLLM KV cache use",
+        "kvCache": "KV cache",
+        "vllmNow": "vLLM now: {{running}} running · {{waiting}} waiting · KV cache {{kv}}",
+        "vllmUnknown": "vLLM metrics not available",
+        "vllmCol": "vLLM run / wait · KV",
+        "waiting": "Waiting",
+        "tableCaption": "Embedding and rerank calls in the window"
+      },
+      "http": {
+        "title": "HTTP routes",
+        "sub": "Timed in the request-ID middleware, per route template.",
+        "rateTitle": "Requests per minute",
+        "latencyTitle": "Latency",
+        "errTitle": "5xx share",
+        "perMin": "Requests/min",
+        "err5xx": "5xx %",
+        "route": "Route",
+        "unmatched": "<unmatched> (no route)",
+        "openLogs": "Open errors for this route in Logs",
+        "topNote": "The {{shown}} slowest of {{total}} routes by p95. Requests matching no route count as one row.",
+        "allNote": "All routes, slowest first.",
+        "showAll": "Show all {{count}}",
+        "showTop": "Show the slowest only",
+        "capped": "More than 200 distinct routes in one minute: the extra ones were counted under <unmatched>.",
+        "noRequests": "No requests recorded in this window.",
+        "tableCaption": "HTTP routes by p95 latency"
+      },
+      "throughput": {
+        "title": "Throughput",
+        "sub_one": "Last {{count}} day.",
+        "sub_other": "Last {{count}} days.",
+        "work": "Longer history in Insights",
+        "docsTitle": "Documents per hour",
+        "processed": "Processed",
+        "failed": "Failed",
+        "callsTitle": "LLM calls per minute",
+        "callsNeedDay": "Per-minute LLM calls need a window of 24 hours or less.",
+        "batchesTitle": "Email batches per hour",
+        "batches": "Batches",
+        "noDocs": "No documents processed in this window.",
+        "runsOff": "Run tracking is off on this server (OPS_RUN_TRACKING=false).",
+        "noBatches": "No email batches in this window."
+      },
+      "concurrency": {
+        "title": "Concurrency now",
+        "sub": "Summed over every loaded instance on every worker, from heartbeat snapshots.",
+        "rolesCaption": "Running, in-flight and queued calls per role",
+        "role": "Role",
+        "roles": {
+          "llm": "LLM",
+          "embed": "Embedding",
+          "rerank": "Rerank"
+        },
+        "inFlight": "In flight",
+        "scope": "{{instances}} loaded instances on {{workers}} workers · as of {{time}}",
+        "budget": "Provider budget: {{used}} of {{limit}} in flight ({{pct}})",
+        "noBudget": "No ratio: OPS_PROVIDER_CONCURRENCY_BUDGET is not set, and summed max_async would mislead because those limits are per workspace.",
+        "topTitle": "Instances with the most queued calls",
+        "worker": "Worker",
+        "pid": "pid {{pid}}",
+        "defaultWorkspace": "(default workspace)",
+        "noneQueued": "Nothing running or queued right now.",
+        "noHeartbeats": "Worker heartbeats could not be read, so the queue counts are unknown (not zero)."
+      },
+      "top": {
+        "title": "Top workspaces",
+        "metric": "Rank by",
+        "metrics": {
+          "llm_calls": "LLM calls",
+          "processing_minutes": "Processing time",
+          "failures": "Failures"
+        },
+        "sub": {
+          "llm_calls": "The 20 workspaces with the most LLM calls in the window.",
+          "processing_minutes": "The 20 workspaces whose pipeline ran longest in the window.",
+          "failures": "The 20 workspaces with the most failed documents in the window (cancelled and duplicates excluded)."
+        },
+        "share": "Relative to the first",
+        "none": "No activity in this window."
       }
     }
   }
