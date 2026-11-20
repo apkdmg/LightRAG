@@ -403,14 +403,15 @@ def test_generate_docker_compose_normalizes_lightrag_restart_policy_from_existin
         tmp_path / "env.example",
         (REPO_ROOT / "env.example").read_text(encoding="utf-8").splitlines(),
     )
-    run_bash(f"""
+    script = f"""
 set -euo pipefail
 source "{REPO_ROOT}/scripts/setup/setup.sh"
 REPO_ROOT="{tmp_path}"
 reset_state
 
 generate_docker_compose "$REPO_ROOT/docker-compose.final.yml\"
-""")
+"""
+    run_bash(script)
     generated_compose = (tmp_path / "docker-compose.final.yml").read_text(
         encoding="utf-8"
     )
@@ -420,6 +421,13 @@ generate_docker_compose "$REPO_ROOT/docker-compose.final.yml\"
     assert "    deploy:\n" not in lightrag_block
     assert "restart_policy" not in lightrag_block
     assert "on-failure" not in lightrag_block
+
+    # The existing restart: line is rewritten in place, so regenerating the
+    # file again changes nothing.
+    run_bash(script)
+    assert (tmp_path / "docker-compose.final.yml").read_text(
+        encoding="utf-8"
+    ) == generated_compose
 
 
 def test_generate_docker_compose_normalizes_lightrag_restart_policy_without_blank_line_before_deploy(
@@ -782,8 +790,10 @@ def test_generate_docker_compose_upgrades_existing_compose_with_log_dir(
     result = _generate_existing_compose(tmp_path, _PRE_LOG_DIR_LIGHTRAG)
     assert (
         '      - "./data/logs:/app/data/logs"\n'
-        in result[: result.index("    deploy:")]
+        in result[: result.index("    restart: unless-stopped")]
     )
+    # The legacy on-failure deploy block is converted too.
+    assert "restart_policy" not in result
     assert (
         """    logging:
       driver: json-file
