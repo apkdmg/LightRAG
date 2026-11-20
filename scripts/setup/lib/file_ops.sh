@@ -1397,7 +1397,7 @@ normalize_lightrag_restart_policy() {
   local in_deploy="no"
   local deploy_seen="no"
   local insert_blank_after_deploy="no"
-  local skip_blank_after_removed_restart="no"
+  local restart_written="no"
   local -a deploy_lines=()
 
   _trim_trailing_blank_lines() {
@@ -1421,11 +1421,20 @@ normalize_lightrag_restart_policy() {
     mv "$trim_file" "$file"
   }
 
+  # lightrag uses `restart: unless-stopped`, not deploy.restart_policy
+  # (on-failure): the server exits 0 on SIGTERM, so on-failure never brings
+  # it back after a host reboot or Docker daemon restart. Any other deploy
+  # settings (resources, ...) are kept under a deploy: block. An existing
+  # restart: line is rewritten in place, so regeneration is idempotent.
   _write_normalized_lightrag_deploy_block() {
     local deploy_line
     local skipping_restart_policy="no"
+    local -a kept_deploy_lines=()
 
-    printf '    deploy:\n' >> "$tmp_file"
+    if [[ "$restart_written" != "yes" ]]; then
+      printf '    restart: unless-stopped\n' >> "$tmp_file"
+      restart_written="yes"
+    fi
     for deploy_line in "${deploy_lines[@]}"; do
       if [[ -z "$deploy_line" ]]; then
         continue
@@ -1443,12 +1452,13 @@ normalize_lightrag_restart_policy() {
         continue
       fi
 
-      printf '%s\n' "$deploy_line" >> "$tmp_file"
+      kept_deploy_lines+=("$deploy_line")
     done
 
-    printf '      restart_policy:\n' >> "$tmp_file"
-    printf '        condition: on-failure\n' >> "$tmp_file"
-    printf '        max_attempts: 10\n' >> "$tmp_file"
+    if [[ ${#kept_deploy_lines[@]} -gt 0 ]]; then
+      printf '    deploy:\n' >> "$tmp_file"
+      printf '%s\n' "${kept_deploy_lines[@]}" >> "$tmp_file"
+    fi
   }
 
   : > "$tmp_file"
@@ -1471,14 +1481,13 @@ normalize_lightrag_restart_policy() {
 
     if [[ "$in_lightrag" == "yes" && "$line" =~ ^[[:space:]]{2}[^[:space:]] && "$line" != "  lightrag:" ]] || \
       [[ "$in_lightrag" == "yes" && "$line" =~ ^[^[:space:]] ]]; then
-      if [[ "$deploy_seen" != "yes" ]]; then
+      if [[ "$deploy_seen" != "yes" && "$restart_written" != "yes" ]]; then
         _trim_trailing_blank_lines "$tmp_file"
         _write_normalized_lightrag_deploy_block
         insert_blank_after_deploy="yes"
       fi
       in_lightrag="no"
       deploy_seen="no"
-      skip_blank_after_removed_restart="no"
     fi
 
     if [[ "$in_lightrag" == "yes" && "$line" == "    deploy:" ]]; then
@@ -1489,15 +1498,11 @@ normalize_lightrag_restart_policy() {
     fi
 
     if [[ "$in_lightrag" == "yes" && "$line" =~ ^[[:space:]]{4}restart: ]]; then
-      skip_blank_after_removed_restart="yes"
-      continue
-    fi
-
-    if [[ "$skip_blank_after_removed_restart" == "yes" && "$in_lightrag" == "yes" ]]; then
-      if [[ -z "$line" ]]; then
-        continue
+      if [[ "$restart_written" != "yes" ]]; then
+        printf '    restart: unless-stopped\n' >> "$tmp_file"
+        restart_written="yes"
       fi
-      skip_blank_after_removed_restart="no"
+      continue
     fi
 
     if [[ "$insert_blank_after_deploy" == "yes" ]]; then
@@ -1512,7 +1517,7 @@ normalize_lightrag_restart_policy() {
       in_deploy="no"
       deploy_seen="no"
       insert_blank_after_deploy="no"
-      skip_blank_after_removed_restart="no"
+      restart_written="no"
       deploy_lines=()
     fi
   done < "$compose_file"
@@ -1523,7 +1528,7 @@ normalize_lightrag_restart_policy() {
     deploy_seen="yes"
   fi
 
-  if [[ "$in_lightrag" == "yes" && "$deploy_seen" != "yes" ]]; then
+  if [[ "$in_lightrag" == "yes" && "$deploy_seen" != "yes" && "$restart_written" != "yes" ]]; then
     _trim_trailing_blank_lines "$tmp_file"
     _write_normalized_lightrag_deploy_block
   fi
@@ -2034,7 +2039,7 @@ inject_lightrag_bind_mounts() {
 
   while IFS= read -r line || [[ -n "$line" ]]; do
     if [[ "$in_lightrag" == "yes" && "$in_volumes" == "yes" ]]; then
-      if [[ "$line" =~ ^[[:space:]]{4}[^[:space:]-] || "$line" =~ ^[[:space:]]{2}[^[:space:]] || "$line" =~ ^(volumes|networks): ]]; then
+      if [[ "$line" =~ ^[[:space:]]{4}[^[:space:]-] || "$line" =~ ^[[:space:]]{2}[^[:space:]] || "$line" =~ ^[^[:space:]] ]]; then
         if [[ "$inserted" == "no" ]]; then
           for mount in "${mounts[@]}"; do
             printf '      - "%s"\n' "$mount" >> "$tmp_file"
@@ -2043,7 +2048,13 @@ inject_lightrag_bind_mounts() {
         fi
         in_volumes="no"
       fi
-    elif [[ "$in_lightrag" == "yes" && "$line" =~ ^[[:space:]]{2}[^[:space:]] && "$line" != "  lightrag:" ]]; then
+    elif [[ "$in_lightrag" == "yes" && \
+            ( "$line" =~ ^[[:space:]]{2}[^[:space:]] || "$line" =~ ^[^[:space:]] ) && \
+            "$line" != "  lightrag:" ]]; then
+      # Any column-0 line (a top-level key or the managed-services marker
+      # comment) also ends the service, as in
+      # inject_service_environment_overrides. Without it a new block was
+      # appended at end of file, after the marker, outside the service.
       if [[ "$inserted" == "no" ]]; then
         printf '    volumes:\n' >> "$tmp_file"
         for mount in "${mounts[@]}"; do
@@ -2094,14 +2105,20 @@ inject_lightrag_port_mapping() {
 
   while IFS= read -r line || [[ -n "$line" ]]; do
     if [[ "$in_lightrag" == "yes" && "$in_ports" == "yes" ]]; then
-      if [[ "$line" =~ ^[[:space:]]{4}[^[:space:]-] || "$line" =~ ^[[:space:]]{2}[^[:space:]] || "$line" =~ ^(volumes|networks): ]]; then
+      if [[ "$line" =~ ^[[:space:]]{4}[^[:space:]-] || "$line" =~ ^[[:space:]]{2}[^[:space:]] || "$line" =~ ^[^[:space:]] ]]; then
         if [[ "$inserted" == "no" ]]; then
           printf '      - "%s"\n' "$port_mapping" >> "$tmp_file"
           inserted="yes"
         fi
         in_ports="no"
       fi
-    elif [[ "$in_lightrag" == "yes" && "$line" =~ ^[[:space:]]{2}[^[:space:]] && "$line" != "  lightrag:" ]]; then
+    elif [[ "$in_lightrag" == "yes" && \
+            ( "$line" =~ ^[[:space:]]{2}[^[:space:]] || "$line" =~ ^[^[:space:]] ) && \
+            "$line" != "  lightrag:" ]]; then
+      # Any column-0 line (a top-level key or the managed-services marker
+      # comment) also ends the service, as in
+      # inject_service_environment_overrides. Without it a new block was
+      # appended at end of file, after the marker, outside the service.
       if [[ "$inserted" == "no" ]]; then
         printf '    ports:\n' >> "$tmp_file"
         printf '      - "%s"\n' "$port_mapping" >> "$tmp_file"

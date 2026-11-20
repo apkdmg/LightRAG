@@ -603,7 +603,8 @@ podman-compose -f docker-compose.podman.yml up -d
 
 Differences from the Docker Compose file:
 
-- uses a top-level `restart` key instead of `deploy.restart_policy`
+- uses `restart: on-failure:10` (the Docker Compose files use
+  `restart: unless-stopped`)
 - omits the `host-gateway` mapping — Podman auto-provides
   **`host.containers.internal`**; use that hostname (not `host.docker.internal`)
   in your `.env` binding hosts when reaching host services.
@@ -617,7 +618,9 @@ Differences from the Docker Compose file:
 - **Set a strong `TOKEN_SECRET`** — never ship a default or weak value.
 - **Configure OAuth2 or disable it explicitly** — don't leave it enabled but
   unconfigured.
-- **Restart policy** — Compose restarts on failure; for `docker run`, add
+- **Restart policy** — Compose uses `restart: unless-stopped`, so LightRAG
+  comes back after a host reboot (the server exits 0 on shutdown, which an
+  `on-failure` policy never restarts); for `docker run`, add
   `--restart unless-stopped`.
 - **Resource limits** — cap memory/CPU with `--memory` / `--cpus`
   (or `deploy.resources` in Compose).
