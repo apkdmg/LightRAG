@@ -1421,11 +1421,16 @@ normalize_lightrag_restart_policy() {
     mv "$trim_file" "$file"
   }
 
+  # lightrag uses `restart: unless-stopped`, not deploy.restart_policy
+  # (on-failure): the server exits 0 on SIGTERM, so on-failure never brings
+  # it back after a host reboot or Docker daemon restart. Any other deploy
+  # settings (resources, ...) are kept under a deploy: block.
   _write_normalized_lightrag_deploy_block() {
     local deploy_line
     local skipping_restart_policy="no"
+    local -a kept_deploy_lines=()
 
-    printf '    deploy:\n' >> "$tmp_file"
+    printf '    restart: unless-stopped\n' >> "$tmp_file"
     for deploy_line in "${deploy_lines[@]}"; do
       if [[ -z "$deploy_line" ]]; then
         continue
@@ -1443,12 +1448,13 @@ normalize_lightrag_restart_policy() {
         continue
       fi
 
-      printf '%s\n' "$deploy_line" >> "$tmp_file"
+      kept_deploy_lines+=("$deploy_line")
     done
 
-    printf '      restart_policy:\n' >> "$tmp_file"
-    printf '        condition: on-failure\n' >> "$tmp_file"
-    printf '        max_attempts: 10\n' >> "$tmp_file"
+    if [[ ${#kept_deploy_lines[@]} -gt 0 ]]; then
+      printf '    deploy:\n' >> "$tmp_file"
+      printf '%s\n' "${kept_deploy_lines[@]}" >> "$tmp_file"
+    fi
   }
 
   : > "$tmp_file"
