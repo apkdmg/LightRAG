@@ -4,8 +4,8 @@
 #   podman-compose -f docker-compose.podman.yml up -d
 #
 # Key differences from docker-compose.yml:
-#   - Uses top-level `restart` instead of `deploy.restart_policy`
-#     (Podman does not support the deploy block for restart policies)
+#   - Uses `restart: on-failure:10` (the Docker Compose files use
+#     `restart: unless-stopped`)
 #   - No `extra_hosts` with `host-gateway` (Podman fails on this special
 #     value; Podman auto-provides host.containers.internal for host access)
 #   - When connecting to host services (e.g. LLM, embedding, rerank),

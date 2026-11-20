@@ -387,7 +387,7 @@ generate_docker_compose "$REPO_ROOT/docker-compose.final.yml\"
 def test_generate_docker_compose_normalizes_lightrag_restart_policy_from_existing_output(
     tmp_path: Path,
 ) -> None:
-    """Regeneration should replace legacy lightrag restart with deploy.restart_policy."""
+    """Regeneration should keep exactly one lightrag restart: unless-stopped."""
     write_text_lines(
         tmp_path / "docker-compose.final.yml",
         [
@@ -416,17 +416,16 @@ generate_docker_compose "$REPO_ROOT/docker-compose.final.yml\"
     )
     lightrag_start = generated_compose.index("  lightrag:\n")
     lightrag_block = generated_compose[lightrag_start:]
-    assert "    restart: unless-stopped" not in lightrag_block
-    assert "    deploy:\n" in lightrag_block
-    assert "      restart_policy:\n" in lightrag_block
-    assert "        condition: on-failure\n" in lightrag_block
-    assert "        max_attempts: 10\n" in lightrag_block
+    assert lightrag_block.count("    restart: unless-stopped\n") == 1
+    assert "    deploy:\n" not in lightrag_block
+    assert "restart_policy" not in lightrag_block
+    assert "on-failure" not in lightrag_block
 
 
 def test_generate_docker_compose_normalizes_lightrag_restart_policy_without_blank_line_before_deploy(
     tmp_path: Path,
 ) -> None:
-    """Regeneration should move the separator blank line after deploy, not before it."""
+    """Regeneration should move the separator blank line after restart, not before it."""
     write_text_lines(
         tmp_path / "docker-compose.final.yml",
         [
@@ -457,21 +456,84 @@ generate_docker_compose "$REPO_ROOT/docker-compose.final.yml\"
     assert (
         """    image: example/lightrag:test
 
-    deploy:
+    restart: unless-stopped
 """
         not in generated_compose
     )
     assert (
         """    image: example/lightrag:test
-    deploy:
+    restart: unless-stopped
 """
         in generated_compose
     )
-    assert "        max_attempts: 10\n\n    volumes:\n" in generated_compose
+    assert "    restart: unless-stopped\n\n    volumes:\n" in generated_compose
     assert (
         '      - "./data/prompts:/app/data/prompts"\n\n  sidecar:\n'
         in generated_compose
     )
+
+
+def test_generate_docker_compose_converts_legacy_lightrag_on_failure_policy(
+    tmp_path: Path,
+) -> None:
+    """A legacy deploy.restart_policy (on-failure) becomes restart: unless-stopped.
+
+    on-failure never restarts lightrag after a host reboot because the server
+    exits 0 on SIGTERM. Other deploy settings must survive the conversion.
+    """
+    write_text_lines(
+        tmp_path / "docker-compose.final.yml",
+        [
+            "services:",
+            "  lightrag:",
+            "    image: example/lightrag:test",
+            "    deploy:",
+            "      restart_policy:",
+            "        condition: on-failure",
+            "        max_attempts: 10",
+            "      resources:",
+            "        limits:",
+            "          memory: 8g",
+            "    extra_hosts:",
+            '      - "host.docker.internal:host-gateway"',
+        ],
+    )
+    write_text_lines(
+        tmp_path / "env.example",
+        (REPO_ROOT / "env.example").read_text(encoding="utf-8").splitlines(),
+    )
+    script = f"""
+set -euo pipefail
+source "{REPO_ROOT}/scripts/setup/setup.sh"
+REPO_ROOT="{tmp_path}"
+reset_state
+
+generate_docker_compose "$REPO_ROOT/docker-compose.final.yml\"
+"""
+    run_bash(script)
+    generated_compose = (tmp_path / "docker-compose.final.yml").read_text(
+        encoding="utf-8"
+    )
+    lightrag_block = generated_compose[generated_compose.index("  lightrag:\n") :]
+    assert "restart_policy" not in lightrag_block
+    assert "on-failure" not in lightrag_block
+    assert "max_attempts" not in lightrag_block
+    assert lightrag_block.count("    restart: unless-stopped\n") == 1
+    assert (
+        """    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 8g
+"""
+        in lightrag_block
+    )
+
+    # Regenerating again must be a no-op for the restart/deploy layout.
+    run_bash(script)
+    assert (tmp_path / "docker-compose.final.yml").read_text(
+        encoding="utf-8"
+    ) == generated_compose
 
 
 def test_generate_docker_compose_preserves_non_managed_named_volumes(
@@ -616,7 +678,7 @@ generate_docker_compose "$REPO_ROOT/docker-compose.final.yml\"
     assert "  vllm-rerank:" not in result
     assert "__WIZARD_MANAGED_SERVICES__" not in result
     assert "depends_on:" not in result
-    assert "        max_attempts: 10\n\nnetworks:\n" in result
+    assert "    restart: unless-stopped\n\nnetworks:\n" in result
 
 
 def test_generate_docker_compose_keeps_blank_line_between_managed_service_and_top_level_sections(
@@ -651,7 +713,9 @@ generate_docker_compose "$REPO_ROOT/docker-compose.final.yml\"
     result = (tmp_path / "docker-compose.final.yml").read_text(encoding="utf-8")
     assert "  vllm-embed:" in result
     assert (
-        """        max_attempts: 10
+        """  lightrag:
+    image: example/lightrag:test
+    restart: unless-stopped
     depends_on:
 """
         in result

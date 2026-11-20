@@ -13,10 +13,7 @@ services:
       - ./data/inputs:/app/data/inputs
       - ./data/prompts:/app/data/prompts
       - ./.env:/app/.env
-    deploy:
-      restart_policy:
-        condition: on-failure
-        max_attempts: 10
+    restart: unless-stopped
     extra_hosts:
       - "host.docker.internal:host-gateway"
     environment:
