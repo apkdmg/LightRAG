@@ -33,10 +33,7 @@ services:
       - ./data/prompts:/app/data/prompts
       - ./data/logs:/app/data/logs
       - ./.env:/app/.env
-    deploy:
-      restart_policy:
-        condition: on-failure
-        max_attempts: 10
+    restart: unless-stopped
     extra_hosts:
       - "host.docker.internal:host-gateway"
     # Cap the console log Docker keeps for this container (json-file driver).
